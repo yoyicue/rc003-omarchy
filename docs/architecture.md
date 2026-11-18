@@ -82,7 +82,7 @@ src/
   input/
     mod.rs             # evdev 发现和热插拔
     device.rs          # 独占与 uinput 转发
-    mapping.rs         # RightAlt/F9 保持与基础按键映射
+    input.rs         # RightAlt/F9 保持与基础按键映射
     actions.rs         # 动作后端
   integrate/
     hyprland.rs        # 可选窗口/工作区动作

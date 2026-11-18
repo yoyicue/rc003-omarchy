@@ -32,6 +32,9 @@ pub trait Protocol: Send {
     /// Decode a notification into zero or more complete PCM frames.
     fn decode_audio(&mut self, data: &[u8]) -> Vec<AudioFrame>;
 
+    /// Reset packet framing and decoder state for a new audio stream.
+    fn on_audio_start(&mut self) {}
+
     /// Handle AUDIO_SYNC (update internal decoder state).
     fn on_audio_sync(&mut self, sync: &AudioSyncData);
 }

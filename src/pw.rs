@@ -28,9 +28,12 @@ const CHANNELS: u32 = 1;
 /// Size of one sample in bytes (i16 = 2 bytes).
 const SAMPLE_SIZE: usize = std::mem::size_of::<i16>();
 
-/// Signal to shut down the PipeWire source cleanly.
+/// Control messages for the PipeWire source.
 #[derive(Debug)]
-pub struct Shutdown;
+pub enum SessionControl {
+    Shutdown,
+    Reset,
+}
 
 /// Run the PipeWire audio source on the current thread (blocking).
 ///
@@ -44,12 +47,16 @@ pub fn run_pw_source(
     sample_rate: u32,
     node_name: &str,
     node_description: &str,
-    shutdown_rx: pipewire::channel::Receiver<Shutdown>,
+    shutdown_rx: pipewire::channel::Receiver<SessionControl>,
     consumer_tx: Option<tokio::sync::mpsc::Sender<crate::consumer::ConsumerEvent>>,
 ) -> Result<(), pipewire::Error> {
     pipewire::init();
 
     let mainloop = MainLoopRc::new(None)?;
+
+    // Buffer of pending PCM samples not yet consumed by PipeWire callbacks.
+    let pending = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let reset_requested = std::rc::Rc::new(std::cell::Cell::new(false));
 
     // Shared slot for the stream - set after creation, used by shutdown handler.
     let stream_slot: std::rc::Rc<std::cell::RefCell<Option<StreamRc>>> =
@@ -57,13 +64,19 @@ pub fn run_pw_source(
     let _receiver = shutdown_rx.attach(mainloop.loop_(), {
         let mainloop = mainloop.clone();
         let stream_slot = stream_slot.clone();
-        move |_: Shutdown| {
-            tracing::info!("PipeWire source shutting down");
-            // Disconnect stream while mainloop is alive (cpal pattern).
-            if let Some(stream) = stream_slot.borrow().as_ref() {
-                let _ = stream.disconnect();
+        let reset_requested = reset_requested.clone();
+        move |control| match control {
+            SessionControl::Shutdown => {
+                tracing::info!("PipeWire source shutting down");
+                if let Some(stream) = stream_slot.borrow().as_ref() {
+                    let _ = stream.disconnect();
+                }
+                mainloop.quit();
             }
-            mainloop.quit();
+            SessionControl::Reset => {
+                reset_requested.set(true);
+                tracing::debug!("PipeWire audio buffer reset");
+            }
         }
     });
 
@@ -86,9 +99,6 @@ pub fn run_pw_source(
 
     // Give the shutdown handler a reference to the stream.
     *stream_slot.borrow_mut() = Some(stream.clone());
-
-    // Buffer of pending PCM samples not yet consumed by PipeWire callbacks.
-    let pending: std::cell::RefCell<Vec<i16>> = std::cell::RefCell::new(Vec::new());
 
     // Precompute linear gain multiplier outside the RT callback to avoid
     // recomputing powf() on every frame.
@@ -122,6 +132,10 @@ pub fn run_pw_source(
             }
         })
         .process(move |stream: &Stream, _| {
+            if reset_requested.replace(false) {
+                pending.borrow_mut().clear();
+                while audio_rx.try_recv().is_ok() {}
+            }
             // NOTE: Vec operations (extend, drain) allocate inside this RT callback.
             // At ~30 fps with 257 samples/frame, allocation pressure is negligible
             // and not a real-time concern for voice audio rates.

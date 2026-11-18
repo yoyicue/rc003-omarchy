@@ -195,6 +195,7 @@ pub async fn run_session(
                     }
                     CtlEvent::AudioStart { reason, codec, stream_id } => {
                         tracing::info!("AUDIO_START (reason={:?}, codec={:?}, stream_id={:?})", reason, codec, stream_id);
+                        protocol.on_audio_start();
                         // Remote resets its sequence counter on every AUDIO_START
                         last_seq = None;
                         current_stream_id = Some(stream_id);

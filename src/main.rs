@@ -84,7 +84,7 @@ struct Cli {
 }
 
 struct PipeWireHandle {
-    shutdown_tx: pipewire::channel::Sender<pw::Shutdown>,
+    shutdown_tx: pipewire::channel::Sender<pw::SessionControl>,
     join: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -96,7 +96,7 @@ impl PipeWireHandle {
         node_description: String,
         consumer_tx: Option<tokio::sync::mpsc::Sender<consumer::ConsumerEvent>>,
     ) -> Self {
-        let (shutdown_tx, shutdown_rx) = pipewire::channel::channel::<pw::Shutdown>();
+        let (shutdown_tx, shutdown_rx) = pipewire::channel::channel::<pw::SessionControl>();
         let join = std::thread::spawn(move || {
             if let Err(error) = pw::run_pw_source(
                 pcm_rx,
@@ -115,11 +115,15 @@ impl PipeWireHandle {
             join: Some(join),
         }
     }
+
+    fn reset(&self) {
+        let _ = self.shutdown_tx.send(pw::SessionControl::Reset);
+    }
 }
 
 impl Drop for PipeWireHandle {
     fn drop(&mut self) {
-        let _ = self.shutdown_tx.send(pw::Shutdown);
+        let _ = self.shutdown_tx.send(pw::SessionControl::Shutdown);
         if let Some(join) = self.join.take() {
             if let Err(error) = join.join() {
                 tracing::error!("PipeWire thread panicked: {error:?}");
@@ -513,6 +517,15 @@ async fn main() -> anyhow::Result<()> {
                     continue;
                 }
             };
+            if codec.sample_rate() != 16_000 {
+                tracing::error!(
+                    sample_rate = codec.sample_rate(),
+                    "unsupported RC003 sample rate"
+                );
+                continue;
+            }
+            _pw_handle.reset();
+
             tracing::info!(
                 "Negotiated protocol: {} ({:?}, {}Hz)",
                 session_protocol.version(),

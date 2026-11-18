@@ -113,7 +113,7 @@ The service uses `newgrp input -c` so the daemon starts with the required input 
 
 ## Validation status
 
-- 118 unit tests pass, plus the explicit uinput integration test.
+- 121 unit tests pass, plus the explicit uinput integration test.
 - Clippy passes with warnings denied; release build succeeds.
 - Real BlueZ negotiation passed with ATVV v1.0, 16 kHz, and 120-byte frames.
 - Superwhisper enumerates `RC003 Remote Microphone` as 16 kHz mono S16LE.

@@ -179,7 +179,7 @@ impl Protocol for ProtocolV10 {
 
         if self.header_mode.is_none() {
             let buffered = self.audio_buffer.len();
-            if buffered < plain_size {
+            if buffered < headered_size {
                 return Vec::new();
             }
             if buffered == headered_size
@@ -188,8 +188,6 @@ impl Protocol for ProtocolV10 {
                 self.header_mode = Some(true);
             } else if buffered.is_multiple_of(plain_size) {
                 self.header_mode = Some(false);
-            } else if buffered < headered_size {
-                return Vec::new();
             } else {
                 tracing::warn!(
                     buffered,
@@ -223,6 +221,13 @@ impl Protocol for ProtocolV10 {
             });
         }
         frames
+    }
+
+    fn on_audio_start(&mut self) {
+        self.audio_buffer.clear();
+        self.header_mode = None;
+        self.frame_seq = 0;
+        self.decoder.reset(0, 0);
     }
 
     fn on_audio_sync(&mut self, sync: &AudioSyncData) {
@@ -417,6 +422,7 @@ mod tests {
         p.audio_frame_size = AudioFrameSize(20);
         p.decoder.reset(0, 0);
         p.frame_seq = 0;
+        p.header_mode = Some(false);
 
         let data = vec![0u8; 20]; // 20 bytes = 40 samples
         let result = p.decode_audio(&data);
@@ -439,8 +445,9 @@ mod tests {
 
         let mut p = ProtocolV10::new();
         assert_eq!(p.on_caps_resp(&caps).unwrap(), Codec::Adpcm16kHz);
+        assert!(p.decode_audio(&[0u8; 120]).is_empty());
         let frames = p.decode_audio(&[0u8; 120]);
-        assert_eq!(frames.len(), 1);
+        assert_eq!(frames.len(), 2);
         assert_eq!(frames[0].samples.len(), 240);
         assert_eq!(frames[0].codec.sample_rate(), 16000);
     }
@@ -451,11 +458,12 @@ mod tests {
         p.selected_codec = Some(Codec::Adpcm16kHz);
         p.audio_frame_size = AudioFrameSize(120);
         assert!(p.decode_audio(&[0u8; 60]).is_empty());
-        assert_eq!(p.decode_audio(&[0u8; 60]).len(), 1);
+        assert!(p.decode_audio(&[0u8; 60]).is_empty());
         let frames = p.decode_audio(&[0u8; 240]);
-        assert_eq!(frames.len(), 2);
-        assert_eq!(frames[0].seq, 1);
-        assert_eq!(frames[1].seq, 2);
+        assert_eq!(frames.len(), 3);
+        assert_eq!(frames[0].seq, 0);
+        assert_eq!(frames[1].seq, 1);
+        assert_eq!(frames[2].seq, 2);
     }
 
     #[test]
@@ -489,6 +497,38 @@ mod tests {
         let mut expected = AdpcmDecoder::new();
         expected.reset(1000, 32);
         assert_eq!(frames[0].samples, expected.decode_bytes(&[0u8; 120]));
+    }
+
+    #[test]
+    fn test_rc003_headered_frame_split_as_120_plus_6() {
+        let mut p = ProtocolV10::new();
+        p.selected_codec = Some(Codec::Adpcm16kHz);
+        p.audio_frame_size = AudioFrameSize(120);
+        let mut data = [0u8; 126];
+        data[3] = 0x03;
+        data[4] = 0xE8;
+        data[5] = 32;
+        assert!(p.decode_audio(&data[..120]).is_empty());
+        let frames = p.decode_audio(&data[120..]);
+        assert_eq!(frames.len(), 1);
+        let mut expected = AdpcmDecoder::new();
+        expected.reset(1000, 32);
+        assert_eq!(frames[0].samples, expected.decode_bytes(&[0u8; 120]));
+    }
+
+    #[test]
+    fn test_audio_start_clears_frame_layout_and_decoder_state() {
+        let mut p = ProtocolV10::new();
+        p.audio_buffer.extend_from_slice(&[1, 2, 3]);
+        p.header_mode = Some(true);
+        p.frame_seq = 42;
+        p.decoder.reset(1000, 32);
+        p.on_audio_start();
+        assert!(p.audio_buffer.is_empty());
+        assert_eq!(p.header_mode, None);
+        assert_eq!(p.frame_seq, 0);
+        assert_eq!(p.decoder.predictor(), 0);
+        assert_eq!(p.decoder.step_index(), 0);
     }
 
     // ── parse_caps_resp_payload tests ───────────────────────────────
@@ -575,6 +615,7 @@ mod tests {
         let mut p = ProtocolV10::new();
         p.selected_codec = Some(Codec::Adpcm8kHz);
         p.audio_frame_size = AudioFrameSize(20);
+        p.header_mode = Some(false);
         // 10 bytes != expected 20
         assert!(p.decode_audio(&[0u8; 10]).is_empty());
         let mut p = ProtocolV10::new();

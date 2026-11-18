@@ -1,4 +1,5 @@
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap};
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::thread::JoinHandle;
@@ -341,7 +342,7 @@ fn run_input_manager(
     mapping_enabled: bool,
 ) {
     let mut devices: HashMap<PathBuf, ManagedDevice> = HashMap::new();
-    let mut ignored_nodes: HashSet<PathBuf> = HashSet::new();
+    let mut ignored_nodes: HashMap<PathBuf, (u64, u64)> = HashMap::new();
     let mut next_scan = Instant::now();
     loop {
         if shutdown_rx.try_recv().is_ok() {
@@ -392,9 +393,9 @@ fn scan_devices(
     release_drain: Duration,
     voice_code: u16,
     mapping_enabled: bool,
-    ignored_nodes: &mut HashSet<PathBuf>,
+    ignored_nodes: &mut HashMap<PathBuf, (u64, u64)>,
 ) {
-    ignored_nodes.retain(|path| path.exists());
+    ignored_nodes.retain(|path, identity| node_identity(path) == Some(*identity));
     let Ok(entries) = std::fs::read_dir("/dev/input") else {
         return;
     };
@@ -405,7 +406,7 @@ fn scan_devices(
             .and_then(|name| name.to_str())
             .is_some_and(|name| name.starts_with("event"))
             || devices.contains_key(&path)
-            || ignored_nodes.contains(&path)
+            || ignored_nodes.get(&path) == node_identity(&path).as_ref()
         {
             continue;
         }
@@ -421,7 +422,9 @@ fn scan_devices(
                 devices.insert(path, device);
             }
             Err(error) if error.to_string() == "not RC003" => {
-                ignored_nodes.insert(path);
+                if let Some(identity) = node_identity(&path) {
+                    ignored_nodes.insert(path, identity);
+                }
             }
             Err(error) => {
                 tracing::debug!(path = %path.display(), %error, "cannot open RC003 input node");
@@ -490,6 +493,11 @@ pub fn voice_key_code(name: &str) -> Result<u16> {
         "RightAlt" => Ok(KEY_RIGHTALT),
         _ => anyhow::bail!("unsupported voice key: {name}"),
     }
+}
+
+fn node_identity(path: &Path) -> Option<(u64, u64)> {
+    let metadata = std::fs::metadata(path).ok()?;
+    Some((metadata.dev(), metadata.ino()))
 }
 
 #[cfg(test)]

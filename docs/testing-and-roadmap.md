@@ -9,7 +9,7 @@
 - M4：实现完成，13 键及 RightAlt 已通过真机验证。
 - M5：完成。服务已通过 `newgrp input -c` 安装并启用，启动权限和遥控器断线后的自动恢复均已通过验收。
 
-自动验证：118 个单元测试、显式 uinput 集成测试、Clippy（warnings denied）和 release build 全部通过。
+自动验证：121 个单元测试、显式 uinput 集成测试、Clippy（warnings denied）和 release build 全部通过。
 
 
 ## 1. 验证原则
@@ -140,3 +140,12 @@
 - 非项目生成的 unit 在停止或卸载前就会被拒绝。
 - unit 中的 `$`、反引号和 `%` 不再被 shell 或 systemd 展开。
 - 服务可执行文件安装到 `~/.local/bin`，不依赖 `target/`。
+
+## 8. 第二轮 review 回归覆盖
+
+- `120 + 6` 的带头帧拆包不会在首个 120 字节处误判为无头帧。
+- `AUDIO_START` 清空音频帧格式、分包缓存和解码器状态。
+- 非 16 kHz 协商被拒绝，新会话开始前清理 PipeWire 残留 PCM。
+- unit 中的单引号、`$`（写成 `$$`）、反引号和 `%` 均有对应处理。
+- 覆盖安装通过 `try-restart` 启动新二进制。
+- 非 RC003 节点缓存按 `(路径, dev/inode)` 识别，兼容 eventN 复用。

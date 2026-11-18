@@ -60,8 +60,9 @@ fn quote(value: &Path) -> String {
             .display()
             .to_string()
             .replace('\\', "\\\\")
+            .replace('\'', "'\\''")
             .replace('"', "\\\"")
-            .replace('$', "\\$")
+            .replace('$', "$$")
             .replace('`', "\\`")
             .replace('%', "%%")
     )
@@ -149,6 +150,7 @@ fn install(apply: bool, no_start: bool, force: bool) -> Result<()> {
         systemctl(&["enable", SERVICE_NAME])?;
     } else {
         systemctl(&["enable", "--now", SERVICE_NAME])?;
+        systemctl(&["try-restart", SERVICE_NAME])?;
     }
     println!("Installed {}", path.display());
     Ok(())
@@ -212,15 +214,23 @@ mod tests {
     #[test]
     fn quote_escapes_shell_and_systemd_expansions() {
         let quoted = quote(Path::new("/tmp/a$b`c%d"));
-        assert!(quoted.contains(r"a\$b"));
+        assert!(quoted.contains("a$$b"));
         assert!(quoted.contains(r"\`c"));
         assert!(quoted.contains("%%d"));
     }
 
     #[test]
+    fn quote_escapes_single_quotes_for_newgrp() {
+        assert_eq!(quote(Path::new("/tmp/a'b")), r#""/tmp/a'\''b""#);
+    }
+
+    #[test]
     fn service_executable_is_outside_target_directory() {
         assert!(!executable_path().to_string_lossy().contains("target"));
-        assert!(executable_path().ends_with(".local/bin/rc003-omarchy"));
+        assert_eq!(
+            executable_path().file_name().and_then(|name| name.to_str()),
+            Some("rc003-omarchy")
+        );
     }
 
     #[test]
