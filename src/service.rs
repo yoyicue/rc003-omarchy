@@ -68,12 +68,28 @@ fn quote(value: &Path) -> String {
     )
 }
 
-fn unit_text(executable: &Path, config: &Path) -> String {
-    format!(
+fn unit_text(executable: &Path, config: &Path) -> Result<String> {
+    validate_safe_path(executable)?;
+    validate_safe_path(config)?;
+    Ok(format!(
         "{SERVICE_MARKER}\n[Unit]\nDescription=RC003 microphone and input bridge\nAfter=graphical-session.target pipewire.service\nPartOf=graphical-session.target\n\n[Service]\nType=simple\nExecStart=/usr/bin/newgrp input -c '{} run --config {}'\nRestart=on-failure\nRestartSec=2\nTimeoutStopSec=15\nKillMode=control-group\nUMask=0077\n\n[Install]\nWantedBy=graphical-session.target\n",
         quote(executable),
         quote(config),
-    )
+    ))
+}
+
+fn validate_safe_path(path: &Path) -> Result<()> {
+    let text = path.display().to_string();
+    if text.is_empty()
+        || !text
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '/' | '-'))
+    {
+        anyhow::bail!(
+            "unsafe path {text:?}; only ASCII letters, digits, '.', '_', '/', and '-' are allowed"
+        );
+    }
+    Ok(())
 }
 
 fn executable_path() -> PathBuf {
@@ -84,7 +100,7 @@ fn executable_path() -> PathBuf {
 }
 
 fn generated_unit() -> Result<String> {
-    Ok(unit_text(&executable_path(), &Config::default_path()))
+    unit_text(&executable_path(), &Config::default_path())
 }
 
 fn install_executable() -> Result<()> {
@@ -149,8 +165,8 @@ fn install(apply: bool, no_start: bool, force: bool) -> Result<()> {
     if no_start {
         systemctl(&["enable", SERVICE_NAME])?;
     } else {
-        systemctl(&["enable", "--now", SERVICE_NAME])?;
-        systemctl(&["try-restart", SERVICE_NAME])?;
+        systemctl(&["enable", SERVICE_NAME])?;
+        systemctl(&["restart", SERVICE_NAME])?;
     }
     println!("Installed {}", path.display());
     Ok(())
@@ -203,25 +219,24 @@ mod tests {
     #[test]
     fn unit_contains_user_session_and_explicit_config() {
         let unit = unit_text(
-            Path::new("/opt/rc003 omarchy"),
+            Path::new("/opt/rc003-omarchy"),
             Path::new("/home/test/config.toml"),
-        );
+        )
+        .unwrap();
         assert!(unit.contains("PartOf=graphical-session.target"));
         assert!(unit.contains("/usr/bin/newgrp input -c"));
         assert!(unit.starts_with(SERVICE_MARKER));
     }
 
     #[test]
-    fn quote_escapes_shell_and_systemd_expansions() {
-        let quoted = quote(Path::new("/tmp/a$b`c%d"));
-        assert!(quoted.contains("a$$b"));
-        assert!(quoted.contains(r"\`c"));
-        assert!(quoted.contains("%%d"));
-    }
-
-    #[test]
-    fn quote_escapes_single_quotes_for_newgrp() {
-        assert_eq!(quote(Path::new("/tmp/a'b")), r#""/tmp/a'\''b""#);
+    fn unsafe_paths_are_rejected() {
+        for path in ["/tmp/a$b", "/tmp/a`b", "/tmp/a%b", "/tmp/a'b", "/tmp/a b"] {
+            assert!(
+                validate_safe_path(Path::new(path)).is_err(),
+                "accepted {path}"
+            );
+        }
+        assert!(validate_safe_path(Path::new("/opt/rc003-omarchy/config.toml")).is_ok());
     }
 
     #[test]

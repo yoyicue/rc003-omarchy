@@ -149,3 +149,12 @@
 - unit 中的单引号、`$`（写成 `$$`）、反引号和 `%` 均有对应处理。
 - 覆盖安装通过 `try-restart` 启动新二进制。
 - 非 RC003 节点缓存按 `(路径, dev/inode)` 识别，兼容 eventN 复用。
+
+## 9. 第三轮 review 回归覆盖
+
+- PCM 帧携带会话编号，旧会话帧被丢弃，新会话首帧不被 Reset 误删。
+- Reset 状态改用 `Arc<AtomicU64>` 跨线程共享，不再使用 `Rc<Cell>`。
+- SIGINT/SIGTERM 只在启动时注册一次，退出时仍执行完整清理。
+- unit 路径使用白名单字符，避免 systemd 与 shell 双层转义。
+- 覆盖安装只执行一次 `restart`。
+- `stat` 失败且缓存为空时不会误跳过输入节点。

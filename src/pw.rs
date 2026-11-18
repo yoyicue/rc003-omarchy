@@ -9,6 +9,10 @@
 
 use std::io;
 use std::sync::mpsc;
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc,
+};
 
 use pipewire::context::ContextRc;
 use pipewire::keys;
@@ -32,7 +36,12 @@ const SAMPLE_SIZE: usize = std::mem::size_of::<i16>();
 #[derive(Debug)]
 pub enum SessionControl {
     Shutdown,
-    Reset,
+}
+
+#[derive(Debug)]
+pub struct PcmFrame {
+    pub generation: u64,
+    pub samples: Vec<i16>,
 }
 
 /// Run the PipeWire audio source on the current thread (blocking).
@@ -41,12 +50,18 @@ pub enum SessionControl {
 /// virtual microphone. Returns when `shutdown_rx` receives a [`Shutdown`] message.
 ///
 /// Call from a dedicated `std::thread::spawn`.
+fn frame_is_current(frame_generation: u64, current_generation: u64) -> bool {
+    frame_generation == current_generation
+}
+
+#[allow(clippy::too_many_arguments)]
 pub fn run_pw_source(
-    audio_rx: mpsc::Receiver<Vec<i16>>,
+    audio_rx: mpsc::Receiver<PcmFrame>,
     gain_db: f32,
     sample_rate: u32,
     node_name: &str,
     node_description: &str,
+    session_generation: Arc<AtomicU64>,
     shutdown_rx: pipewire::channel::Receiver<SessionControl>,
     consumer_tx: Option<tokio::sync::mpsc::Sender<crate::consumer::ConsumerEvent>>,
 ) -> Result<(), pipewire::Error> {
@@ -56,7 +71,6 @@ pub fn run_pw_source(
 
     // Buffer of pending PCM samples not yet consumed by PipeWire callbacks.
     let pending = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
-    let reset_requested = std::rc::Rc::new(std::cell::Cell::new(false));
 
     // Shared slot for the stream - set after creation, used by shutdown handler.
     let stream_slot: std::rc::Rc<std::cell::RefCell<Option<StreamRc>>> =
@@ -64,19 +78,12 @@ pub fn run_pw_source(
     let _receiver = shutdown_rx.attach(mainloop.loop_(), {
         let mainloop = mainloop.clone();
         let stream_slot = stream_slot.clone();
-        let reset_requested = reset_requested.clone();
-        move |control| match control {
-            SessionControl::Shutdown => {
-                tracing::info!("PipeWire source shutting down");
-                if let Some(stream) = stream_slot.borrow().as_ref() {
-                    let _ = stream.disconnect();
-                }
-                mainloop.quit();
+        move |_: SessionControl| {
+            tracing::info!("PipeWire source shutting down");
+            if let Some(stream) = stream_slot.borrow().as_ref() {
+                let _ = stream.disconnect();
             }
-            SessionControl::Reset => {
-                reset_requested.set(true);
-                tracing::debug!("PipeWire audio buffer reset");
-            }
+            mainloop.quit();
         }
     });
 
@@ -111,6 +118,7 @@ pub fn run_pw_source(
     let our_node_id: std::rc::Rc<std::cell::Cell<u32>> =
         std::rc::Rc::new(std::cell::Cell::new(u32::MAX));
 
+    let mut previous_generation = session_generation.load(Ordering::Relaxed);
     let _listener = stream
         .add_local_listener_with_user_data(())
         .state_changed({
@@ -132,9 +140,10 @@ pub fn run_pw_source(
             }
         })
         .process(move |stream: &Stream, _| {
-            if reset_requested.replace(false) {
+            let current_generation = session_generation.load(Ordering::Relaxed);
+            if current_generation != previous_generation {
                 pending.borrow_mut().clear();
-                while audio_rx.try_recv().is_ok() {}
+                previous_generation = current_generation;
             }
             // NOTE: Vec operations (extend, drain) allocate inside this RT callback.
             // At ~30 fps with 257 samples/frame, allocation pressure is negligible
@@ -144,8 +153,10 @@ pub fn run_pw_source(
             loop {
                 match audio_rx.try_recv() {
                     Ok(mut frame) => {
-                        crate::adpcm::apply_gain_linear(&mut frame, gain_linear);
-                        buf.extend_from_slice(&frame);
+                        if frame_is_current(frame.generation, current_generation) {
+                            crate::adpcm::apply_gain_linear(&mut frame.samples, gain_linear);
+                            buf.extend_from_slice(&frame.samples);
+                        }
                     }
                     Err(mpsc::TryRecvError::Empty) => break,
                     Err(mpsc::TryRecvError::Disconnected) => break,
@@ -436,4 +447,15 @@ pub fn run_pw_source(
 
     tracing::info!("PipeWire source stopped");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_current_session_frames_are_accepted() {
+        assert!(!frame_is_current(6, 7));
+        assert!(frame_is_current(7, 7));
+    }
 }

@@ -17,6 +17,10 @@ use anyhow::Context;
 use clap::Parser;
 use std::collections::HashSet;
 use std::path::PathBuf;
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc,
+};
 use std::time::Duration;
 
 /// Capacity of the async channel between the ATVV session and the decoder task.
@@ -85,18 +89,21 @@ struct Cli {
 
 struct PipeWireHandle {
     shutdown_tx: pipewire::channel::Sender<pw::SessionControl>,
+    generation: Arc<AtomicU64>,
     join: Option<std::thread::JoinHandle<()>>,
 }
 
 impl PipeWireHandle {
     fn new(
-        pcm_rx: std::sync::mpsc::Receiver<Vec<i16>>,
+        pcm_rx: std::sync::mpsc::Receiver<pw::PcmFrame>,
         gain: f32,
         node_name: String,
         node_description: String,
         consumer_tx: Option<tokio::sync::mpsc::Sender<consumer::ConsumerEvent>>,
     ) -> Self {
         let (shutdown_tx, shutdown_rx) = pipewire::channel::channel::<pw::SessionControl>();
+        let generation = Arc::new(AtomicU64::new(0));
+        let session_generation = generation.clone();
         let join = std::thread::spawn(move || {
             if let Err(error) = pw::run_pw_source(
                 pcm_rx,
@@ -104,6 +111,7 @@ impl PipeWireHandle {
                 16_000,
                 &node_name,
                 &node_description,
+                session_generation,
                 shutdown_rx,
                 consumer_tx,
             ) {
@@ -112,12 +120,13 @@ impl PipeWireHandle {
         });
         Self {
             shutdown_tx,
+            generation,
             join: Some(join),
         }
     }
 
-    fn reset(&self) {
-        let _ = self.shutdown_tx.send(pw::SessionControl::Reset);
+    fn reset(&self) -> u64 {
+        self.generation.fetch_add(1, Ordering::Relaxed) + 1
     }
 }
 
@@ -147,19 +156,38 @@ fn sanitize_name(s: &str) -> String {
     result.trim_matches('-').to_string()
 }
 
-#[cfg(unix)]
-async fn shutdown_signal() {
-    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-        .expect("failed to install SIGTERM handler");
-    tokio::select! {
-        _ = tokio::signal::ctrl_c() => {}
-        _ = terminate.recv() => {}
-    }
+struct ShutdownSignal {
+    #[cfg(unix)]
+    interrupt: tokio::signal::unix::Signal,
+    #[cfg(unix)]
+    terminate: tokio::signal::unix::Signal,
 }
 
-#[cfg(not(unix))]
-async fn shutdown_signal() {
-    let _ = shutdown_signal().await;
+impl ShutdownSignal {
+    fn new() -> anyhow::Result<Self> {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{signal, SignalKind};
+            Ok(Self {
+                interrupt: signal(SignalKind::interrupt())?,
+                terminate: signal(SignalKind::terminate())?,
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            Ok(Self {})
+        }
+    }
+
+    async fn wait(&mut self) {
+        #[cfg(unix)]
+        tokio::select! {
+            _ = self.interrupt.recv() => {}
+            _ = self.terminate.recv() => {}
+        }
+        #[cfg(not(unix))]
+        let _ = tokio::signal::ctrl_c().await;
+    }
 }
 
 /// Wait for device to be connected, using event stream if possible.
@@ -304,6 +332,8 @@ async fn main() -> anyhow::Result<()> {
         tracing::warn!("--mic-on-demand without --frame-timeout: mic may get stuck in Opening state if remote is asleep");
     }
 
+    let mut shutdown = ShutdownSignal::new()?;
+
     let _input_handle = if cli.no_input {
         None
     } else {
@@ -356,7 +386,7 @@ async fn main() -> anyhow::Result<()> {
                         }
                     }
                 }
-                _ = shutdown_signal() => {
+                _ = shutdown.wait() => {
                     tracing::info!("Shutting down");
                     return Ok(());
                 }
@@ -365,7 +395,7 @@ async fn main() -> anyhow::Result<()> {
 
         tokio::select! {
             _ = ensure_connected(&device, retry_delay) => {}
-            _ = shutdown_signal() => {
+            _ = shutdown.wait() => {
                 tracing::info!("Shutting down");
                 return Ok(());
             }
@@ -388,7 +418,7 @@ async fn main() -> anyhow::Result<()> {
                         }
                     }
                 }
-                _ = shutdown_signal() => {
+                _ = shutdown.wait() => {
                     tracing::info!("Shutting down");
                     return Ok(());
                 }
@@ -451,7 +481,7 @@ async fn main() -> anyhow::Result<()> {
             (None, None)
         };
 
-        let (pcm_tx, pcm_rx) = std::sync::mpsc::channel::<Vec<i16>>();
+        let (pcm_tx, pcm_rx) = std::sync::mpsc::channel::<pw::PcmFrame>();
         let (consumer_tx, mut consumer_rx) = if cli.mic_on_demand {
             let (tx, rx) = tokio::sync::mpsc::channel(16);
             (Some(tx), Some(rx))
@@ -496,7 +526,7 @@ async fn main() -> anyhow::Result<()> {
                         tracing::error!("Negotiation failed: {e}");
                         tokio::select! {
                             _ = tokio::time::sleep(retry_delay) => {}
-                            _ = shutdown_signal() => {
+                            _ = shutdown.wait() => {
                                 tracing::info!("Shutting down");
                                 break 'discover;
                             }
@@ -504,7 +534,7 @@ async fn main() -> anyhow::Result<()> {
                         continue;
                     }
                 },
-                _ = shutdown_signal() => {
+                _ = shutdown.wait() => {
                     tracing::info!("interrupted during negotiation");
                     break 'discover;
                 }
@@ -524,7 +554,7 @@ async fn main() -> anyhow::Result<()> {
                 );
                 continue;
             }
-            _pw_handle.reset();
+            let generation = _pw_handle.reset();
 
             tracing::info!(
                 "Negotiated protocol: {} ({:?}, {}Hz)",
@@ -543,7 +573,10 @@ async fn main() -> anyhow::Result<()> {
                     let mut samples = frame.samples;
                     adpcm::declip(&mut samples);
                     adpcm::lowpass(&mut samples);
-                    let _ = pcm_tx.send(samples);
+                    let _ = pcm_tx.send(pw::PcmFrame {
+                        generation,
+                        samples,
+                    });
                 }
             });
 
@@ -567,7 +600,7 @@ async fn main() -> anyhow::Result<()> {
                         mic_on_demand: cli.mic_on_demand,
                     },
                 ) => result,
-                _ = shutdown_signal() => {
+                _ = shutdown.wait() => {
                     let mic_close = session_protocol.mic_close_cmd(
                         protocol::types::StreamId::ANY,
                     );
@@ -609,7 +642,7 @@ async fn main() -> anyhow::Result<()> {
             }
             tokio::select! {
                 _ = tokio::time::sleep(reconnect_delay) => {}
-                _ = shutdown_signal() => {
+                _ = shutdown.wait() => {
                     tracing::info!("Interrupted during reconnect backoff, shutting down");
                     break 'discover;
                 }
@@ -624,7 +657,7 @@ async fn main() -> anyhow::Result<()> {
                 _ = ensure_connected(&device, retry_delay) => {
                     tracing::info!("Device reconnected");
                 }
-                _ = shutdown_signal() => {
+                _ = shutdown.wait() => {
                     tracing::info!("Interrupted during reconnection, shutting down");
                     break 'discover;
                 }
@@ -657,7 +690,7 @@ async fn main() -> anyhow::Result<()> {
                             }
                         }
                     }
-                    _ = shutdown_signal() => {
+                    _ = shutdown.wait() => {
                         tracing::info!("Interrupted during characteristic resolution, shutting down");
                         break 'discover;
                     }

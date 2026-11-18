@@ -406,7 +406,9 @@ fn scan_devices(
             .and_then(|name| name.to_str())
             .is_some_and(|name| name.starts_with("event"))
             || devices.contains_key(&path)
-            || ignored_nodes.get(&path) == node_identity(&path).as_ref()
+            || ignored_nodes
+                .get(&path)
+                .is_some_and(|cached| node_identity(&path).as_ref() == Some(cached))
         {
             continue;
         }
