@@ -128,3 +128,7 @@ release: F9 up + ATVV stop/drain
 ATVVoice 已下载到 `~/Work/tries/atvvoice`，其 `src/pw.rs` 是本项目原生 PipeWire 源的主要实现参考。需要保留的关键点包括独立 PipeWire OS 线程、`Audio/Source`、`Direction::Output` 和显式 MONO channel position。
 
 不得把 ATVVoice 文档中其他遥控器的 8 kHz、134 字节帧、逐帧 DVI 状态重置或 MIC_OPEN 参数直接套到 RC003-MC。目标设备当前已确认的是 ATVV v1.0、16 kHz 和 120 字节帧；其命令和 ADPCM 行为以 RC003 参考实现及本机后续真实语音验收为准。
+
+## 11. 跨会话虚拟源生命周期
+
+`rc003-omarchy` 的 PipeWire 源在进程生命周期内常驻。BLE 重连只结束当前 ATVV 会话并替换 PCM 生产者，不销毁或重新创建虚拟源，避免 Superwhisper 因源 ID 变化而回退或要求重新选择。进程收到 SIGINT/SIGTERM 后才统一关闭源。

@@ -89,6 +89,7 @@ udev 规则应只匹配 RC003 的事件节点；uinput 规则可授权 `input` �
 - `After=graphical-session.target pipewire.service`，并随图形会话退出。
 - `Restart=on-failure`，使用有限重启间隔，避免持续错误刷日志。
 - 使用绝对可执行路径和显式配置路径；通过 `newgrp input -c` 启动，使服务进程获得输入组权限。
+- 安装时把当前二进制复制到 `~/.local/bin/rc003-omarchy`，避免 unit 指向 `target/` 构建目录；`$`、反引号和 `%` 均需转义。
 - 退出时停止所有子任务并释放输入、F9 和音频资源。
 - 默认只在用户明确安装并启用后常驻，不在首次构建时自动启动。
 

@@ -93,7 +93,7 @@ pub struct SessionConfig<'a> {
     pub timeouts: &'a SessionTimeouts,
     pub command_rx: Option<&'a mut mpsc::Receiver<ExternalCommand>>,
     pub state_tx: Option<&'a tokio::sync::watch::Sender<State>>,
-    pub consumer_rx: Option<tokio::sync::mpsc::Receiver<consumer::ConsumerEvent>>,
+    pub consumer_rx: Option<&'a mut tokio::sync::mpsc::Receiver<consumer::ConsumerEvent>>,
     pub mic_on_demand: bool,
 }
 
@@ -271,7 +271,7 @@ pub async fn run_session(
                         last_seq = Some(frame.seq);
 
                         if audio_tx.send(frame).await.is_err() {
-                            tracing::warn!("audio frame dropped: receiver channel full or closed");
+                            tracing::warn!("audio frame dropped: receiver channel closed");
                         }
                     }
                 }
@@ -890,7 +890,7 @@ mod tests {
         let (device, mut ctrl) = mock_device();
         let (audio_tx, _audio_rx) = tokio_mpsc::channel(64);
         let (state_tx, mut state_rx) = tokio::sync::watch::channel(State::Connected);
-        let (consumer_tx, consumer_rx) = tokio_mpsc::channel(16);
+        let (consumer_tx, mut consumer_rx) = tokio_mpsc::channel(16);
 
         let timeouts = SessionTimeouts {
             frame_timeout: Duration::ZERO,
@@ -922,7 +922,7 @@ mod tests {
                     timeouts: &timeouts,
                     command_rx: None,
                     state_tx: Some(&state_tx),
-                    consumer_rx: Some(consumer_rx),
+                    consumer_rx: Some(&mut consumer_rx),
                     mic_on_demand: true,
                 },
             )
@@ -960,7 +960,7 @@ mod tests {
         let (device, mut ctrl) = mock_device();
         let (audio_tx, _audio_rx) = tokio_mpsc::channel(64);
         let (state_tx, mut state_rx) = tokio::sync::watch::channel(State::Connected);
-        let (consumer_tx, consumer_rx) = tokio_mpsc::channel(16);
+        let (consumer_tx, mut consumer_rx) = tokio_mpsc::channel(16);
 
         let timeouts = SessionTimeouts {
             frame_timeout: Duration::ZERO,
@@ -991,7 +991,7 @@ mod tests {
                     timeouts: &timeouts,
                     command_rx: None,
                     state_tx: Some(&state_tx),
-                    consumer_rx: Some(consumer_rx),
+                    consumer_rx: Some(&mut consumer_rx),
                     mic_on_demand: true,
                 },
             )
@@ -1043,7 +1043,7 @@ mod tests {
         let (device, mut ctrl) = mock_device();
         let (audio_tx, _audio_rx) = tokio_mpsc::channel(64);
         let (state_tx, mut state_rx) = tokio::sync::watch::channel(State::Connected);
-        let (consumer_tx, consumer_rx) = tokio_mpsc::channel(16);
+        let (consumer_tx, mut consumer_rx) = tokio_mpsc::channel(16);
 
         let timeouts = SessionTimeouts {
             frame_timeout: Duration::ZERO,
@@ -1075,7 +1075,7 @@ mod tests {
                     timeouts: &timeouts,
                     command_rx: None,
                     state_tx: Some(&state_tx),
-                    consumer_rx: Some(consumer_rx),
+                    consumer_rx: Some(&mut consumer_rx),
                     mic_on_demand: false, // disabled
                 },
             )
@@ -1116,7 +1116,7 @@ mod tests {
         let (device, mut ctrl) = mock_device();
         let (audio_tx, _audio_rx) = tokio_mpsc::channel(64);
         let (state_tx, mut state_rx) = tokio::sync::watch::channel(State::Connected);
-        let (consumer_tx, consumer_rx) = tokio_mpsc::channel(16);
+        let (consumer_tx, mut consumer_rx) = tokio_mpsc::channel(16);
 
         let timeouts = SessionTimeouts {
             frame_timeout: Duration::ZERO,
@@ -1148,7 +1148,7 @@ mod tests {
                     timeouts: &timeouts,
                     command_rx: None,
                     state_tx: Some(&state_tx),
-                    consumer_rx: Some(consumer_rx),
+                    consumer_rx: Some(&mut consumer_rx),
                     mic_on_demand: true,
                 },
             )
@@ -1202,7 +1202,7 @@ mod tests {
         let (device, mut ctrl) = mock_device();
         let (audio_tx, _audio_rx) = tokio_mpsc::channel(64);
         let (state_tx, mut state_rx) = tokio::sync::watch::channel(State::Connected);
-        let (consumer_tx, consumer_rx) = tokio_mpsc::channel(16);
+        let (consumer_tx, mut consumer_rx) = tokio_mpsc::channel(16);
 
         let timeouts = SessionTimeouts {
             frame_timeout: Duration::ZERO,
@@ -1233,7 +1233,7 @@ mod tests {
                     timeouts: &timeouts,
                     command_rx: None,
                     state_tx: Some(&state_tx),
-                    consumer_rx: Some(consumer_rx),
+                    consumer_rx: Some(&mut consumer_rx),
                     mic_on_demand: true,
                 },
             )
@@ -1282,7 +1282,7 @@ mod tests {
         let (device, mut ctrl) = mock_device();
         let (audio_tx, _audio_rx) = tokio_mpsc::channel(64);
         let (state_tx, mut state_rx) = tokio::sync::watch::channel(State::Connected);
-        let (consumer_tx, consumer_rx) = tokio_mpsc::channel(16);
+        let (consumer_tx, mut consumer_rx) = tokio_mpsc::channel(16);
 
         let timeouts = SessionTimeouts {
             frame_timeout: Duration::ZERO,
@@ -1313,7 +1313,7 @@ mod tests {
                     timeouts: &timeouts,
                     command_rx: None,
                     state_tx: Some(&state_tx),
-                    consumer_rx: Some(consumer_rx),
+                    consumer_rx: Some(&mut consumer_rx),
                     mic_on_demand: true,
                 },
             )

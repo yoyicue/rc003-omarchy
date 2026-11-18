@@ -463,11 +463,28 @@ mod tests {
         let mut p = ProtocolV10::new();
         p.selected_codec = Some(Codec::Adpcm16kHz);
         p.audio_frame_size = AudioFrameSize(120);
-        let mut data = vec![0u8; 126];
+        let mut data = [0u8; 126];
         data[3] = 0x03;
         data[4] = 0xE8;
         data[5] = 32;
         let frames = p.decode_audio(&data);
+        assert_eq!(frames.len(), 1);
+        let mut expected = AdpcmDecoder::new();
+        expected.reset(1000, 32);
+        assert_eq!(frames[0].samples, expected.decode_bytes(&[0u8; 120]));
+    }
+
+    #[test]
+    fn test_rc003_headered_frame_split_across_notifications() {
+        let mut p = ProtocolV10::new();
+        p.selected_codec = Some(Codec::Adpcm16kHz);
+        p.audio_frame_size = AudioFrameSize(120);
+        let mut data = [0u8; 126];
+        data[3] = 0x03;
+        data[4] = 0xE8;
+        data[5] = 32;
+        assert!(p.decode_audio(&data[..60]).is_empty());
+        let frames = p.decode_audio(&data[60..]);
         assert_eq!(frames.len(), 1);
         let mut expected = AdpcmDecoder::new();
         expected.reset(1000, 32);

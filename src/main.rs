@@ -83,6 +83,51 @@ struct Cli {
     verbose: u8,
 }
 
+struct PipeWireHandle {
+    shutdown_tx: pipewire::channel::Sender<pw::Shutdown>,
+    join: Option<std::thread::JoinHandle<()>>,
+}
+
+impl PipeWireHandle {
+    fn new(
+        pcm_rx: std::sync::mpsc::Receiver<Vec<i16>>,
+        gain: f32,
+        node_name: String,
+        node_description: String,
+        consumer_tx: Option<tokio::sync::mpsc::Sender<consumer::ConsumerEvent>>,
+    ) -> Self {
+        let (shutdown_tx, shutdown_rx) = pipewire::channel::channel::<pw::Shutdown>();
+        let join = std::thread::spawn(move || {
+            if let Err(error) = pw::run_pw_source(
+                pcm_rx,
+                gain,
+                16_000,
+                &node_name,
+                &node_description,
+                shutdown_rx,
+                consumer_tx,
+            ) {
+                tracing::error!("PipeWire error: {error}");
+            }
+        });
+        Self {
+            shutdown_tx,
+            join: Some(join),
+        }
+    }
+}
+
+impl Drop for PipeWireHandle {
+    fn drop(&mut self) {
+        let _ = self.shutdown_tx.send(pw::Shutdown);
+        if let Some(join) = self.join.take() {
+            if let Err(error) = join.join() {
+                tracing::error!("PipeWire thread panicked: {error:?}");
+            }
+        }
+    }
+}
+
 /// Sanitize a string for use as a D-Bus name component and PipeWire node suffix.
 /// Lowercases, replaces non-alphanumeric chars with hyphens, collapses runs, trims.
 #[must_use]
@@ -96,6 +141,21 @@ fn sanitize_name(s: &str) -> String {
         }
     }
     result.trim_matches('-').to_string()
+}
+
+#[cfg(unix)]
+async fn shutdown_signal() {
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .expect("failed to install SIGTERM handler");
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {}
+        _ = terminate.recv() => {}
+    }
+}
+
+#[cfg(not(unix))]
+async fn shutdown_signal() {
+    let _ = shutdown_signal().await;
 }
 
 /// Wait for device to be connected, using event stream if possible.
@@ -210,7 +270,7 @@ async fn main() -> anyhow::Result<()> {
     if cli.description.is_none() {
         cli.description = Some(config.audio.description.clone());
     }
-    cli.no_input |= !config.input.enabled || !config.mapping.enabled;
+    cli.no_input |= !config.input.enabled;
 
     // Init tracing based on verbosity
     let filter = match cli.verbose {
@@ -247,6 +307,7 @@ async fn main() -> anyhow::Result<()> {
             config.input.release_grab_on_exit,
             Duration::from_millis(config.audio.release_drain_ms),
             input::voice_key_code(&config.input.voice_key)?,
+            config.mapping.enabled,
         )?)
     };
 
@@ -291,7 +352,7 @@ async fn main() -> anyhow::Result<()> {
                         }
                     }
                 }
-                _ = tokio::signal::ctrl_c() => {
+                _ = shutdown_signal() => {
                     tracing::info!("Shutting down");
                     return Ok(());
                 }
@@ -300,7 +361,7 @@ async fn main() -> anyhow::Result<()> {
 
         tokio::select! {
             _ = ensure_connected(&device, retry_delay) => {}
-            _ = tokio::signal::ctrl_c() => {
+            _ = shutdown_signal() => {
                 tracing::info!("Shutting down");
                 return Ok(());
             }
@@ -323,7 +384,7 @@ async fn main() -> anyhow::Result<()> {
                         }
                     }
                 }
-                _ = tokio::signal::ctrl_c() => {
+                _ = shutdown_signal() => {
                     tracing::info!("Shutting down");
                     return Ok(());
                 }
@@ -386,6 +447,21 @@ async fn main() -> anyhow::Result<()> {
             (None, None)
         };
 
+        let (pcm_tx, pcm_rx) = std::sync::mpsc::channel::<Vec<i16>>();
+        let (consumer_tx, mut consumer_rx) = if cli.mic_on_demand {
+            let (tx, rx) = tokio::sync::mpsc::channel(16);
+            (Some(tx), Some(rx))
+        } else {
+            (None, None)
+        };
+        let _pw_handle = PipeWireHandle::new(
+            pcm_rx,
+            gain,
+            node_name.clone(),
+            node_description.clone(),
+            consumer_tx,
+        );
+
         // Inner loop: session → reconnect (same device).
         loop {
             let ble_device = ble::BluerDevice {
@@ -416,7 +492,7 @@ async fn main() -> anyhow::Result<()> {
                         tracing::error!("Negotiation failed: {e}");
                         tokio::select! {
                             _ = tokio::time::sleep(retry_delay) => {}
-                            _ = tokio::signal::ctrl_c() => {
+                            _ = shutdown_signal() => {
                                 tracing::info!("Shutting down");
                                 break 'discover;
                             }
@@ -424,7 +500,7 @@ async fn main() -> anyhow::Result<()> {
                         continue;
                     }
                 },
-                _ = tokio::signal::ctrl_c() => {
+                _ = shutdown_signal() => {
                     tracing::info!("interrupted during negotiation");
                     break 'discover;
                 }
@@ -444,35 +520,9 @@ async fn main() -> anyhow::Result<()> {
                 codec.sample_rate()
             );
 
-            let sample_rate = codec.sample_rate();
             let (frame_tx, mut frame_rx) =
                 tokio::sync::mpsc::channel::<protocol::types::AudioFrame>(DECODER_CHANNEL_CAPACITY);
-            let (pcm_tx, pcm_rx) = std::sync::mpsc::channel::<Vec<i16>>();
-            let (pw_shutdown_tx, pw_shutdown_rx) = pipewire::channel::channel::<pw::Shutdown>();
-
-            let (consumer_tx, consumer_rx) = if cli.mic_on_demand {
-                let (tx, rx) = tokio::sync::mpsc::channel(16);
-                (Some(tx), Some(rx))
-            } else {
-                (None, None)
-            };
-
-            let pw_name = node_name.clone();
-            let pw_desc = node_description.clone();
-            let pw_thread = std::thread::spawn(move || {
-                if let Err(e) = pw::run_pw_source(
-                    pcm_rx,
-                    gain,
-                    sample_rate,
-                    &pw_name,
-                    &pw_desc,
-                    pw_shutdown_rx,
-                    consumer_tx,
-                ) {
-                    tracing::error!("PipeWire error: {}", e);
-                }
-            });
-
+            let pcm_tx = pcm_tx.clone();
             // Post-processing task: Protocol already decoded the audio,
             // so we just apply declip/lowpass/gain and forward PCM.
             let decoder_handle = tokio::spawn(async move {
@@ -492,6 +542,7 @@ async fn main() -> anyhow::Result<()> {
                     atvv::SessionConfig {
                         audio_tx: frame_tx,
                         timeouts: &timeouts,
+
                         command_rx: {
                             #[cfg(feature = "dbus")]
                             { dbus_cmd_rx.as_mut() }
@@ -499,29 +550,24 @@ async fn main() -> anyhow::Result<()> {
                             { None }
                         },
                         state_tx: Some(&state_tx),
-                        consumer_rx,
+                        consumer_rx: consumer_rx.as_mut(),
                         mic_on_demand: cli.mic_on_demand,
                     },
                 ) => result,
-                _ = tokio::signal::ctrl_c() => {
+                _ = shutdown_signal() => {
                     let mic_close = session_protocol.mic_close_cmd(
                         protocol::types::StreamId::ANY,
                     );
-                    let _ = chars.tx.write(&mic_close).await;
+                    let _ = atvv::BleDevice::write_command(&ble_device, &mic_close).await;
                     tracing::info!("Sent MIC_CLOSE, shutting down");
-                    let _ = pw_shutdown_tx.send(pw::Shutdown);
                     break 'discover;
                 }
             };
 
-            // Tear down audio pipeline: frame_tx was moved into run_session and
-            // is now dropped, so the decoder task's recv() returns None and it
-            // finishes naturally. Await it for a clean shutdown instead of aborting.
-            let _ = pw_shutdown_tx.send(pw::Shutdown);
+            // frame_tx was moved into run_session and is now dropped, so the
+            // decoder task finishes naturally. The PipeWire source stays alive
+            // across reconnects; only its PCM producer is replaced.
             let _ = decoder_handle.await;
-            if let Err(panic) = pw_thread.join() {
-                tracing::error!("PipeWire thread panicked: {panic:?}");
-            }
 
             match &session_result {
                 Ok(()) => tracing::info!("Session ended"),
@@ -550,7 +596,7 @@ async fn main() -> anyhow::Result<()> {
             }
             tokio::select! {
                 _ = tokio::time::sleep(reconnect_delay) => {}
-                _ = tokio::signal::ctrl_c() => {
+                _ = shutdown_signal() => {
                     tracing::info!("Interrupted during reconnect backoff, shutting down");
                     break 'discover;
                 }
@@ -565,7 +611,7 @@ async fn main() -> anyhow::Result<()> {
                 _ = ensure_connected(&device, retry_delay) => {
                     tracing::info!("Device reconnected");
                 }
-                _ = tokio::signal::ctrl_c() => {
+                _ = shutdown_signal() => {
                     tracing::info!("Interrupted during reconnection, shutting down");
                     break 'discover;
                 }
@@ -598,7 +644,7 @@ async fn main() -> anyhow::Result<()> {
                             }
                         }
                     }
-                    _ = tokio::signal::ctrl_c() => {
+                    _ = shutdown_signal() => {
                         tracing::info!("Interrupted during characteristic resolution, shutting down");
                         break 'discover;
                     }

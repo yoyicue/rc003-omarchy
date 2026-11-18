@@ -58,7 +58,7 @@ RC003 在 Linux 配对后通过 `/dev/input/event*` 上报 HID。项目在内核
 语音键在普通映射之前处理：
 
 ```text
-RC003 voice raw down → emit F9 down → Superwhisper starts native dictation
+RC003 voice raw down → emit RightAlt down → Superwhisper starts native dictation
 RC003 voice repeat   → ignore
 RC003 voice raw up   → optional measured drain → emit F9 up → transcription and insertion
 ```
@@ -67,7 +67,7 @@ RC003 voice raw up   → optional measured drain → emit F9 up → transcriptio
 
 - 不等待 tap/hold/double 判定，不增加手势延迟。
 - 不经过宏、文本注入或 `superwhisper transcribe`。
-- F9 down/up 必须一一对应；异常退出和断连时最多补发一次 F9 up。
+- RightAlt/F9 down/up 必须一一对应；异常退出和断连时最多补发一次 F9 up。
 - 默认 release drain 为 0，只有真机证明尾字被截断时才启用有限延迟。
 - 语音键不支持普通单击、双击或长按动作，避免破坏听写生命周期。
 
@@ -131,7 +131,7 @@ Superwhisper 独占以下职责：
 本项目只负责：
 
 - 报告音频源是否可见、是否被选择。
-- 提供实时音频和 F9 down/up。
+- 提供实时音频和 RightAlt/F9 down/up。
 - 在设备不在线、源未选择或快捷键不符合预期时给出诊断。
 
 守护进程不调用 `superwhisper record/start/stop/transcribe` 来模拟原生路径，也不修改其模型、账户或许可配置。

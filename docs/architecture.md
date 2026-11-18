@@ -82,7 +82,7 @@ src/
   input/
     mod.rs             # evdev 发现和热插拔
     device.rs          # 独占与 uinput 转发
-    mapping.rs         # tap/hold/double、层、原始 F9 通道
+    mapping.rs         # RightAlt/F9 保持与基础按键映射
     actions.rs         # 动作后端
   integrate/
     hyprland.rs        # 可选窗口/工作区动作
@@ -103,7 +103,7 @@ udev/
 - 使用 Tokio 管理 BLE、设备发现和生命周期任务。
 - PipeWire 回调线程不执行 BLE、日志格式化、堆分配、锁等待或桌面 IPC。
 - BLE 到音频回调使用有界队列；队列满时保实时性并记录丢弃计数，不允许无限增加延迟。
-- 输入映射单独处理 evdev fd；F9 down/up 不等待音频任务。
+- 输入映射单独处理 evdev fd；RightAlt/F9 down/up 不等待音频任务。
 - 每次物理连接分配单调递增的 generation。旧 generation 的回调、定时器和断开事件不得污染新会话。
 - 所有任务由统一 cancellation token 关闭；退出时必须释放 F9、其他按住键、evdev grab 和 PipeWire 流。
 

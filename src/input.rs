@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::thread::JoinHandle;
@@ -71,6 +71,7 @@ fn output_key_codes() -> Vec<u16> {
 
 #[derive(Debug)]
 pub struct InputMapper {
+    mapping_enabled: bool,
     voice_code: u16,
     voice_down: bool,
     voice_release_at: Option<Instant>,
@@ -81,6 +82,7 @@ pub struct InputMapper {
 impl Default for InputMapper {
     fn default() -> Self {
         Self {
+            mapping_enabled: true,
             voice_code: KEY_F9,
             voice_down: false,
             voice_release_at: None,
@@ -99,8 +101,18 @@ impl InputMapper {
         }
     }
 
+    #[cfg(test)]
     pub fn with_voice_key(voice_code: u16, release_drain: Duration) -> Self {
         Self {
+            voice_code,
+            release_drain,
+            ..Self::default()
+        }
+    }
+
+    pub fn with_options(voice_code: u16, release_drain: Duration, mapping_enabled: bool) -> Self {
+        Self {
+            mapping_enabled,
             voice_code,
             release_drain,
             ..Self::default()
@@ -128,6 +140,9 @@ impl InputMapper {
         let value = event.value();
         if code == KEY_F5 || code == KEY_F9 {
             return self.map_voice(value);
+        }
+        if !self.mapping_enabled {
+            return Vec::new();
         }
         let Some(output) = output_key(code) else {
             return Vec::new();
@@ -204,6 +219,7 @@ impl ManagedDevice {
         release_grab_on_exit: bool,
         release_drain: Duration,
         voice_code: u16,
+        mapping_enabled: bool,
     ) -> Result<Self> {
         let mut device = Device::open(path).with_context(|| format!("open {}", path.display()))?;
         let id = device.input_id();
@@ -227,14 +243,14 @@ impl ManagedDevice {
         Ok(Self {
             device,
             virtual_device,
-            mapper: InputMapper::with_voice_key(voice_code, release_drain),
+            mapper: InputMapper::with_options(voice_code, release_drain, mapping_enabled),
             release_grab_on_exit,
         })
     }
 
     fn process_events(&mut self) -> Result<()> {
-        let events = self.device.fetch_events()?;
         let mut mapped = self.mapper.pending_events();
+        let events = self.device.fetch_events()?;
         for event in events {
             if event.event_type() == EventType::KEY {
                 tracing::debug!(
@@ -277,19 +293,26 @@ pub struct InputManagerHandle {
 impl InputManagerHandle {
     #[cfg(test)]
     pub fn start() -> Result<Self> {
-        Self::start_with_release_grab(true, Duration::ZERO, KEY_F9)
+        Self::start_with_release_grab(true, Duration::ZERO, KEY_F9, true)
     }
 
     pub fn start_with_release_grab(
         release_grab_on_exit: bool,
         release_drain: Duration,
         voice_code: u16,
+        mapping_enabled: bool,
     ) -> Result<Self> {
         let (shutdown_tx, shutdown_rx) = mpsc::channel();
         let join = std::thread::Builder::new()
             .name("rc003-input".to_string())
             .spawn(move || {
-                run_input_manager(shutdown_rx, release_grab_on_exit, release_drain, voice_code)
+                run_input_manager(
+                    shutdown_rx,
+                    release_grab_on_exit,
+                    release_drain,
+                    voice_code,
+                    mapping_enabled,
+                )
             })
             .context("start RC003 input thread")?;
         Ok(Self {
@@ -315,8 +338,10 @@ fn run_input_manager(
     release_grab_on_exit: bool,
     release_drain: Duration,
     voice_code: u16,
+    mapping_enabled: bool,
 ) {
     let mut devices: HashMap<PathBuf, ManagedDevice> = HashMap::new();
+    let mut ignored_nodes: HashSet<PathBuf> = HashSet::new();
     let mut next_scan = Instant::now();
     loop {
         if shutdown_rx.try_recv().is_ok() {
@@ -328,6 +353,8 @@ fn run_input_manager(
                 release_grab_on_exit,
                 release_drain,
                 voice_code,
+                mapping_enabled,
+                &mut ignored_nodes,
             );
             next_scan = Instant::now() + INPUT_SCAN_INTERVAL;
         }
@@ -364,7 +391,10 @@ fn scan_devices(
     release_grab_on_exit: bool,
     release_drain: Duration,
     voice_code: u16,
+    mapping_enabled: bool,
+    ignored_nodes: &mut HashSet<PathBuf>,
 ) {
+    ignored_nodes.retain(|path| path.exists());
     let Ok(entries) = std::fs::read_dir("/dev/input") else {
         return;
     };
@@ -375,15 +405,24 @@ fn scan_devices(
             .and_then(|name| name.to_str())
             .is_some_and(|name| name.starts_with("event"))
             || devices.contains_key(&path)
+            || ignored_nodes.contains(&path)
         {
             continue;
         }
-        match ManagedDevice::open(&path, release_grab_on_exit, release_drain, voice_code) {
+        match ManagedDevice::open(
+            &path,
+            release_grab_on_exit,
+            release_drain,
+            voice_code,
+            mapping_enabled,
+        ) {
             Ok(device) => {
                 tracing::info!(path = %path.display(), "RC003 input ready");
                 devices.insert(path, device);
             }
-            Err(error) if error.to_string() == "not RC003" => {}
+            Err(error) if error.to_string() == "not RC003" => {
+                ignored_nodes.insert(path);
+            }
             Err(error) => {
                 tracing::debug!(path = %path.display(), %error, "cannot open RC003 input node");
             }
@@ -503,6 +542,13 @@ mod tests {
         let mut mapper = InputMapper::with_voice_key(KEY_RIGHTALT, Duration::ZERO);
         assert_eq!(mapper.map(key_event(KEY_F5, 1))[0].code(), KEY_RIGHTALT);
         assert_eq!(mapper.map(key_event(KEY_F5, 0))[0].code(), KEY_RIGHTALT);
+    }
+
+    #[test]
+    fn mapping_disabled_keeps_voice_but_disables_other_keys() {
+        let mut mapper = InputMapper::with_options(KEY_F9, Duration::ZERO, false);
+        assert_eq!(mapper.map(key_event(KEY_F5, 1))[0].code(), KEY_F9);
+        assert!(mapper.map(key_event(KEY_UP, 1)).is_empty());
     }
 
     #[test]

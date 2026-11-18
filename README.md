@@ -7,7 +7,7 @@ Xiaomi Bluetooth Remote 2 Pro (RC003) integration for Omarchy, focused on native
 - BlueZ ATVV discovery, capability negotiation, command writes, reconnects, and session handling.
 - RC003-specific 16 kHz IMA/DVI ADPCM decoding, including 120-byte raw frames, 126-byte headered frames, and fragmented/coalesced notifications.
 - Native PipeWire `Audio/Source` named `rc003-omarchy`, visible to Superwhisper without changing system defaults.
-- Device-specific evdev/uinput handling for all 13 RC003 keys, with F9 down/up for native Superwhisper dictation and release cleanup on exit/disconnect.
+- Device-specific evdev/uinput handling for all 13 RC003 keys, with RightAlt/F9 down/up for native Superwhisper dictation and release cleanup on exit/disconnect.
 - Strict TOML configuration, `scan`, `doctor`, `test-keys`, `test-audio`, and `test-dictation` commands.
 - Preview-first systemd user service management with explicit `--apply`.
 
@@ -109,15 +109,15 @@ target/release/rc003-omarchy service status
 target/release/rc003-omarchy service uninstall --apply
 ```
 
-The service uses `newgrp input -c` so the daemon starts with the required input group. Real dictation has passed on Redmi; the service is installed and enabled.
+The service uses `newgrp input -c` so the daemon starts with the required input group. The executable is installed to `~/.local/bin/rc003-omarchy` instead of a `target/` path, and the PipeWire source stays alive across BLE reconnects. Real dictation has passed on Redmi; the service is installed and enabled.
 
 ## Validation status
 
-- 113 unit tests pass, plus the explicit uinput integration test.
+- 118 unit tests pass, plus the explicit uinput integration test.
 - Clippy passes with warnings denied; release build succeeds.
 - Real BlueZ negotiation passed with ATVV v1.0, 16 kHz, and 120-byte frames.
 - Superwhisper enumerates `RC003 Remote Microphone` as 16 kHz mono S16LE.
-- Virtual RC003 input is verified end to end as F9 down/up through evdev/uinput.
+- Virtual RC003 input is verified end to end as RightAlt/F9 down/up through evdev/uinput.
 - Physical RC003-to-Superwhisper dictation passed with RightAlt: three real recordings were transcribed and inserted by Superwhisper.
 - The systemd user service is installed and enabled with `newgrp input -c`; startup, input-group, and Bluetooth wake/reconnect acceptance have all passed.
 
