@@ -1,0 +1,31 @@
+[package]
+name = "rc003-omarchy"
+version = "0.1.0"
+edition = "2021"
+description = "Xiaomi RC003 integration for Omarchy and Superwhisper"
+publish = false
+
+[features]
+default = []
+dbus = ["dep:zbus"]
+
+[dependencies]
+bluer = { version = "0.17", features = ["bluetoothd"] }
+pipewire = { version = "0.9", features = ["v0_3_49"] }
+tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "signal", "time"] }
+clap = { version = "4", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+futures = "0.3"
+anyhow = "1"
+num_enum = "0.7"
+bitflags = "2"
+zbus = { version = "5", features = ["tokio"], optional = true }
+evdev = "0.13.2"
+serde = { version = "1.0.229", features = ["derive"] }
+toml = "1.2.1"
+serde_json = "1.0.154"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["test-util"] }
+tokio-stream = "0.1"

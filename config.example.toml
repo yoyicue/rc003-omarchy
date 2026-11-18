@@ -1,0 +1,25 @@
+version = 1
+
+[device]
+address = ""
+auto_connect = true
+reconnect_initial_ms = 1000
+reconnect_max_ms = 15000
+
+[audio]
+node_name = "rc003-omarchy"
+description = "RC003 Remote Microphone"
+gain_db = 0.0
+release_drain_ms = 0
+
+[input]
+enabled = true
+voice_key = "RightAlt"
+release_grab_on_exit = true
+
+[mapping]
+enabled = true
+profile = "default"
+
+[logging]
+level = "info"

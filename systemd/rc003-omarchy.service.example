@@ -1,0 +1,16 @@
+[Unit]
+Description=RC003 microphone and input bridge
+After=graphical-session.target pipewire.service
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/newgrp input -c '/usr/local/bin/rc003-omarchy run --config %h/.config/rc003-omarchy/config.toml'
+Restart=on-failure
+RestartSec=2
+TimeoutStopSec=15
+KillMode=control-group
+UMask=0077
+
+[Install]
+WantedBy=graphical-session.target
