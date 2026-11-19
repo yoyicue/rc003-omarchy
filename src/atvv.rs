@@ -192,7 +192,6 @@ pub async fn run_session(
     let mut stopped_generation = None;
     let mut drop_next_frame = false;
     let mut pending_close = None;
-    let mut accept_start_packets = false;
     macro_rules! close_mic_reset {
         ($state:ident, $last_seq:ident, $current_stream_id:ident) => {
             if stopped_generation != Some(stream_generation) {
@@ -246,7 +245,6 @@ pub async fn run_session(
                 match protocol.parse_ctl(&data) {
                     CtlEvent::AudioStop { reason } => {
                         tracing::info!("AUDIO_STOP (reason={:?})", reason);
-                        accept_start_packets = false;
                         if pending_close == Some(reason) {
                             pending_close = None;
                             if state == State::Opening {
@@ -270,13 +268,11 @@ pub async fn run_session(
                             tail_expiration.clear();
                         }
                         if let Some(generation) = generation {
-                            generation.fetch_add(1, Ordering::Relaxed);
                             stream_generation = generation.load(Ordering::Relaxed);
                         }
                         stopped_generation = None;
                         pending_close = None;
                         drop_next_frame = false;
-                        accept_start_packets = true;
                         protocol.on_audio_start();
                         // Remote resets its sequence counter on every AUDIO_START
                         last_seq = None;
@@ -343,10 +339,9 @@ pub async fn run_session(
                         drop_next_frame = protocol.has_partial_audio();
                         stream_generation = packet.generation;
                     }
-                    if packet.generation < stream_generation && !accept_start_packets {
+                    if packet.generation < stream_generation {
                         continue;
                     }
-                    accept_start_packets = false;
                     for mut frame in protocol.decode_audio(&packet.data) {
                         // Reset frame timer on every audio frame
                         if frame_timeout_enabled {
@@ -965,11 +960,12 @@ mod tests {
             .await
         });
         let audio_start = [CTL_AUDIO_START, 0x03, 0x02, 0x00];
+        generation.fetch_add(1, Ordering::Relaxed);
         ctrl.ctl_tx.send(audio_start.to_vec()).unwrap();
         tokio::time::advance(Duration::from_millis(1)).await;
         assert_eq!(generation.load(Ordering::Relaxed), 1);
 
-        ctrl.rx_tx.send(audio_packet(vec![0; 120], 0)).unwrap();
+        ctrl.rx_tx.send(audio_packet(vec![0; 120], 1)).unwrap();
         tokio::time::advance(Duration::from_millis(1)).await;
         let queued = audio_rx.recv().await.unwrap();
         assert_eq!(queued.generation, 1);
@@ -1042,6 +1038,7 @@ mod tests {
             vec![vec![0x0D, 0x00]]
         );
 
+        generation.fetch_add(1, Ordering::Relaxed);
         ctrl.ctl_tx.send(audio_start.to_vec()).unwrap();
         tokio::time::advance(Duration::from_millis(1)).await;
         assert_eq!(generation.load(Ordering::Relaxed), 5);
@@ -1722,6 +1719,7 @@ mod tests {
         try_recv_all_commands(&mut ctrl.commands_rx).await;
 
         // AUDIO_START → Streaming
+        generation.fetch_add(1, Ordering::Relaxed);
         ctrl.ctl_tx.send(vec![CTL_AUDIO_START]).unwrap();
         tokio::time::advance(Duration::from_millis(1)).await;
         assert!(wait_for_state(&mut state_rx, State::Streaming, Duration::from_millis(10)).await);

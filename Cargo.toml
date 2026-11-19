@@ -17,6 +17,7 @@ clap = { version = "4", features = ["derive"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 futures = "0.3"
+tokio-stream = "0.1"
 anyhow = "1"
 num_enum = "0.7"
 bitflags = "2"
@@ -29,4 +30,3 @@ crossbeam-queue = "0.3.14"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["test-util"] }
-tokio-stream = "0.1"

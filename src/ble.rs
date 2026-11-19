@@ -2,7 +2,7 @@
 
 use std::pin::Pin;
 use std::sync::{
-    atomic::{AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
     Arc,
 };
 use std::task::{Context, Poll};
@@ -13,6 +13,7 @@ use bluer::{
     gatt::{remote::Characteristic, WriteOp},
     Adapter, AdapterEvent, Address, Device, Uuid,
 };
+use crossbeam_queue::ArrayQueue;
 use futures::{Stream, StreamExt};
 
 use crate::atvv::{AudioPacket, BleDevice, BleFut, BleStream, DeviceConnectionEvent};
@@ -21,25 +22,10 @@ fn notification_payload(data: Vec<u8>) -> Option<Vec<u8>> {
     (!data.is_empty()).then_some(data)
 }
 
-/// Wrap a `CharacteristicReader` (from `AcquireNotify`) into a `Stream<Item = Vec<u8>>`.
-fn reader_to_stream(
-    reader: bluer::gatt::CharacteristicReader,
-) -> Pin<Box<dyn Stream<Item = Vec<u8>> + Send>> {
-    Box::pin(futures::stream::unfold(reader, |reader| async move {
-        match reader.recv().await {
-            Ok(data) => match notification_payload(data) {
-                Some(data) => Some((data, reader)),
-                None => {
-                    tracing::debug!("BLE notification socket reached EOF");
-                    None
-                }
-            },
-            Err(e) => {
-                tracing::debug!("BLE notification stream ended: {e}");
-                None
-            }
-        }
-    }))
+fn advance_generation_on_audio_start(data: &[u8], generation: &AtomicU64) {
+    if data.len() >= 4 && data[0] == 0x04 {
+        generation.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 struct AudioNotificationStream {
@@ -51,7 +37,7 @@ impl Stream for AudioNotificationStream {
     type Item = AudioPacket;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        self.inner.poll_next(cx)
+        self.inner.as_mut().poll_next(cx)
     }
 }
 
@@ -61,64 +47,74 @@ impl Drop for AudioNotificationStream {
     }
 }
 
-fn send_latest(
-    tx: &tokio::sync::mpsc::Sender<AudioPacket>,
-    receiver: &Arc<tokio::sync::Mutex<tokio::sync::mpsc::Receiver<AudioPacket>>>,
-    packet: AudioPacket,
-) -> bool {
-    match tx.try_send(packet) {
-        Ok(()) => true,
-        Err(tokio::sync::mpsc::error::TrySendError::Full(packet)) => {
-            if let Ok(mut receiver) = receiver.try_lock() {
-                let _ = receiver.try_recv();
-            }
-            !matches!(
-                tx.try_send(packet),
-                Err(tokio::sync::mpsc::error::TrySendError::Closed(_))
-            )
-        }
-        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => false,
-    }
+fn send_latest(queue: &ArrayQueue<AudioPacket>, packet: AudioPacket) {
+    queue.force_push(packet);
 }
 
-fn audio_reader_to_stream(
-    reader: bluer::gatt::CharacteristicReader,
+async fn coordinate_notifications(
+    ctl: bluer::gatt::CharacteristicReader,
+    rx: bluer::gatt::CharacteristicReader,
     generation: Arc<AtomicU64>,
-) -> Pin<Box<dyn Stream<Item = AudioPacket> + Send>> {
-    let (tx, receiver) = tokio::sync::mpsc::channel(64);
-    let receiver = Arc::new(tokio::sync::Mutex::new(receiver));
-    let task_receiver = receiver.clone();
-    let task = tokio::spawn(async move {
-        loop {
-            match reader.recv().await {
-                Ok(data) => {
-                    let Some(data) = notification_payload(data) else {
-                        break;
-                    };
-                    let packet = AudioPacket {
-                        data,
-                        generation: generation.load(Ordering::Relaxed),
-                    };
-                    if !send_latest(&tx, &task_receiver, packet) {
+    ctl_tx: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
+    audio_tx: Arc<ArrayQueue<AudioPacket>>,
+) {
+    loop {
+        tokio::select! {
+            biased;
+            result = ctl.recv() => {
+                match result {
+                    Ok(data) => {
+                        let Some(data) = notification_payload(data) else { break };
+                        advance_generation_on_audio_start(&data, &generation);
+                        if ctl_tx.send(data).is_err() {
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        tracing::debug!("BLE control notification stream ended: {e}");
                         break;
                     }
                 }
-                Err(e) => {
-                    tracing::debug!("BLE audio notification stream ended: {e}");
-                    break;
+            }
+            result = rx.recv() => {
+                match result {
+                    Ok(data) => {
+                        let Some(data) = notification_payload(data) else { break };
+                        let packet = AudioPacket {
+                            data,
+                            generation: generation.load(Ordering::Relaxed),
+                        };
+                        send_latest(&audio_tx, packet);
+                    }
+                    Err(e) => {
+                        tracing::debug!("BLE audio notification stream ended: {e}");
+                        break;
+                    }
                 }
             }
         }
-    });
-    let inner: Pin<Box<dyn Stream<Item = AudioPacket> + Send>> =
-        Box::pin(futures::stream::unfold(receiver, |receiver| async move {
-            receiver
-                .lock()
-                .await
-                .recv()
-                .await
-                .map(|packet| (packet, receiver))
-        }));
+    }
+}
+
+fn audio_stream(
+    task: tokio::task::JoinHandle<()>,
+    receiver: Arc<ArrayQueue<AudioPacket>>,
+    closed: Arc<AtomicBool>,
+) -> Pin<Box<dyn Stream<Item = AudioPacket> + Send>> {
+    let inner: Pin<Box<dyn Stream<Item = AudioPacket> + Send>> = Box::pin(futures::stream::unfold(
+        (receiver, closed),
+        |(receiver, closed)| async move {
+            loop {
+                if let Some(packet) = receiver.pop() {
+                    return Some((packet, (receiver, closed)));
+                }
+                if closed.load(Ordering::Relaxed) {
+                    return None;
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        },
+    ));
     Box::pin(AudioNotificationStream { inner, task })
 }
 
@@ -169,6 +165,16 @@ impl std::fmt::Debug for AtvvChars {
     }
 }
 
+#[derive(Default)]
+struct NotificationState {
+    ctl: tokio::sync::Mutex<
+        Option<(
+            bluer::gatt::CharacteristicReader,
+            tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
+        )>,
+    >,
+}
+
 /// Real BLE device implementation wrapping bluer types.
 /// Borrows the device and characteristics so main.rs retains ownership
 /// for reconnect logic and shutdown MIC_CLOSE.
@@ -176,6 +182,18 @@ pub struct BluerDevice<'a> {
     pub device: &'a Device,
     pub chars: &'a AtvvChars,
     pub generation: Arc<AtomicU64>,
+    notifications: Arc<NotificationState>,
+}
+
+impl<'a> BluerDevice<'a> {
+    pub fn new(device: &'a Device, chars: &'a AtvvChars, generation: Arc<AtomicU64>) -> Self {
+        Self {
+            device,
+            chars,
+            generation,
+            notifications: Arc::new(NotificationState::default()),
+        }
+    }
 }
 
 impl BleDevice for BluerDevice<'_> {
@@ -205,7 +223,12 @@ impl BleDevice for BluerDevice<'_> {
                           Another ATVVoice instance may be connected to this device.",
             )?;
             tracing::debug!("CTL AcquireNotify: exclusive access, MTU={}", reader.mtu());
-            Ok(reader_to_stream(reader))
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            *self.notifications.ctl.lock().await = Some((reader, tx));
+            Ok(
+                Box::pin(tokio_stream::wrappers::UnboundedReceiverStream::new(rx))
+                    as BleStream<Vec<u8>>,
+            )
         })
     }
 
@@ -216,7 +239,23 @@ impl BleDevice for BluerDevice<'_> {
                           Another ATVVoice instance may be connected to this device.",
             )?;
             tracing::debug!("RX AcquireNotify: exclusive access, MTU={}", reader.mtu());
-            Ok(audio_reader_to_stream(reader, self.generation.clone()))
+            let (ctl_reader, ctl_tx) = self
+                .notifications
+                .ctl
+                .lock()
+                .await
+                .take()
+                .context("CTL notifications must be acquired before RX")?;
+            let audio_tx = Arc::new(ArrayQueue::new(64));
+            let receiver = audio_tx.clone();
+            let closed = Arc::new(AtomicBool::new(false));
+            let task_closed = closed.clone();
+            let generation = self.generation.clone();
+            let task = tokio::spawn(async move {
+                coordinate_notifications(ctl_reader, reader, generation, ctl_tx, audio_tx).await;
+                task_closed.store(true, Ordering::Relaxed);
+            });
+            Ok(audio_stream(task, receiver, closed))
         })
     }
 
@@ -438,26 +477,70 @@ mod tests {
         assert!(task.is_finished());
     }
 
-    #[tokio::test]
-    async fn full_queue_drops_oldest_packet_without_blocking() {
-        let (tx, receiver) = tokio::sync::mpsc::channel(1);
-        let receiver = Arc::new(tokio::sync::Mutex::new(receiver));
-        tx.try_send(AudioPacket {
-            data: vec![1],
-            generation: 1,
-        })
-        .unwrap();
-        assert!(send_latest(
-            &tx,
-            &receiver,
+    #[test]
+    fn full_queue_drops_oldest_packet_without_blocking() {
+        let queue = ArrayQueue::new(1);
+        send_latest(
+            &queue,
+            AudioPacket {
+                data: vec![1],
+                generation: 1,
+            },
+        );
+        send_latest(
+            &queue,
             AudioPacket {
                 data: vec![2],
                 generation: 2,
-            }
-        ));
-        let packet = receiver.lock().await.try_recv().unwrap();
+            },
+        );
+        let packet = queue.pop().unwrap();
         assert_eq!(packet.data, vec![2]);
         assert_eq!(packet.generation, 2);
+    }
+
+    #[test]
+    fn saturation_discards_old_generation_packets() {
+        let queue = ArrayQueue::new(64);
+        for _ in 0..64 {
+            send_latest(
+                &queue,
+                AudioPacket {
+                    data: vec![0],
+                    generation: 0,
+                },
+            );
+        }
+        for _ in 0..5 {
+            send_latest(
+                &queue,
+                AudioPacket {
+                    data: vec![1],
+                    generation: 1,
+                },
+            );
+        }
+        let mut old = 0;
+        let mut new = 0;
+        while let Some(packet) = queue.pop() {
+            match packet.generation {
+                0 => old += 1,
+                1 => new += 1,
+                generation => panic!("unexpected generation {generation}"),
+            }
+        }
+        assert_eq!((old, new), (59, 5));
+    }
+
+    #[test]
+    fn audio_start_advances_generation_before_audio() {
+        let generation = AtomicU64::new(0);
+        advance_generation_on_audio_start(&[0x04, 0x03, 0x02, 0x00], &generation);
+        assert_eq!(generation.load(Ordering::Relaxed), 1);
+        advance_generation_on_audio_start(&[0x00, 0x00], &generation);
+        assert_eq!(generation.load(Ordering::Relaxed), 1);
+        advance_generation_on_audio_start(&[0x04], &generation);
+        assert_eq!(generation.load(Ordering::Relaxed), 1);
     }
 
     #[test]

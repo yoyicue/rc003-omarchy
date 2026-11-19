@@ -630,11 +630,7 @@ async fn main() -> anyhow::Result<()> {
 
         // Inner loop: session → reconnect (same device).
         loop {
-            let ble_device = ble::BluerDevice {
-                device: &device,
-                chars: &chars,
-                generation: _pw_handle.generation.clone(),
-            };
+            let ble_device = ble::BluerDevice::new(&device, &chars, _pw_handle.generation.clone());
 
             // Negotiate protocol version
             let (caps, streams) = tokio::select! {
