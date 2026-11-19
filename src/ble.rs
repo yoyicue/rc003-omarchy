@@ -8,7 +8,7 @@ use std::sync::{
 use std::task::{Context, Poll};
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::{Context as _, Result};
 use bluer::{
     gatt::{remote::Characteristic, WriteOp},
     Adapter, AdapterEvent, Address, Device, Uuid,
@@ -43,7 +43,7 @@ fn reader_to_stream(
 }
 
 struct AudioNotificationStream {
-    receiver: tokio::sync::mpsc::Receiver<AudioPacket>,
+    inner: Pin<Box<dyn Stream<Item = AudioPacket> + Send>>,
     task: tokio::task::JoinHandle<()>,
 }
 
@@ -51,7 +51,7 @@ impl Stream for AudioNotificationStream {
     type Item = AudioPacket;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        self.receiver.poll_recv(cx)
+        self.inner.poll_next(cx)
     }
 }
 
@@ -61,11 +61,33 @@ impl Drop for AudioNotificationStream {
     }
 }
 
+fn send_latest(
+    tx: &tokio::sync::mpsc::Sender<AudioPacket>,
+    receiver: &Arc<tokio::sync::Mutex<tokio::sync::mpsc::Receiver<AudioPacket>>>,
+    packet: AudioPacket,
+) -> bool {
+    match tx.try_send(packet) {
+        Ok(()) => true,
+        Err(tokio::sync::mpsc::error::TrySendError::Full(packet)) => {
+            if let Ok(mut receiver) = receiver.try_lock() {
+                let _ = receiver.try_recv();
+            }
+            !matches!(
+                tx.try_send(packet),
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_))
+            )
+        }
+        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => false,
+    }
+}
+
 fn audio_reader_to_stream(
     reader: bluer::gatt::CharacteristicReader,
     generation: Arc<AtomicU64>,
 ) -> Pin<Box<dyn Stream<Item = AudioPacket> + Send>> {
     let (tx, receiver) = tokio::sync::mpsc::channel(64);
+    let receiver = Arc::new(tokio::sync::Mutex::new(receiver));
+    let task_receiver = receiver.clone();
     let task = tokio::spawn(async move {
         loop {
             match reader.recv().await {
@@ -77,7 +99,7 @@ fn audio_reader_to_stream(
                         data,
                         generation: generation.load(Ordering::Relaxed),
                     };
-                    if tx.send(packet).await.is_err() {
+                    if !send_latest(&tx, &task_receiver, packet) {
                         break;
                     }
                 }
@@ -88,7 +110,16 @@ fn audio_reader_to_stream(
             }
         }
     });
-    Box::pin(AudioNotificationStream { receiver, task })
+    let inner: Pin<Box<dyn Stream<Item = AudioPacket> + Send>> =
+        Box::pin(futures::stream::unfold(receiver, |receiver| async move {
+            receiver
+                .lock()
+                .await
+                .recv()
+                .await
+                .map(|packet| (packet, receiver))
+        }));
+    Box::pin(AudioNotificationStream { inner, task })
 }
 
 fn atvv_write_op() -> WriteOp {
@@ -398,13 +429,35 @@ mod tests {
 
     #[tokio::test]
     async fn dropping_audio_stream_aborts_reader_task() {
-        let (_tx, receiver) = tokio::sync::mpsc::channel(1);
+        let inner = Box::pin(futures::stream::empty());
         let task = tokio::spawn(std::future::pending());
-        let stream = AudioNotificationStream { receiver, task };
+        let stream = AudioNotificationStream { inner, task };
         let task = stream.task.abort_handle();
         drop(stream);
         tokio::task::yield_now().await;
         assert!(task.is_finished());
+    }
+
+    #[tokio::test]
+    async fn full_queue_drops_oldest_packet_without_blocking() {
+        let (tx, receiver) = tokio::sync::mpsc::channel(1);
+        let receiver = Arc::new(tokio::sync::Mutex::new(receiver));
+        tx.try_send(AudioPacket {
+            data: vec![1],
+            generation: 1,
+        })
+        .unwrap();
+        assert!(send_latest(
+            &tx,
+            &receiver,
+            AudioPacket {
+                data: vec![2],
+                generation: 2,
+            }
+        ));
+        let packet = receiver.lock().await.try_recv().unwrap();
+        assert_eq!(packet.data, vec![2]);
+        assert_eq!(packet.generation, 2);
     }
 
     #[test]
