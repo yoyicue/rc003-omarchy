@@ -633,6 +633,7 @@ async fn main() -> anyhow::Result<()> {
             let ble_device = ble::BluerDevice {
                 device: &device,
                 chars: &chars,
+                generation: _pw_handle.generation.clone(),
             };
 
             // Negotiate protocol version

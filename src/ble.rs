@@ -1,6 +1,11 @@
 //! BLE device discovery and ATVV GATT characteristic resolution.
 
 use std::pin::Pin;
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc,
+};
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -10,7 +15,7 @@ use bluer::{
 };
 use futures::{Stream, StreamExt};
 
-use crate::atvv::{BleDevice, BleFut, BleStream, DeviceConnectionEvent};
+use crate::atvv::{AudioPacket, BleDevice, BleFut, BleStream, DeviceConnectionEvent};
 
 fn notification_payload(data: Vec<u8>) -> Option<Vec<u8>> {
     (!data.is_empty()).then_some(data)
@@ -35,6 +40,55 @@ fn reader_to_stream(
             }
         }
     }))
+}
+
+struct AudioNotificationStream {
+    receiver: tokio::sync::mpsc::Receiver<AudioPacket>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Stream for AudioNotificationStream {
+    type Item = AudioPacket;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        self.receiver.poll_recv(cx)
+    }
+}
+
+impl Drop for AudioNotificationStream {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+fn audio_reader_to_stream(
+    reader: bluer::gatt::CharacteristicReader,
+    generation: Arc<AtomicU64>,
+) -> Pin<Box<dyn Stream<Item = AudioPacket> + Send>> {
+    let (tx, receiver) = tokio::sync::mpsc::channel(64);
+    let task = tokio::spawn(async move {
+        loop {
+            match reader.recv().await {
+                Ok(data) => {
+                    let Some(data) = notification_payload(data) else {
+                        break;
+                    };
+                    let packet = AudioPacket {
+                        data,
+                        generation: generation.load(Ordering::Relaxed),
+                    };
+                    if tx.send(packet).await.is_err() {
+                        break;
+                    }
+                }
+                Err(e) => {
+                    tracing::debug!("BLE audio notification stream ended: {e}");
+                    break;
+                }
+            }
+        }
+    });
+    Box::pin(AudioNotificationStream { receiver, task })
 }
 
 fn atvv_write_op() -> WriteOp {
@@ -90,6 +144,7 @@ impl std::fmt::Debug for AtvvChars {
 pub struct BluerDevice<'a> {
     pub device: &'a Device,
     pub chars: &'a AtvvChars,
+    pub generation: Arc<AtomicU64>,
 }
 
 impl BleDevice for BluerDevice<'_> {
@@ -123,14 +178,14 @@ impl BleDevice for BluerDevice<'_> {
         })
     }
 
-    fn rx_notifications(&self) -> BleFut<'_, BleStream<Vec<u8>>> {
+    fn rx_notifications(&self) -> BleFut<'_, BleStream<AudioPacket>> {
         Box::pin(async {
             let reader = self.chars.rx.notify_io().await.context(
                 "Failed to acquire exclusive RX notifications. \
                           Another ATVVoice instance may be connected to this device.",
             )?;
             tracing::debug!("RX AcquireNotify: exclusive access, MTU={}", reader.mtu());
-            Ok(reader_to_stream(reader))
+            Ok(audio_reader_to_stream(reader, self.generation.clone()))
         })
     }
 
@@ -339,6 +394,17 @@ mod tests {
     fn zero_length_notification_is_eof() {
         assert_eq!(notification_payload(Vec::new()), None);
         assert_eq!(notification_payload(vec![1, 2]), Some(vec![1, 2]));
+    }
+
+    #[tokio::test]
+    async fn dropping_audio_stream_aborts_reader_task() {
+        let (_tx, receiver) = tokio::sync::mpsc::channel(1);
+        let task = tokio::spawn(std::future::pending());
+        let stream = AudioNotificationStream { receiver, task };
+        let task = stream.task.abort_handle();
+        drop(stream);
+        tokio::task::yield_now().await;
+        assert!(task.is_finished());
     }
 
     #[test]
