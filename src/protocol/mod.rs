@@ -32,6 +32,10 @@ pub trait Protocol: Send {
     /// Decode a notification into zero or more complete PCM frames.
     fn decode_audio(&mut self, data: &[u8]) -> Vec<AudioFrame>;
 
+    fn has_partial_audio(&self) -> bool {
+        false
+    }
+
     /// Select the v1.0 wire frame layout. v0.4 always includes its header.
     fn set_frame_layout(&mut self, _layout: AudioFrameLayout) {}
 

@@ -9,7 +9,7 @@
 - M4：实现完成，13 键及 RightAlt 已通过真机验证。
 - M5：完成。服务已通过 `newgrp input -c` 安装并启用，启动权限和遥控器断线后的自动恢复均已通过验收。
 
-此前 Redmi 基线：140 个单元测试、显式 uinput 集成测试、Clippy（warnings denied）和 release build 全部通过。第九、十轮分别有 123、124 项可移植测试通过；第十一至十三轮的 Redmi 单元测试数分别为 148、149、149，详见第 18、19、20 节。
+此前 Redmi 基线：140 个单元测试、显式 uinput 集成测试、Clippy（warnings denied）和 release build 全部通过。第九、十轮分别有 123、124 项可移植测试通过；第十一至十三轮的 Redmi 单元测试数分别为 148、149、149，详见第 18、19、20 节。第十四轮有 126 项可移植测试通过，Redmi 完整验证待执行，见第 21 节。
 
 
 ## 1. 验证原则
@@ -246,8 +246,16 @@ Redmi 验证：149 个单元测试、Clippy 和 release build 通过，新二进
 ## 20. 第十三轮 review 回归覆盖
 
 - 用 `stream_generation` 标记录音及其首次停止；只有新 AUDIO_START 才重置停止标记，Opening 状态的迟到确认不会给上一代续期。所有本地关闭路径都在 BLE 写入前设置期限。
-- 每个音频帧固定使用所属 AUDIO_START 的 generation，不再在出队时读取可能已变化的全局代数。
+- 每个音频帧使用当前输出段的 generation，不再在出队时盲目读取可能已变化的全局代数。
 - 首次厂商握手与 SIGTERM/故障通知竞争，首次 GATT 等待不再阻塞退出。
 - 重复停止测试加入真实 3ms 间隔，避免 Tokio 虚拟时钟与 std::time::Instant 不同步造成假通过。
 
 Redmi 验证：149 个单元测试、Clippy、release build 和五项 `doctor` 通过，新二进制已安装并运行。生产差异仅 `atvv.rs` 与 `main.rs` 两处文件；本轮真实听写待确认。
+
+## 21. 第十四轮 review 回归覆盖
+
+- generation 切换时只在协议存在跨代残帧的情况下丢弃首个完整帧；无残帧的新完整帧立即可输出，后续完整帧也恢复输出，不再持续静音。
+- 已停止录音的迟到 AUDIO_STOP 在重新打开期间直接忽略，保留 Opening，后续关闭请求仍会发送 MIC_CLOSE。
+- 回归测试改用真实 v1.0 分片协议，覆盖无残帧切换、跨代残帧、后续恢复、Opening 再次关闭和真实 3ms 期限断言。
+
+当前验证：126 项可移植测试全部通过，rustfmt 和差异检查通过。Redmi 当前无法解析地址，完整 149 项单元测试、Clippy、release build 和真机复验尚待执行。

@@ -207,6 +207,10 @@ impl Protocol for ProtocolV10 {
         self.audio_buffer.clear();
     }
 
+    fn has_partial_audio(&self) -> bool {
+        !self.audio_buffer.is_empty()
+    }
+
     fn on_audio_start(&mut self) {
         self.audio_buffer.clear();
         self.frame_seq = 0;

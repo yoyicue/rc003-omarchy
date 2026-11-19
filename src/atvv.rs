@@ -184,6 +184,7 @@ pub async fn run_session(
 
     let mut stream_generation = 0;
     let mut stopped_generation = None;
+    let mut drop_next_frame = false;
     macro_rules! close_mic_reset {
         ($state:ident, $last_seq:ident, $current_stream_id:ident) => {
             if stopped_generation != Some(stream_generation) {
@@ -237,6 +238,9 @@ pub async fn run_session(
                 match protocol.parse_ctl(&data) {
                     CtlEvent::AudioStop { reason } => {
                         tracing::info!("AUDIO_STOP (reason={:?})", reason);
+                        if state == State::Opening && stopped_generation == Some(stream_generation) {
+                            continue;
+                        }
                         // For HTT button release, remote already stopped — don't send `MIC_CLOSE`
                         let should_close = !matches!(reason, AudioStopReason::HttButtonRelease)
                             && state == State::Streaming;
@@ -257,6 +261,7 @@ pub async fn run_session(
                             stream_generation = generation.load(Ordering::Relaxed);
                         }
                         stopped_generation = None;
+                        drop_next_frame = false;
                         protocol.on_audio_start();
                         // Remote resets its sequence counter on every AUDIO_START
                         last_seq = None;
@@ -317,6 +322,13 @@ pub async fn run_session(
                     return Ok(());
                 };
                 if state == State::Streaming {
+                    if let Some(generation) = generation {
+                        let latest = generation.load(Ordering::Relaxed);
+                        if latest != stream_generation {
+                            drop_next_frame = protocol.has_partial_audio();
+                            stream_generation = latest;
+                        }
+                    }
                     for mut frame in protocol.decode_audio(&data) {
                         // Reset frame timer on every audio frame
                         if frame_timeout_enabled {
@@ -337,6 +349,10 @@ pub async fn run_session(
                         }
                         last_seq = Some(frame.seq);
 
+                        if drop_next_frame {
+                            drop_next_frame = false;
+                            continue;
+                        }
                         frame.generation = stream_generation;
                         if audio_tx.send(frame).await.is_err() {
                             tracing::warn!("audio frame dropped: receiver channel closed");
@@ -879,9 +895,9 @@ mod tests {
     async fn test_audio_generation_tracks_start_stop_and_disconnect() {
         tokio::time::pause();
 
-        let (device, ctrl) = mock_device();
+        let (device, mut ctrl) = mock_device();
         let (audio_tx, mut audio_rx) = tokio_mpsc::channel(64);
-        let (state_tx, _state_rx) = tokio::sync::watch::channel(State::Connected);
+        let (state_tx, state_rx) = tokio::sync::watch::channel(State::Connected);
         let generation = Arc::new(AtomicU64::new(0));
         let tail_expiration = TailDeadline::new();
         let timeouts = SessionTimeouts {
@@ -889,12 +905,12 @@ mod tests {
             keepalive: Duration::ZERO,
         };
         let caps = Capabilities {
-            version: ProtocolVersion::V0_4,
-            codecs: Codecs::ADPCM_8KHZ,
-            interaction_model: InteractionModel::OnRequest,
-            audio_frame_size: AudioFrameSize(134),
+            version: ProtocolVersion::V1_0,
+            codecs: Codecs::ADPCM_16KHZ,
+            interaction_model: InteractionModel::HoldToTalk,
+            audio_frame_size: AudioFrameSize(120),
         };
-        let mut protocol = ProtocolV04::new();
+        let mut protocol = crate::protocol::v10::ProtocolV10::new();
         protocol.on_caps_resp(&caps).unwrap();
         let ctl = device.ctl_notifications().await.unwrap();
         let rx = device.rx_notifications().await.unwrap();
@@ -920,42 +936,63 @@ mod tests {
             )
             .await
         });
-        ctrl.ctl_tx.send(vec![CTL_AUDIO_START]).unwrap();
+        let audio_start = [CTL_AUDIO_START, 0x03, 0x02, 0x00];
+        ctrl.ctl_tx.send(audio_start.to_vec()).unwrap();
         tokio::time::advance(Duration::from_millis(1)).await;
         assert_eq!(generation.load(Ordering::Relaxed), 1);
 
-        ctrl.rx_tx.send(make_audio_frame(0)).unwrap();
+        ctrl.rx_tx.send(vec![0; 120]).unwrap();
         tokio::time::advance(Duration::from_millis(1)).await;
         let queued = audio_rx.recv().await.unwrap();
         assert_eq!(queued.generation, 1);
 
         generation.fetch_add(1, Ordering::Relaxed);
-        ctrl.rx_tx.send(make_audio_frame(1)).unwrap();
+        ctrl.rx_tx.send(vec![1; 120]).unwrap();
         tokio::time::advance(Duration::from_millis(1)).await;
-        assert_eq!(audio_rx.recv().await.unwrap().generation, 1);
+        assert_eq!(audio_rx.recv().await.unwrap().generation, 2);
+
+        ctrl.rx_tx.send(vec![2; 60]).unwrap();
+        tokio::time::advance(Duration::from_millis(1)).await;
+        assert!(audio_rx.try_recv().is_err());
+        generation.fetch_add(1, Ordering::Relaxed);
+        ctrl.rx_tx.send(vec![2; 60]).unwrap();
+        tokio::time::advance(Duration::from_millis(1)).await;
+        assert!(audio_rx.try_recv().is_err());
+        ctrl.rx_tx.send(vec![3; 120]).unwrap();
+        tokio::time::advance(Duration::from_millis(1)).await;
+        assert_eq!(audio_rx.recv().await.unwrap().generation, 3);
 
         ctrl.ctl_tx.send(vec![CTL_AUDIO_STOP]).unwrap();
         tokio::time::advance(Duration::from_millis(1)).await;
-        assert_eq!(generation.load(Ordering::Relaxed), 2);
+        assert_eq!(generation.load(Ordering::Relaxed), 3);
         assert!(tail_expiration.is_armed());
         let first_deadline = tail_expiration.deadline_ms();
         std::thread::sleep(Duration::from_millis(3));
         ctrl.ctl_tx.send(vec![CTL_START_SEARCH]).unwrap();
         tokio::time::advance(Duration::from_millis(1)).await;
+        try_recv_all_commands(&mut ctrl.commands_rx).await;
         ctrl.ctl_tx.send(vec![CTL_AUDIO_STOP]).unwrap();
         tokio::time::advance(Duration::from_millis(1)).await;
+        assert_eq!(*state_rx.borrow(), State::Opening);
         assert_eq!(tail_expiration.deadline_ms(), first_deadline);
-
-        ctrl.ctl_tx.send(vec![CTL_AUDIO_START]).unwrap();
+        ctrl.ctl_tx.send(vec![CTL_START_SEARCH]).unwrap();
         tokio::time::advance(Duration::from_millis(1)).await;
-        assert_eq!(generation.load(Ordering::Relaxed), 3);
+        assert_eq!(*state_rx.borrow(), State::Connected);
+        assert_eq!(
+            try_recv_all_commands(&mut ctrl.commands_rx).await,
+            vec![vec![0x0D, 0x00]]
+        );
+
+        ctrl.ctl_tx.send(audio_start.to_vec()).unwrap();
+        tokio::time::advance(Duration::from_millis(1)).await;
+        assert_eq!(generation.load(Ordering::Relaxed), 4);
         assert!(!tail_expiration.is_armed());
         ctrl.event_tx
             .send(DeviceConnectionEvent::Disconnected)
             .unwrap();
         assert!(session.await.unwrap().is_ok());
         assert!(generation.load(Ordering::Relaxed) > queued.generation);
-        assert_eq!(generation.load(Ordering::Relaxed), 4);
+        assert_eq!(generation.load(Ordering::Relaxed), 5);
     }
 
     #[tokio::test]
