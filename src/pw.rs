@@ -9,6 +9,7 @@
 
 use std::io;
 use std::sync::mpsc;
+use std::sync::{Arc, Mutex};
 
 use pipewire::context::ContextRc;
 use pipewire::keys;
@@ -50,9 +51,8 @@ fn frame_is_newer(frame_generation: u64, previous_generation: u64) -> bool {
     frame_generation > previous_generation
 }
 
-#[allow(clippy::too_many_arguments)]
 pub fn run_pw_source(
-    audio_rx: mpsc::Receiver<PcmFrame>,
+    audio_rx: Arc<Mutex<mpsc::Receiver<PcmFrame>>>,
     gain_db: f32,
     sample_rate: u32,
     node_name: &str,
@@ -140,20 +140,14 @@ pub fn run_pw_source(
             // and not a real-time concern for voice audio rates.
             let mut buf = pending.borrow_mut();
 
-            loop {
-                match audio_rx.try_recv() {
-                    Ok(mut frame) => {
-                        if frame_is_newer(frame.generation, previous_generation) {
-                            buf.clear();
-                            previous_generation = frame.generation;
-                        }
-                        if frame.generation == previous_generation {
-                            crate::adpcm::apply_gain_linear(&mut frame.samples, gain_linear);
-                            buf.extend_from_slice(&frame.samples);
-                        }
-                    }
-                    Err(mpsc::TryRecvError::Empty) => break,
-                    Err(mpsc::TryRecvError::Disconnected) => break,
+            while let Ok(Ok(mut frame)) = audio_rx.try_lock().map(|rx| rx.try_recv()) {
+                if frame_is_newer(frame.generation, previous_generation) {
+                    buf.clear();
+                    previous_generation = frame.generation;
+                }
+                if frame.generation == previous_generation {
+                    crate::adpcm::apply_gain_linear(&mut frame.samples, gain_linear);
+                    buf.extend_from_slice(&frame.samples);
                 }
             }
 

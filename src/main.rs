@@ -17,6 +17,7 @@ use anyhow::Context;
 use clap::Parser;
 use std::collections::HashSet;
 use std::path::PathBuf;
+use std::sync::Mutex;
 use std::sync::{
     atomic::{AtomicU64, Ordering},
     Arc,
@@ -95,7 +96,7 @@ struct PipeWireHandle {
 
 impl PipeWireHandle {
     fn new(
-        pcm_rx: std::sync::mpsc::Receiver<pw::PcmFrame>,
+        pcm_rx: Arc<Mutex<std::sync::mpsc::Receiver<pw::PcmFrame>>>,
         gain: f32,
         node_name: String,
         node_description: String,
@@ -121,10 +122,6 @@ impl PipeWireHandle {
             generation,
             join: Some(join),
         }
-    }
-
-    fn reset(&self) -> u64 {
-        self.generation.fetch_add(1, Ordering::Relaxed) + 1
     }
 }
 
@@ -480,6 +477,7 @@ async fn main() -> anyhow::Result<()> {
         };
 
         let (pcm_tx, pcm_rx) = std::sync::mpsc::sync_channel::<pw::PcmFrame>(32);
+        let pcm_rx = Arc::new(Mutex::new(pcm_rx));
         let (consumer_tx, mut consumer_rx) = if cli.mic_on_demand {
             let (tx, rx) = tokio::sync::mpsc::channel(16);
             (Some(tx), Some(rx))
@@ -487,7 +485,7 @@ async fn main() -> anyhow::Result<()> {
             (None, None)
         };
         let _pw_handle = PipeWireHandle::new(
-            pcm_rx,
+            pcm_rx.clone(),
             gain,
             node_name.clone(),
             node_description.clone(),
@@ -560,8 +558,6 @@ async fn main() -> anyhow::Result<()> {
                 }
                 continue;
             }
-            let generation = _pw_handle.reset();
-
             tracing::info!(
                 "Negotiated protocol: {} ({:?}, {}Hz)",
                 session_protocol.version(),
@@ -572,21 +568,27 @@ async fn main() -> anyhow::Result<()> {
             let (frame_tx, mut frame_rx) =
                 tokio::sync::mpsc::channel::<protocol::types::AudioFrame>(DECODER_CHANNEL_CAPACITY);
             let pcm_tx = pcm_tx.clone();
+            let pcm_rx = pcm_rx.clone();
             // Post-processing task: Protocol already decoded the audio,
             // so we just apply declip/lowpass/gain and forward PCM.
+            let generation = _pw_handle.generation.clone();
             let decoder_handle = tokio::spawn(async move {
                 while let Some(frame) = frame_rx.recv().await {
                     let mut samples = frame.samples;
                     adpcm::declip(&mut samples);
                     adpcm::lowpass(&mut samples);
-                    if let Err(error) = pcm_tx.try_send(pw::PcmFrame {
-                        generation,
+                    match pcm_tx.try_send(pw::PcmFrame {
+                        generation: generation.load(Ordering::Relaxed),
                         samples,
                     }) {
-                        tracing::debug!(
-                            ?error,
-                            "dropping PCM frame because the channel is full or closed"
-                        );
+                        Ok(()) => {}
+                        Err(std::sync::mpsc::TrySendError::Full(frame)) => {
+                            if let Ok(rx) = pcm_rx.try_lock() {
+                                let _ = rx.try_recv();
+                            }
+                            let _ = pcm_tx.try_send(frame);
+                        }
+                        Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {}
                     }
                 }
             });
@@ -608,6 +610,7 @@ async fn main() -> anyhow::Result<()> {
                         },
                         state_tx: Some(&state_tx),
                         consumer_rx: consumer_rx.as_mut(),
+                        generation: Some(&_pw_handle.generation),
                         mic_on_demand: cli.mic_on_demand,
                     },
                 ) => result,

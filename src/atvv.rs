@@ -1,4 +1,8 @@
 use std::pin::Pin;
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc,
+};
 use std::time::Duration;
 
 use anyhow::Result;
@@ -94,6 +98,7 @@ pub struct SessionConfig<'a> {
     pub command_rx: Option<&'a mut mpsc::Receiver<ExternalCommand>>,
     pub state_tx: Option<&'a tokio::sync::watch::Sender<State>>,
     pub consumer_rx: Option<&'a mut tokio::sync::mpsc::Receiver<consumer::ConsumerEvent>>,
+    pub generation: Option<&'a Arc<AtomicU64>>,
     pub mic_on_demand: bool,
 }
 
@@ -121,6 +126,7 @@ pub async fn run_session(
         mut command_rx,
         state_tx,
         mut consumer_rx,
+        generation,
         mic_on_demand,
     } = config;
     let mut state = State::Connected;
@@ -195,6 +201,9 @@ pub async fn run_session(
                     }
                     CtlEvent::AudioStart { reason, codec, stream_id } => {
                         tracing::info!("AUDIO_START (reason={:?}, codec={:?}, stream_id={:?})", reason, codec, stream_id);
+                        if let Some(generation) = generation {
+                            generation.fetch_add(1, Ordering::Relaxed);
+                        }
                         protocol.on_audio_start();
                         // Remote resets its sequence counter on every AUDIO_START
                         last_seq = None;
@@ -576,6 +585,7 @@ mod tests {
                     command_rx: None,
                     state_tx: Some(&state_tx),
                     consumer_rx: None,
+                    generation: None,
                     mic_on_demand: false,
                 },
             )
@@ -680,6 +690,7 @@ mod tests {
                     command_rx: None,
                     state_tx: Some(&state_tx),
                     consumer_rx: None,
+                    generation: None,
                     mic_on_demand: false,
                 },
             )
@@ -765,6 +776,7 @@ mod tests {
                     command_rx: None,
                     state_tx: Some(&state_tx),
                     consumer_rx: None,
+                    generation: None,
                     mic_on_demand: false,
                 },
             )
@@ -780,6 +792,61 @@ mod tests {
         tokio::time::advance(Duration::from_millis(1)).await;
 
         // Verify run_session returns Ok
+        let result = session.await.unwrap();
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_audio_start_increments_generation() {
+        tokio::time::pause();
+
+        let (device, ctrl) = mock_device();
+        let (audio_tx, _audio_rx) = tokio_mpsc::channel(64);
+        let (state_tx, _state_rx) = tokio::sync::watch::channel(State::Connected);
+        let generation = Arc::new(AtomicU64::new(0));
+        let timeouts = SessionTimeouts {
+            frame_timeout: Duration::ZERO,
+            keepalive: Duration::ZERO,
+        };
+        let caps = Capabilities {
+            version: ProtocolVersion::V0_4,
+            codecs: Codecs::ADPCM_8KHZ,
+            interaction_model: InteractionModel::OnRequest,
+            audio_frame_size: AudioFrameSize(134),
+        };
+        let mut protocol = ProtocolV04::new();
+        protocol.on_caps_resp(&caps).unwrap();
+        let ctl = device.ctl_notifications().await.unwrap();
+        let rx = device.rx_notifications().await.unwrap();
+        let events = device.connection_events().await.unwrap();
+        let streams = BleStreams { ctl, rx, events };
+        let generation_for_session = generation.clone();
+        let session = tokio::spawn(async move {
+            run_session(
+                &device,
+                &mut protocol,
+                streams,
+                SessionConfig {
+                    audio_tx,
+                    timeouts: &timeouts,
+                    command_rx: None,
+                    state_tx: Some(&state_tx),
+                    consumer_rx: None,
+                    generation: Some(&generation_for_session),
+                    mic_on_demand: false,
+                },
+            )
+            .await
+        });
+        ctrl.ctl_tx.send(vec![CTL_AUDIO_START]).unwrap();
+        tokio::time::advance(Duration::from_millis(1)).await;
+        assert_eq!(generation.load(Ordering::Relaxed), 1);
+        ctrl.ctl_tx.send(vec![CTL_AUDIO_START]).unwrap();
+        tokio::time::advance(Duration::from_millis(1)).await;
+        assert_eq!(generation.load(Ordering::Relaxed), 2);
+        ctrl.event_tx
+            .send(DeviceConnectionEvent::Disconnected)
+            .unwrap();
         let result = session.await.unwrap();
         assert!(result.is_ok());
     }
@@ -827,6 +894,7 @@ mod tests {
                     command_rx: Some(&mut cmd_rx),
                     state_tx: Some(&state_tx),
                     consumer_rx: None,
+                    generation: None,
                     mic_on_demand: false,
                 },
             )
@@ -924,6 +992,7 @@ mod tests {
                     command_rx: None,
                     state_tx: Some(&state_tx),
                     consumer_rx: Some(&mut consumer_rx),
+                    generation: None,
                     mic_on_demand: true,
                 },
             )
@@ -993,6 +1062,7 @@ mod tests {
                     command_rx: None,
                     state_tx: Some(&state_tx),
                     consumer_rx: Some(&mut consumer_rx),
+                    generation: None,
                     mic_on_demand: true,
                 },
             )
@@ -1077,6 +1147,7 @@ mod tests {
                     command_rx: None,
                     state_tx: Some(&state_tx),
                     consumer_rx: Some(&mut consumer_rx),
+                    generation: None,
                     mic_on_demand: false, // disabled
                 },
             )
@@ -1150,6 +1221,7 @@ mod tests {
                     command_rx: None,
                     state_tx: Some(&state_tx),
                     consumer_rx: Some(&mut consumer_rx),
+                    generation: None,
                     mic_on_demand: true,
                 },
             )
@@ -1235,6 +1307,7 @@ mod tests {
                     command_rx: None,
                     state_tx: Some(&state_tx),
                     consumer_rx: Some(&mut consumer_rx),
+                    generation: None,
                     mic_on_demand: true,
                 },
             )
@@ -1315,6 +1388,7 @@ mod tests {
                     command_rx: None,
                     state_tx: Some(&state_tx),
                     consumer_rx: Some(&mut consumer_rx),
+                    generation: None,
                     mic_on_demand: true,
                 },
             )
@@ -1405,6 +1479,7 @@ mod tests {
                     command_rx: None,
                     state_tx: Some(&state_tx),
                     consumer_rx: None,
+                    generation: None,
                     mic_on_demand: false,
                 },
             )
