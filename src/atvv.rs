@@ -102,6 +102,18 @@ pub struct SessionConfig<'a> {
     pub mic_on_demand: bool,
 }
 
+struct InvalidateGenerationOnExit<'a> {
+    generation: Option<&'a Arc<AtomicU64>>,
+}
+
+impl Drop for InvalidateGenerationOnExit<'_> {
+    fn drop(&mut self) {
+        if let Some(generation) = self.generation {
+            generation.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
 /// Run the ATVV protocol session.
 ///
 /// Audio frames (decoded PCM) are sent to `config.audio_tx`.
@@ -135,6 +147,9 @@ pub async fn run_session(
         generation,
         mic_on_demand,
     } = config;
+    // Normal AUDIO_STOP keeps the same generation so its tail can drain. Any
+    // connection exit, including future cancellation, invalidates queued PCM.
+    let _invalidate_generation = InvalidateGenerationOnExit { generation };
     let mut state = State::Connected;
 
     // set_state takes &mut State as a parameter rather than capturing it because
@@ -830,11 +845,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_audio_start_increments_generation() {
+    async fn test_audio_generation_tracks_start_stop_and_disconnect() {
         tokio::time::pause();
 
         let (device, ctrl) = mock_device();
-        let (audio_tx, _audio_rx) = tokio_mpsc::channel(64);
+        let (audio_tx, mut audio_rx) = tokio_mpsc::channel(64);
         let (state_tx, _state_rx) = tokio::sync::watch::channel(State::Connected);
         let generation = Arc::new(AtomicU64::new(0));
         let timeouts = SessionTimeouts {
@@ -874,14 +889,25 @@ mod tests {
         ctrl.ctl_tx.send(vec![CTL_AUDIO_START]).unwrap();
         tokio::time::advance(Duration::from_millis(1)).await;
         assert_eq!(generation.load(Ordering::Relaxed), 1);
+
+        ctrl.rx_tx.send(make_audio_frame(0)).unwrap();
+        tokio::time::advance(Duration::from_millis(1)).await;
+        let queued = audio_rx.recv().await.unwrap();
+        assert_eq!(queued.generation, 1);
+
+        ctrl.ctl_tx.send(vec![CTL_AUDIO_STOP]).unwrap();
+        tokio::time::advance(Duration::from_millis(1)).await;
+        assert_eq!(generation.load(Ordering::Relaxed), 1);
+
         ctrl.ctl_tx.send(vec![CTL_AUDIO_START]).unwrap();
         tokio::time::advance(Duration::from_millis(1)).await;
         assert_eq!(generation.load(Ordering::Relaxed), 2);
         ctrl.event_tx
             .send(DeviceConnectionEvent::Disconnected)
             .unwrap();
-        let result = session.await.unwrap();
-        assert!(result.is_ok());
+        assert!(session.await.unwrap().is_ok());
+        assert!(generation.load(Ordering::Relaxed) > queued.generation);
+        assert_eq!(generation.load(Ordering::Relaxed), 3);
     }
 
     #[tokio::test]

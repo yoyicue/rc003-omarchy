@@ -85,7 +85,7 @@ pub fn run_pw_source(
     node_description: &str,
     shutdown_rx: pipewire::channel::Receiver<SessionControl>,
     startup_tx: Option<std::sync::mpsc::Sender<Result<(), String>>>,
-    failure_tx: tokio::sync::mpsc::UnboundedSender<String>,
+    failure_tx: tokio::sync::watch::Sender<Option<String>>,
     consumer_tx: Option<tokio::sync::watch::Sender<crate::consumer::ConsumerEvent>>,
 ) -> Result<(), pipewire::Error> {
     pipewire::init();
@@ -168,7 +168,7 @@ pub fn run_pw_source(
                     if let Some(startup_tx) = startup_tx.take() {
                         let _ = startup_tx.send(Err(failure.clone()));
                     }
-                    let _ = failure_tx.send(failure);
+                    let _ = failure_tx.send(Some(failure));
                     mainloop.quit();
                 }
             }

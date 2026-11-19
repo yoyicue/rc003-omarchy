@@ -131,4 +131,4 @@ ATVVoice 已下载到 `~/Work/tries/atvvoice`，其 `src/pw.rs` 是本项目原�
 
 ## 11. 跨会话虚拟源生命周期
 
-`rc003-omarchy` 的 PipeWire 源在进程生命周期内常驻。BLE 重连只结束当前 ATVV 会话并替换 PCM 生产者，不销毁或重新创建虚拟源，避免 Superwhisper 因源 ID 变化而回退或要求重新选择。每次 `AUDIO_START` 都通过 `Arc<AtomicU64>` 推进会话编号；实时音频回调独占 PCM 缓冲，在输出前清除旧编号样本，主循环不再通过 `RefCell` 或 `Cell` 与其共享状态。PCM 使用容量 32 的 `crossbeam_queue::ArrayQueue`，通过 `force_push` 在队列满时覆盖最旧帧。PipeWire 只有进入 Paused 或 Streaming 才确认启动成功，后续 Error 或意外 Unconnected 会通知主进程。协商出的采样率不是 16 kHz 时会拒绝运行。
+`rc003-omarchy` 的 PipeWire 源在进程生命周期内常驻。BLE 重连只结束当前 ATVV 会话并替换 PCM 生产者，不销毁或重新创建虚拟源。每次 `AUDIO_START` 都通过 `Arc<AtomicU64>` 推进会话编号；正常 `AUDIO_STOP` 保持编号以排空尾音，任何连接退出或会话取消都通过退出守卫推进编号，使排队旧 PCM 失效。实时音频回调独占缓冲，主循环不与其共享 `RefCell` 或 `Cell`。PipeWire 只有进入 Paused 或 Streaming 才确认启动成功；watch 保存最新 Error、意外 Unconnected 或线程退出状态，唤醒包括蓝牙重连在内的所有生命周期等待，并在录音中使用统一 MIC_CLOSE 清理路径。协商出的采样率不是 16 kHz 时会拒绝运行。

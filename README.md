@@ -109,12 +109,12 @@ target/release/rc003-omarchy service status
 target/release/rc003-omarchy service uninstall --apply
 ```
 
-The service uses `newgrp input -c` so the daemon starts with the required input group. PCM frames carry a session generation, and a bounded `ArrayQueue` drops the oldest frame when full. Every AUDIO_START atomically advances the generation; the PipeWire real-time callback exclusively owns its PCM buffer and discards older generations, with no `RefCell` or `Cell` shared with the main loop. Startup succeeds only after the stream reaches Paused or Streaming, and asynchronous stream failures reach the daemon. The executable is installed to `~/.local/bin/rc003-omarchy` instead of a `target/` path, and the PipeWire source stays alive across BLE reconnects. Real dictation has passed on Redmi; the service is installed and enabled.
+The service uses `newgrp input -c` so the daemon starts with the required input group. PCM frames carry a session generation, and a bounded `ArrayQueue` drops the oldest frame when full. Every AUDIO_START advances the generation, while normal AUDIO_STOP preserves it long enough to drain the tail; every connection exit invalidates queued PCM. The PipeWire real-time callback exclusively owns its buffer. Startup succeeds only after the stream reaches Paused or Streaming. A watch channel retains the latest asynchronous failure and wakes every lifecycle wait, including Bluetooth reconnects; recording failures use the same MIC_CLOSE cleanup path as normal shutdown. The executable is installed to `~/.local/bin/rc003-omarchy` instead of a `target/` path, and the PipeWire source stays alive across BLE reconnects.
 
 ## Validation status
 
-- 140 unit tests pass, plus the explicit uinput integration test.
-- Clippy passes with warnings denied; release build succeeds.
+- Previous Redmi baseline: 140 unit tests plus the explicit uinput integration test; Clippy passed with warnings denied and the release build succeeded.
+- Latest lifecycle changes: 123 portable tests pass on macOS, including disconnect invalidation, consumed failure notifications, closed failure channels, and relative config paths. Full Redmi build and PipeWire fault-injection validation are still pending.
 - Real BlueZ negotiation passed with ATVV v1.0, 16 kHz, and 120-byte frames.
 - Superwhisper enumerates `RC003 Remote Microphone` as 16 kHz mono S16LE.
 - Virtual RC003 input is verified end to end as RightAlt/F9 down/up through evdev/uinput.

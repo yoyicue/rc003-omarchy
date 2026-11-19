@@ -9,7 +9,7 @@
 - M4：实现完成，13 键及 RightAlt 已通过真机验证。
 - M5：完成。服务已通过 `newgrp input -c` 安装并启用，启动权限和遥控器断线后的自动恢复均已通过验收。
 
-自动验证：140 个单元测试、显式 uinput 集成测试、Clippy（warnings denied）和 release build 全部通过。
+此前 Redmi 基线：140 个单元测试、显式 uinput 集成测试、Clippy（warnings denied）和 release build 全部通过。第九轮改动已有 123 项可移植测试通过，完整 Redmi 验证见第 16 节。
 
 
 ## 1. 验证原则
@@ -211,3 +211,12 @@
 - 默认运行日志只输出脱敏蓝牙地址。
 
 2026-11-19 在 Redmi 重新安装新二进制后，140 个单元测试、显式 uinput 集成测试、Clippy、release build 和五项 `doctor` 检查通过。缺失默认配置与自定义配置的 unit 预览均通过；持续 `pw-cat` 消费者在真实蓝牙重连后再次收到 AUDIO_START。自动发现模式下，第二实例首次遇到真实占用，另一实例退出 5 秒后自动找回同一遥控器并完成协商。默认日志已实测脱敏，服务恢复为 enabled/active。本轮未重新生成 Superwhisper 语音记录。
+
+## 16. 第九轮 review 回归覆盖
+
+- 正常 AUDIO_STOP 保持 generation 以排空尾音；任何连接退出或会话取消都通过退出守卫使排队旧 PCM 失效。
+- PipeWire 故障监听覆盖协商、录音、退避和蓝牙重连，录音故障与正常停止共用 MIC_CLOSE 清理路径，最终返回失败让 systemd 重启。
+- 故障通知使用 watch 保存最新状态。即使通知已被 select 消费或通道异常关闭，后续等待和最终退出仍能失败关闭，不静默丢错。
+- 自定义相对配置路径在生成 unit 前转为绝对路径，避免工作目录变化后找不到配置。
+
+当前验证：rustfmt 通过；123 项可移植测试在 macOS 全部通过，包括实际 ShutdownSignal 代码的通知消费与通道关闭测试。项目完整 143 项单元测试、Clippy、release build、uinput 集成测试、PipeWire 真机故障注入及最终服务恢复尚未执行，原因是 Redmi 合盖离线。待设备恢复后必须完成这些验收，再更新本节为真机通过。

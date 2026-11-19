@@ -104,11 +104,16 @@ fn executable_path() -> PathBuf {
     PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".local/bin/rc003-omarchy")
 }
 
+fn absolute_config_path(path: &Path) -> Result<PathBuf> {
+    std::path::absolute(path).with_context(|| format!("resolve config path {}", path.display()))
+}
+
 fn generated_unit(config: Option<&Path>) -> Result<String> {
     let config = config.map(PathBuf::from).or_else(|| {
         let default = Config::default_path();
         default.is_file().then_some(default)
     });
+    let config = config.as_deref().map(absolute_config_path).transpose()?;
     unit_text(&executable_path(), config.as_deref())
 }
 
@@ -246,6 +251,13 @@ mod tests {
     fn unit_without_a_config_file_uses_builtin_defaults() {
         let unit = unit_text(Path::new("/opt/rc003-omarchy"), None).unwrap();
         assert!(!unit.contains("--config"));
+    }
+
+    #[test]
+    fn relative_config_paths_are_made_absolute() {
+        let path = absolute_config_path(Path::new("custom.toml")).unwrap();
+        assert!(path.is_absolute());
+        assert_eq!(path, std::env::current_dir().unwrap().join("custom.toml"));
     }
 
     #[test]

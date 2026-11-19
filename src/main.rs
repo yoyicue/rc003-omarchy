@@ -89,7 +89,7 @@ struct Cli {
 struct PipeWireHandle {
     shutdown_tx: pipewire::channel::Sender<pw::SessionControl>,
     generation: Arc<AtomicU64>,
-    failure_rx: tokio::sync::mpsc::UnboundedReceiver<String>,
+    failure_rx: Option<tokio::sync::watch::Receiver<Option<String>>>,
     join: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -103,7 +103,7 @@ impl PipeWireHandle {
     ) -> anyhow::Result<Self> {
         let (shutdown_tx, shutdown_rx) = pipewire::channel::channel::<pw::SessionControl>();
         let (startup_tx, startup_rx) = std::sync::mpsc::channel::<Result<(), String>>();
-        let (failure_tx, failure_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let (failure_tx, failure_rx) = tokio::sync::watch::channel::<Option<String>>(None);
         let generation = Arc::new(AtomicU64::new(0));
         let thread_generation = generation.clone();
         let join = std::thread::spawn(move || {
@@ -121,14 +121,14 @@ impl PipeWireHandle {
             ) {
                 let message = error.to_string();
                 let _ = startup_tx.send(Err(message.clone()));
-                let _ = failure_tx.send(message);
+                let _ = failure_tx.send(Some(message));
             }
         });
         match startup_rx.recv_timeout(Duration::from_secs(3)) {
             Ok(Ok(())) => Ok(Self {
                 shutdown_tx,
                 generation,
-                failure_rx,
+                failure_rx: Some(failure_rx),
                 join: Some(join),
             }),
             Ok(Err(error)) => {
@@ -175,6 +175,8 @@ struct ShutdownSignal {
     interrupt: tokio::signal::unix::Signal,
     #[cfg(unix)]
     terminate: tokio::signal::unix::Signal,
+    pipewire_failure_rx: Option<tokio::sync::watch::Receiver<Option<String>>>,
+    pipewire_failure: Option<String>,
 }
 
 impl ShutdownSignal {
@@ -185,22 +187,79 @@ impl ShutdownSignal {
             Ok(Self {
                 interrupt: signal(SignalKind::interrupt())?,
                 terminate: signal(SignalKind::terminate())?,
+                pipewire_failure_rx: None,
+                pipewire_failure: None,
             })
         }
         #[cfg(not(unix))]
         {
-            Ok(Self {})
+            Ok(Self {
+                pipewire_failure_rx: None,
+                pipewire_failure: None,
+            })
         }
     }
 
+    fn watch_pipewire(&mut self, receiver: tokio::sync::watch::Receiver<Option<String>>) {
+        self.pipewire_failure_rx = Some(receiver);
+    }
+
+    fn pipewire_failure(&self) -> Option<String> {
+        self.pipewire_failure.clone().or_else(|| {
+            self.pipewire_failure_rx
+                .as_ref()
+                .and_then(|receiver| receiver.borrow().clone())
+        })
+    }
+
+    fn record_pipewire_failure(&mut self, failure: String) {
+        tracing::error!(%failure, "PipeWire thread failed");
+        self.pipewire_failure = Some(failure);
+    }
+
     async fn wait(&mut self) {
+        if self.pipewire_failure.is_some() {
+            return;
+        }
+        if let Some(failure) = self.pipewire_failure() {
+            self.record_pipewire_failure(failure);
+            return;
+        }
+        let changed = async {
+            match self.pipewire_failure_rx.as_mut() {
+                Some(receiver) => receiver.changed().await,
+                None => std::future::pending().await,
+            }
+        };
         #[cfg(unix)]
         tokio::select! {
             _ = self.interrupt.recv() => {}
             _ = self.terminate.recv() => {}
+            result = changed => {
+                let failure = self.pipewire_failure().unwrap_or_else(|| {
+                    if result.is_err() {
+                        "PipeWire thread stopped without an error report".to_string()
+                    } else {
+                        "PipeWire failure notification did not contain an error".to_string()
+                    }
+                });
+                self.record_pipewire_failure(failure);
+            }
         }
         #[cfg(not(unix))]
-        let _ = tokio::signal::ctrl_c().await;
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            result = changed => {
+                let failure = self.pipewire_failure().unwrap_or_else(|| {
+                    if result.is_err() {
+                        "PipeWire thread stopped without an error report".to_string()
+                    } else {
+                        "PipeWire failure notification did not contain an error".to_string()
+                    }
+                });
+                self.record_pipewire_failure(failure);
+            }
+        }
     }
 }
 
@@ -537,6 +596,11 @@ async fn main() -> anyhow::Result<()> {
             node_description.clone(),
             consumer_tx,
         )?;
+        let failure_rx = _pw_handle
+            .failure_rx
+            .take()
+            .expect("PipeWire failure receiver is registered once");
+        shutdown.watch_pipewire(failure_rx);
 
         // Inner loop: session → reconnect (same device).
         loop {
@@ -656,10 +720,6 @@ async fn main() -> anyhow::Result<()> {
                         mic_on_demand: cli.mic_on_demand,
                     },
                 ) => result,
-                Some(failure) = _pw_handle.failure_rx.recv() => {
-                    tracing::error!(%failure, "PipeWire thread failed");
-                    return Err(anyhow::anyhow!(failure));
-                },
                 _ = shutdown.wait() => {
                     let mic_close = session_protocol.mic_close_cmd(
                         protocol::types::StreamId::ANY,
@@ -765,12 +825,51 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
+    if let Some(failure) = shutdown.pipewire_failure() {
+        return Err(anyhow::anyhow!("PipeWire failure: {failure}"));
+    }
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn pipewire_failure_survives_a_consumed_notification() {
+        let mut shutdown = ShutdownSignal::new().unwrap();
+        let (failure_tx, failure_rx) = tokio::sync::watch::channel(None);
+        shutdown.watch_pipewire(failure_rx);
+        failure_tx
+            .send(Some("injected failure".to_string()))
+            .unwrap();
+        shutdown
+            .pipewire_failure_rx
+            .as_mut()
+            .unwrap()
+            .changed()
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), shutdown.wait())
+            .await
+            .expect("stored PipeWire failure did not wake the lifecycle");
+        assert_eq!(
+            shutdown.pipewire_failure().as_deref(),
+            Some("injected failure")
+        );
+    }
+
+    #[tokio::test]
+    async fn closed_pipewire_failure_channel_is_an_error() {
+        let mut shutdown = ShutdownSignal::new().unwrap();
+        let (failure_tx, failure_rx) = tokio::sync::watch::channel(None);
+        shutdown.watch_pipewire(failure_rx);
+        drop(failure_tx);
+        tokio::time::timeout(Duration::from_secs(1), shutdown.wait())
+            .await
+            .expect("closed PipeWire channel did not wake the lifecycle");
+        assert!(shutdown.pipewire_failure().is_some());
+    }
 
     #[test]
     fn locked_device_exclusions_expire() {
