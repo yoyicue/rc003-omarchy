@@ -77,11 +77,16 @@ pub struct AudioPacket {
     pub generation: u64,
 }
 
+#[derive(Debug, Clone)]
+pub enum SessionNotification {
+    Control(Vec<u8>),
+    Audio(AudioPacket),
+}
+
 /// BLE notification streams for an active session.
 /// Created during negotiation and passed to `run_session`.
 pub struct BleStreams {
-    pub ctl: BleStream<Vec<u8>>,
-    pub rx: BleStream<AudioPacket>,
+    pub notifications: BleStream<SessionNotification>,
     pub events: BleStream<DeviceConnectionEvent>,
 }
 
@@ -90,11 +95,8 @@ pub trait BleDevice: Send {
     /// Write a command to the TX characteristic.
     fn write_command(&self, data: &[u8]) -> BleFut<'_, ()>;
 
-    /// Get a stream of CTL notifications.
-    fn ctl_notifications(&self) -> BleFut<'_, BleStream<Vec<u8>>>;
-
-    /// Get a stream of RX (audio) notifications.
-    fn rx_notifications(&self) -> BleFut<'_, BleStream<AudioPacket>>;
+    /// Get the ordered stream of control and audio notifications.
+    fn notifications(&self) -> BleFut<'_, BleStream<SessionNotification>>;
 
     /// Get a stream of device connection events.
     fn connection_events(&self) -> BleFut<'_, BleStream<DeviceConnectionEvent>>;
@@ -207,11 +209,9 @@ pub async fn run_session(
     }
 
     // Destructure pre-subscribed BLE streams
-    let ctl_stream = streams.ctl;
-    let rx_stream = streams.rx;
+    let notifications = streams.notifications;
     let device_events = streams.events;
-    tokio::pin!(ctl_stream);
-    tokio::pin!(rx_stream);
+    tokio::pin!(notifications);
     tokio::pin!(device_events);
 
     let mut last_seq: Option<u16> = None;
@@ -234,15 +234,17 @@ pub async fn run_session(
 
     loop {
         tokio::select! {
-            data = ctl_stream.next() => {
-                let Some(data) = data else {
-                    tracing::info!("CTL stream ended");
+            event = notifications.next() => {
+                let Some(event) = event else {
+                    tracing::info!("Notification stream ended");
                     return Ok(());
                 };
-                if data.is_empty() {
-                    continue;
-                }
-                match protocol.parse_ctl(&data) {
+                match event {
+                    SessionNotification::Control(data) => {
+                        if data.is_empty() {
+                            continue;
+                        }
+                        match protocol.parse_ctl(&data) {
                     CtlEvent::AudioStop { reason } => {
                         tracing::info!("AUDIO_STOP (reason={:?})", reason);
                         if pending_close == Some(reason) {
@@ -329,12 +331,8 @@ pub async fn run_session(
                     }
                 }
             }
-            packet = rx_stream.next() => {
-                let Some(packet) = packet else {
-                    tracing::info!("RX stream ended");
-                    return Ok(());
-                };
-                if state == State::Streaming {
+                    SessionNotification::Audio(packet) => {
+                        if state == State::Streaming {
                     if packet.generation > stream_generation {
                         drop_next_frame = protocol.has_partial_audio();
                         stream_generation = packet.generation;
@@ -373,6 +371,8 @@ pub async fn run_session(
                     }
                 }
             }
+        }
+        }
             // External commands (D-Bus, etc.)
             Some(cmd) = async {
                 match command_rx.as_mut() {
@@ -511,38 +511,55 @@ mod tests {
     struct MockBleDevice {
         /// Commands written by the state machine (for assertion).
         commands: tokio_mpsc::UnboundedSender<Vec<u8>>,
-        /// Inject CTL notifications.
-        ctl_rx: Mutex<Option<tokio_mpsc::UnboundedReceiver<Vec<u8>>>>,
-        /// Inject RX (audio) notifications.
-        rx_rx: Mutex<Option<tokio_mpsc::UnboundedReceiver<AudioPacket>>>,
+        notifications: Mutex<Option<tokio_mpsc::UnboundedReceiver<SessionNotification>>>,
         /// Inject device events.
         event_rx: Mutex<Option<tokio_mpsc::UnboundedReceiver<DeviceConnectionEvent>>>,
     }
 
+    struct ControlSender(tokio_mpsc::UnboundedSender<SessionNotification>);
+
+    impl ControlSender {
+        fn send(
+            &self,
+            data: Vec<u8>,
+        ) -> Result<(), tokio_mpsc::error::SendError<SessionNotification>> {
+            self.0.send(SessionNotification::Control(data))
+        }
+    }
+
+    struct AudioSender(tokio_mpsc::UnboundedSender<SessionNotification>);
+
+    impl AudioSender {
+        fn send(
+            &self,
+            packet: AudioPacket,
+        ) -> Result<(), tokio_mpsc::error::SendError<SessionNotification>> {
+            self.0.send(SessionNotification::Audio(packet))
+        }
+    }
+
     struct MockControls {
         commands_rx: tokio_mpsc::UnboundedReceiver<Vec<u8>>,
-        ctl_tx: tokio_mpsc::UnboundedSender<Vec<u8>>,
-        rx_tx: tokio_mpsc::UnboundedSender<AudioPacket>,
+        ctl_tx: ControlSender,
+        rx_tx: AudioSender,
         event_tx: tokio_mpsc::UnboundedSender<DeviceConnectionEvent>,
     }
 
     fn mock_device() -> (MockBleDevice, MockControls) {
         let (commands_tx, commands_rx) = tokio_mpsc::unbounded_channel();
-        let (ctl_tx, ctl_rx) = tokio_mpsc::unbounded_channel();
-        let (rx_tx, rx_rx) = tokio_mpsc::unbounded_channel();
+        let (notification_tx, notification_rx) = tokio_mpsc::unbounded_channel();
         let (event_tx, event_rx) = tokio_mpsc::unbounded_channel();
 
         let device = MockBleDevice {
             commands: commands_tx,
-            ctl_rx: Mutex::new(Some(ctl_rx)),
-            rx_rx: Mutex::new(Some(rx_rx)),
+            notifications: Mutex::new(Some(notification_rx)),
             event_rx: Mutex::new(Some(event_rx)),
         };
 
         let controls = MockControls {
             commands_rx,
-            ctl_tx,
-            rx_tx,
+            ctl_tx: ControlSender(notification_tx.clone()),
+            rx_tx: AudioSender(notification_tx),
             event_tx,
         };
 
@@ -560,27 +577,15 @@ mod tests {
             })
         }
 
-        fn ctl_notifications(&self) -> BleFut<'_, BleStream<Vec<u8>>> {
+        fn notifications(&self) -> BleFut<'_, BleStream<SessionNotification>> {
             Box::pin(async {
                 let rx = self
-                    .ctl_rx
+                    .notifications
                     .lock()
                     .await
                     .take()
-                    .expect("ctl_notifications called more than once");
-                Ok(Box::pin(UnboundedReceiverStream::new(rx)) as BleStream<Vec<u8>>)
-            })
-        }
-
-        fn rx_notifications(&self) -> BleFut<'_, BleStream<AudioPacket>> {
-            Box::pin(async {
-                let rx = self
-                    .rx_rx
-                    .lock()
-                    .await
-                    .take()
-                    .expect("rx_notifications called more than once");
-                Ok(Box::pin(UnboundedReceiverStream::new(rx)) as BleStream<AudioPacket>)
+                    .expect("notifications called more than once");
+                Ok(Box::pin(UnboundedReceiverStream::new(rx)) as BleStream<SessionNotification>)
             })
         }
 
@@ -681,10 +686,12 @@ mod tests {
         protocol.on_caps_resp(&caps).unwrap();
 
         // Create BleStreams from mock (consumes receivers)
-        let ctl = device.ctl_notifications().await.unwrap();
-        let rx = device.rx_notifications().await.unwrap();
+        let notifications = device.notifications().await.unwrap();
         let events = device.connection_events().await.unwrap();
-        let streams = BleStreams { ctl, rx, events };
+        let streams = BleStreams {
+            notifications,
+            events,
+        };
 
         let session = tokio::spawn(async move {
             run_session(
@@ -789,10 +796,12 @@ mod tests {
         let mut protocol = ProtocolV04::new();
         protocol.on_caps_resp(&caps).unwrap();
 
-        let ctl = device.ctl_notifications().await.unwrap();
-        let rx = device.rx_notifications().await.unwrap();
+        let notifications = device.notifications().await.unwrap();
         let events = device.connection_events().await.unwrap();
-        let streams = BleStreams { ctl, rx, events };
+        let streams = BleStreams {
+            notifications,
+            events,
+        };
 
         let session = tokio::spawn(async move {
             run_session(
@@ -876,10 +885,12 @@ mod tests {
         let mut protocol = ProtocolV04::new();
         protocol.on_caps_resp(&caps).unwrap();
 
-        let ctl = device.ctl_notifications().await.unwrap();
-        let rx = device.rx_notifications().await.unwrap();
+        let notifications = device.notifications().await.unwrap();
         let events = device.connection_events().await.unwrap();
-        let streams = BleStreams { ctl, rx, events };
+        let streams = BleStreams {
+            notifications,
+            events,
+        };
 
         let session = tokio::spawn(async move {
             run_session(
@@ -935,10 +946,12 @@ mod tests {
         };
         let mut protocol = crate::protocol::v10::ProtocolV10::new();
         protocol.on_caps_resp(&caps).unwrap();
-        let ctl = device.ctl_notifications().await.unwrap();
-        let rx = device.rx_notifications().await.unwrap();
+        let notifications = device.notifications().await.unwrap();
         let events = device.connection_events().await.unwrap();
-        let streams = BleStreams { ctl, rx, events };
+        let streams = BleStreams {
+            notifications,
+            events,
+        };
         let generation_for_session = generation.clone();
         let tail_for_session = tail_expiration.clone();
         let session = tokio::spawn(async move {
@@ -1070,10 +1083,12 @@ mod tests {
         };
         let mut protocol = ProtocolV04::new();
         protocol.on_caps_resp(&caps).unwrap();
-        let ctl = device.ctl_notifications().await.unwrap();
-        let rx = device.rx_notifications().await.unwrap();
+        let notifications = device.notifications().await.unwrap();
         let events = device.connection_events().await.unwrap();
-        let streams = BleStreams { ctl, rx, events };
+        let streams = BleStreams {
+            notifications,
+            events,
+        };
         let session = tokio::spawn(async move {
             run_session(
                 &device,
@@ -1093,6 +1108,7 @@ mod tests {
             .await
         });
         drop(ctrl.ctl_tx);
+        drop(ctrl.rx_tx);
         tokio::time::advance(Duration::from_millis(1)).await;
         let result = session.await.unwrap();
         assert!(result.is_ok());
@@ -1124,10 +1140,12 @@ mod tests {
         let mut protocol = ProtocolV04::new();
         protocol.on_caps_resp(&caps).unwrap();
 
-        let ctl = device.ctl_notifications().await.unwrap();
-        let rx = device.rx_notifications().await.unwrap();
+        let notifications = device.notifications().await.unwrap();
         let events = device.connection_events().await.unwrap();
-        let streams = BleStreams { ctl, rx, events };
+        let streams = BleStreams {
+            notifications,
+            events,
+        };
 
         let session = tokio::spawn(async move {
             run_session(
@@ -1222,8 +1240,7 @@ mod tests {
         let mut protocol = ProtocolV04::new();
         protocol.on_caps_resp(&caps).unwrap();
         let streams = BleStreams {
-            ctl: device.ctl_notifications().await.unwrap(),
-            rx: device.rx_notifications().await.unwrap(),
+            notifications: device.notifications().await.unwrap(),
             events: device.connection_events().await.unwrap(),
         };
         let session = tokio::spawn(async move {
@@ -1285,10 +1302,12 @@ mod tests {
         let mut protocol = ProtocolV04::new();
         protocol.on_caps_resp(&caps).unwrap();
 
-        let ctl = device.ctl_notifications().await.unwrap();
-        let rx = device.rx_notifications().await.unwrap();
+        let notifications = device.notifications().await.unwrap();
         let events = device.connection_events().await.unwrap();
-        let streams = BleStreams { ctl, rx, events };
+        let streams = BleStreams {
+            notifications,
+            events,
+        };
 
         let session = tokio::spawn(async move {
             run_session(
@@ -1356,10 +1375,12 @@ mod tests {
         let mut protocol = ProtocolV04::new();
         protocol.on_caps_resp(&caps).unwrap();
 
-        let ctl = device.ctl_notifications().await.unwrap();
-        let rx = device.rx_notifications().await.unwrap();
+        let notifications = device.notifications().await.unwrap();
         let events = device.connection_events().await.unwrap();
-        let streams = BleStreams { ctl, rx, events };
+        let streams = BleStreams {
+            notifications,
+            events,
+        };
 
         let session = tokio::spawn(async move {
             run_session(
@@ -1441,10 +1462,12 @@ mod tests {
         let mut protocol = ProtocolV04::new();
         protocol.on_caps_resp(&caps).unwrap();
 
-        let ctl = device.ctl_notifications().await.unwrap();
-        let rx = device.rx_notifications().await.unwrap();
+        let notifications = device.notifications().await.unwrap();
         let events = device.connection_events().await.unwrap();
-        let streams = BleStreams { ctl, rx, events };
+        let streams = BleStreams {
+            notifications,
+            events,
+        };
 
         let session = tokio::spawn(async move {
             run_session(
@@ -1516,10 +1539,12 @@ mod tests {
         let mut protocol = ProtocolV04::new();
         protocol.on_caps_resp(&caps).unwrap();
 
-        let ctl = device.ctl_notifications().await.unwrap();
-        let rx = device.rx_notifications().await.unwrap();
+        let notifications = device.notifications().await.unwrap();
         let events = device.connection_events().await.unwrap();
-        let streams = BleStreams { ctl, rx, events };
+        let streams = BleStreams {
+            notifications,
+            events,
+        };
 
         let session = tokio::spawn(async move {
             run_session(
@@ -1603,10 +1628,12 @@ mod tests {
         let mut protocol = ProtocolV04::new();
         protocol.on_caps_resp(&caps).unwrap();
 
-        let ctl = device.ctl_notifications().await.unwrap();
-        let rx = device.rx_notifications().await.unwrap();
+        let notifications = device.notifications().await.unwrap();
         let events = device.connection_events().await.unwrap();
-        let streams = BleStreams { ctl, rx, events };
+        let streams = BleStreams {
+            notifications,
+            events,
+        };
 
         let session = tokio::spawn(async move {
             run_session(
@@ -1686,10 +1713,12 @@ mod tests {
         let mut protocol = ProtocolV04::new();
         protocol.on_caps_resp(&caps).unwrap();
 
-        let ctl = device.ctl_notifications().await.unwrap();
-        let rx = device.rx_notifications().await.unwrap();
+        let notifications = device.notifications().await.unwrap();
         let events = device.connection_events().await.unwrap();
-        let streams = BleStreams { ctl, rx, events };
+        let streams = BleStreams {
+            notifications,
+            events,
+        };
 
         let session = tokio::spawn(async move {
             run_session(
@@ -1777,10 +1806,12 @@ mod tests {
         let mut protocol = ProtocolV10::new();
         protocol.on_caps_resp(&caps).unwrap();
 
-        let ctl = device.ctl_notifications().await.unwrap();
-        let rx = device.rx_notifications().await.unwrap();
+        let notifications = device.notifications().await.unwrap();
         let events = device.connection_events().await.unwrap();
-        let streams = BleStreams { ctl, rx, events };
+        let streams = BleStreams {
+            notifications,
+            events,
+        };
 
         let session = tokio::spawn(async move {
             run_session(

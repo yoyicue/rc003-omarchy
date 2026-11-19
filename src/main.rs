@@ -343,8 +343,7 @@ async fn negotiate(
     // Subscribe to all streams up front. Only CTL is needed for negotiation,
     // but the others must be acquired now since BLE notification handles are
     // exclusive (can't re-subscribe later).
-    let mut ctl_stream = ble.ctl_notifications().await?;
-    let rx_stream = ble.rx_notifications().await?;
+    let mut notifications = ble.notifications().await?;
     let device_events = ble.connection_events().await?;
 
     ble.write_command(&protocol::get_caps_cmd()).await?;
@@ -356,23 +355,23 @@ async fn negotiate(
     // BleStream<T> is Pin<Box<dyn Stream>>, already Unpin -- no tokio::pin! needed.
     loop {
         tokio::select! {
-            data = ctl_stream.next() => {
-                match data {
-                    Some(data) => {
+            event = notifications.next() => {
+                match event {
+                    Some(atvv::SessionNotification::Control(data)) => {
                         if let Some(caps) = protocol::parse_caps_resp(&data) {
                             tracing::info!(
                                 "CAPS_RESP: version={}, codecs={:?}, model={:?}, frame_size={}",
                                 caps.version, caps.codecs, caps.interaction_model, caps.audio_frame_size.0
                             );
                             return Ok((caps, atvv::BleStreams {
-                                ctl: ctl_stream,
-                                rx: rx_stream,
+                                notifications,
                                 events: device_events,
                             }));
                         }
                         // Not a CAPS_RESP (e.g., stale START_SEARCH) -- keep waiting
                         tracing::debug!("Ignoring non-CAPS_RESP CTL during negotiation: {:02x?}", data);
                     }
+                    Some(atvv::SessionNotification::Audio(_)) => {}
                     None => {
                         anyhow::bail!("device disconnected during negotiation");
                     }
