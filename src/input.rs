@@ -176,6 +176,10 @@ impl InputMapper {
 
     fn map_voice(&mut self, value: i32) -> Vec<InputEvent> {
         match value {
+            1 if self.voice_down && self.voice_release_at.is_some() => {
+                self.voice_release_at = None;
+                Vec::new()
+            }
             1 if !self.voice_down => {
                 self.voice_release_at = None;
                 self.voice_down = true;
@@ -205,6 +209,30 @@ impl InputMapper {
         }
         events
     }
+}
+
+fn process_event_batch(
+    mapper: &mut InputMapper,
+    events: Result<Vec<InputEvent>, std::io::Error>,
+) -> Result<Vec<InputEvent>> {
+    let mut mapped = mapper.pending_events();
+    match events {
+        Ok(events) => {
+            for event in events {
+                if event.event_type() == EventType::KEY {
+                    tracing::debug!(
+                        code = event.code(),
+                        value = event.value(),
+                        "RC003 raw input event"
+                    );
+                }
+                mapped.extend(mapper.map(event));
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+        Err(error) => return Err(error.into()),
+    }
+    Ok(mapped)
 }
 
 struct ManagedDevice {
@@ -250,18 +278,8 @@ impl ManagedDevice {
     }
 
     fn process_events(&mut self) -> Result<()> {
-        let mut mapped = self.mapper.pending_events();
-        let events = self.device.fetch_events()?;
-        for event in events {
-            if event.event_type() == EventType::KEY {
-                tracing::debug!(
-                    code = event.code(),
-                    value = event.value(),
-                    "RC003 raw input event"
-                );
-            }
-            mapped.extend(self.mapper.map(event));
-        }
+        let events = self.device.fetch_events().map(|events| events.collect());
+        let mapped = process_event_batch(&mut self.mapper, events)?;
         if !mapped.is_empty() {
             tracing::debug!(?mapped, "RC003 mapped input events");
             self.virtual_device.emit(&mapped)?;
@@ -673,6 +691,37 @@ mod tests {
             }
         }
         found
+    }
+
+    #[test]
+    fn wouldblock_event_source_still_releases_after_deadline() {
+        let mut mapper = InputMapper::with_release_drain(Duration::from_millis(20));
+        mapper.map(key_event(KEY_F5, 1));
+        mapper.map(key_event(KEY_F5, 0));
+        std::thread::sleep(Duration::from_millis(30));
+        let events = process_event_batch(
+            &mut mapper,
+            Err(std::io::Error::from(std::io::ErrorKind::WouldBlock)),
+        )
+        .unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].code(), KEY_F9);
+        assert_eq!(events[0].value(), 0);
+    }
+
+    #[test]
+    fn repress_cancels_pending_release() {
+        let mut mapper = InputMapper::with_release_drain(Duration::from_millis(50));
+        mapper.map(key_event(KEY_F5, 1));
+        mapper.map(key_event(KEY_F5, 0));
+        assert!(mapper.map(key_event(KEY_F5, 1)).is_empty());
+        assert!(mapper.pending_events().is_empty());
+        std::thread::sleep(Duration::from_millis(60));
+        mapper.map(key_event(KEY_F5, 0));
+        std::thread::sleep(Duration::from_millis(60));
+        let events = mapper.pending_events();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].value(), 0);
     }
 
     #[test]

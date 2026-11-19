@@ -103,7 +103,6 @@ impl PipeWireHandle {
     ) -> Self {
         let (shutdown_tx, shutdown_rx) = pipewire::channel::channel::<pw::SessionControl>();
         let generation = Arc::new(AtomicU64::new(0));
-        let session_generation = generation.clone();
         let join = std::thread::spawn(move || {
             if let Err(error) = pw::run_pw_source(
                 pcm_rx,
@@ -111,7 +110,6 @@ impl PipeWireHandle {
                 16_000,
                 &node_name,
                 &node_description,
-                session_generation,
                 shutdown_rx,
                 consumer_tx,
             ) {
@@ -481,7 +479,7 @@ async fn main() -> anyhow::Result<()> {
             (None, None)
         };
 
-        let (pcm_tx, pcm_rx) = std::sync::mpsc::channel::<pw::PcmFrame>();
+        let (pcm_tx, pcm_rx) = std::sync::mpsc::sync_channel::<pw::PcmFrame>(32);
         let (consumer_tx, mut consumer_rx) = if cli.mic_on_demand {
             let (tx, rx) = tokio::sync::mpsc::channel(16);
             (Some(tx), Some(rx))
@@ -544,6 +542,10 @@ async fn main() -> anyhow::Result<()> {
                 Ok((p, c)) => (p, c),
                 Err(e) => {
                     tracing::error!("Protocol creation failed: {e}");
+                    tokio::select! {
+                        _ = tokio::time::sleep(reconnect_delay) => {}
+                        _ = shutdown.wait() => break 'discover,
+                    }
                     continue;
                 }
             };
@@ -552,6 +554,10 @@ async fn main() -> anyhow::Result<()> {
                     sample_rate = codec.sample_rate(),
                     "unsupported RC003 sample rate"
                 );
+                tokio::select! {
+                    _ = tokio::time::sleep(reconnect_delay) => {}
+                    _ = shutdown.wait() => break 'discover,
+                }
                 continue;
             }
             let generation = _pw_handle.reset();
@@ -573,10 +579,15 @@ async fn main() -> anyhow::Result<()> {
                     let mut samples = frame.samples;
                     adpcm::declip(&mut samples);
                     adpcm::lowpass(&mut samples);
-                    let _ = pcm_tx.send(pw::PcmFrame {
+                    if let Err(error) = pcm_tx.try_send(pw::PcmFrame {
                         generation,
                         samples,
-                    });
+                    }) {
+                        tracing::debug!(
+                            ?error,
+                            "dropping PCM frame because the channel is full or closed"
+                        );
+                    }
                 }
             });
 
@@ -616,7 +627,10 @@ async fn main() -> anyhow::Result<()> {
             let _ = decoder_handle.await;
 
             match &session_result {
-                Ok(()) => tracing::info!("Session ended"),
+                Ok(()) => {
+                    tracing::info!("Session ended");
+                    reconnect_delay = retry_delay;
+                }
                 Err(e) if is_device_locked_error(e) => {
                     if filter_addr.is_some() {
                         // Explicit --device: fatal, user asked for this specific device.

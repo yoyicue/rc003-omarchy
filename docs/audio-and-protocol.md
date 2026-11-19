@@ -131,4 +131,4 @@ ATVVoice 已下载到 `~/Work/tries/atvvoice`，其 `src/pw.rs` 是本项目原�
 
 ## 11. 跨会话虚拟源生命周期
 
-`rc003-omarchy` 的 PipeWire 源在进程生命周期内常驻。BLE 重连只结束当前 ATVV 会话并替换 PCM 生产者，不销毁或重新创建虚拟源，避免 Superwhisper 因源 ID 变化而回退或要求重新选择。进程收到 SIGINT/SIGTERM 后才统一关闭源。每个新 ATVV 会话使用递增的会话编号，PipeWire 只接收当前编号的 PCM 帧，旧帧不会误播，新会话首帧也不会被 Reset 误删。会话编号使用 `Arc<AtomicU64>` 跨线程共享。协商出的采样率不是 16 kHz 时会拒绝运行。
+`rc003-omarchy` 的 PipeWire 源在进程生命周期内常驻。BLE 重连只结束当前 ATVV 会话并替换 PCM 生产者，不销毁或重新创建虚拟源，避免 Superwhisper 因源 ID 变化而回退或要求重新选择。进程收到 SIGINT/SIGTERM 后才统一关闭源。每个新 ATVV 会话使用递增的会话编号。PipeWire 只依据帧里的编号判断：更大的编号开启新会话并清空旧缓冲，相同编号接收，较小编号丢弃，因此不会因为读取当前编号与取帧之间的竞态而误删首帧。PCM 使用容量 32 的有界通道，通道满或关闭时丢弃新帧，避免无消费者时无限堆积。协商出的采样率不是 16 kHz 时会拒绝运行。

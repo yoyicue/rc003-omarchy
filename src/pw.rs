@@ -9,10 +9,6 @@
 
 use std::io;
 use std::sync::mpsc;
-use std::sync::{
-    atomic::{AtomicU64, Ordering},
-    Arc,
-};
 
 use pipewire::context::ContextRc;
 use pipewire::keys;
@@ -50,8 +46,8 @@ pub struct PcmFrame {
 /// virtual microphone. Returns when `shutdown_rx` receives a [`Shutdown`] message.
 ///
 /// Call from a dedicated `std::thread::spawn`.
-fn frame_is_current(frame_generation: u64, current_generation: u64) -> bool {
-    frame_generation == current_generation
+fn frame_is_newer(frame_generation: u64, previous_generation: u64) -> bool {
+    frame_generation > previous_generation
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -61,7 +57,6 @@ pub fn run_pw_source(
     sample_rate: u32,
     node_name: &str,
     node_description: &str,
-    session_generation: Arc<AtomicU64>,
     shutdown_rx: pipewire::channel::Receiver<SessionControl>,
     consumer_tx: Option<tokio::sync::mpsc::Sender<crate::consumer::ConsumerEvent>>,
 ) -> Result<(), pipewire::Error> {
@@ -118,7 +113,7 @@ pub fn run_pw_source(
     let our_node_id: std::rc::Rc<std::cell::Cell<u32>> =
         std::rc::Rc::new(std::cell::Cell::new(u32::MAX));
 
-    let mut previous_generation = session_generation.load(Ordering::Relaxed);
+    let mut previous_generation = 0;
     let _listener = stream
         .add_local_listener_with_user_data(())
         .state_changed({
@@ -140,11 +135,6 @@ pub fn run_pw_source(
             }
         })
         .process(move |stream: &Stream, _| {
-            let current_generation = session_generation.load(Ordering::Relaxed);
-            if current_generation != previous_generation {
-                pending.borrow_mut().clear();
-                previous_generation = current_generation;
-            }
             // NOTE: Vec operations (extend, drain) allocate inside this RT callback.
             // At ~30 fps with 257 samples/frame, allocation pressure is negligible
             // and not a real-time concern for voice audio rates.
@@ -153,7 +143,11 @@ pub fn run_pw_source(
             loop {
                 match audio_rx.try_recv() {
                     Ok(mut frame) => {
-                        if frame_is_current(frame.generation, current_generation) {
+                        if frame_is_newer(frame.generation, previous_generation) {
+                            buf.clear();
+                            previous_generation = frame.generation;
+                        }
+                        if frame.generation == previous_generation {
                             crate::adpcm::apply_gain_linear(&mut frame.samples, gain_linear);
                             buf.extend_from_slice(&frame.samples);
                         }
@@ -455,7 +449,7 @@ mod tests {
 
     #[test]
     fn only_current_session_frames_are_accepted() {
-        assert!(!frame_is_current(6, 7));
-        assert!(frame_is_current(7, 7));
+        assert!(frame_is_newer(7, 6));
+        assert!(!frame_is_newer(6, 7));
     }
 }

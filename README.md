@@ -109,11 +109,11 @@ target/release/rc003-omarchy service status
 target/release/rc003-omarchy service uninstall --apply
 ```
 
-The service uses `newgrp input -c` so the daemon starts with the required input group. PCM frames carry an atomic session generation so reconnects cannot replay old audio or drop the next session's first frame. The executable is installed to `~/.local/bin/rc003-omarchy` instead of a `target/` path, and the PipeWire source stays alive across BLE reconnects. Real dictation has passed on Redmi; the service is installed and enabled.
+The service uses `newgrp input -c` so the daemon starts with the required input group. PCM frames carry a session generation, and only frame metadata decides what to play or discard. A bounded PCM channel prevents unbounded buffering when no consumer is connected. The executable is installed to `~/.local/bin/rc003-omarchy` instead of a `target/` path, and the PipeWire source stays alive across BLE reconnects. Real dictation has passed on Redmi; the service is installed and enabled.
 
 ## Validation status
 
-- 121 unit tests pass, plus the explicit uinput integration test.
+- 123 unit tests pass, plus the explicit uinput integration test.
 - Clippy passes with warnings denied; release build succeeds.
 - Real BlueZ negotiation passed with ATVV v1.0, 16 kHz, and 120-byte frames.
 - Superwhisper enumerates `RC003 Remote Microphone` as 16 kHz mono S16LE.
