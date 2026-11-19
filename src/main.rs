@@ -362,8 +362,8 @@ async fn negotiate(
         tokio::select! {
             event = notifications.next() => {
                 match event {
-                    Some(atvv::SessionNotification::Control(data)) => {
-                        if let Some(caps) = protocol::parse_caps_resp(&data) {
+                    Some(atvv::SessionNotification::Control(packet)) => {
+                        if let Some(caps) = protocol::parse_caps_resp(&packet.data) {
                             tracing::info!(
                                 "CAPS_RESP: version={}, codecs={:?}, model={:?}, frame_size={}",
                                 caps.version, caps.codecs, caps.interaction_model, caps.audio_frame_size.0
@@ -374,7 +374,7 @@ async fn negotiate(
                             }));
                         }
                         // Not a CAPS_RESP (e.g., stale START_SEARCH) -- keep waiting
-                        tracing::debug!("Ignoring non-CAPS_RESP CTL during negotiation: {:02x?}", data);
+                        tracing::debug!("Ignoring non-CAPS_RESP CTL during negotiation: {:02x?}", packet.data);
                     }
                     Some(atvv::SessionNotification::Audio(_)) => {}
                     None => {
@@ -634,12 +634,7 @@ async fn main() -> anyhow::Result<()> {
 
         // Inner loop: session → reconnect (same device).
         loop {
-            let ble_device = ble::BluerDevice::new(
-                &device,
-                &chars,
-                _pw_handle.generation.clone(),
-                _pw_handle.streaming.clone(),
-            );
+            let ble_device = ble::BluerDevice::new(&device, &chars, _pw_handle.generation.clone());
 
             // Negotiate protocol version
             let (caps, streams) = tokio::select! {

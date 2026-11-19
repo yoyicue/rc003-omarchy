@@ -298,8 +298,17 @@ Redmi 验证：156 个单元测试及显式 uinput 集成测试通过，Clippy �
 
 ## 26. 第十九轮 review 回归覆盖
 
-- 以共享 `streaming` 布尔值区分空闲开始与连续录音开始：空闲开始不排空，保住新首帧；连续开始才先用旧 generation 淘汰积压旧包。
-- 停止事件只在仍活跃时先交付尾音再切换状态，避免 STOP 先于尾包造成截断。
+- 改用 BlueZ 单一 D-Bus `PropertiesChanged` 消息流确定控制与音频顺序，避免用流式布尔值和 socket 优先级猜测边界。
+- `ControlPacket` 在入队时携带 generation，START 与后续音频使用同一编号；控制事件在音频饱和时仍保留，协调器关闭返回 EOF 并释放订阅。
 - 测试直接断言开始、停止、下一次开始和断连时的流式状态，并分别验证 START 前旧包与 STOP 前尾包的事件顺序。
 
 Redmi 验证：157 个单元测试及显式 uinput 集成测试通过，Clippy 和 release build 通过，新二进制已安装，五项 `doctor` 全部通过。真实 HoldToTalk 听写形成新的 Superwhisper 识别并成功上屏；主动断开后自动重连并重新完成能力协商。
+
+## 27. 第二十轮 review 回归覆盖
+
+- 用单一 D-Bus `PropertiesChanged` 消息流替代两路 `AcquireNotify` socket，直接采用 BlueZ 的信号顺序，不再根据状态动态选择读取优先级。
+- 使用 zbus Proxy 分别开启 CTL/RX StartNotify，路径由 adapter、device、service 和 characteristic ID 构造；消息按路径分类并解码 `Value`。
+- START 使用 `ControlPacket { data, generation }`，与后续音频共享编号，避免两次开始积压时读取到下一代编号。
+- 反例矩阵包括首帧、尾帧、快速短按、关麦立即重录、相同内容不同代、69 包饱和、控制事件保留、v0.4、SYNC 和统一 EOF。
+
+Redmi 验证：157 个单元测试、Clippy 和 release build 通过，真实 StartNotify、能力协商和五项 `doctor` 通过。连续短按与立即重录的识别及音频来源待本次确认。

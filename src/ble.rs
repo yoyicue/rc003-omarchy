@@ -1,6 +1,6 @@
 //! BLE device discovery and ATVV GATT characteristic resolution.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::pin::Pin;
 use std::sync::{
     atomic::{AtomicBool, AtomicU64, Ordering},
@@ -15,9 +15,12 @@ use bluer::{
     Adapter, AdapterEvent, Address, Device, Uuid,
 };
 use futures::{Stream, StreamExt};
+use zbus::zvariant::OwnedValue;
+use zbus::{Connection, MatchRule, MessageStream, Proxy};
 
 use crate::atvv::{
-    AudioPacket, BleDevice, BleFut, BleStream, DeviceConnectionEvent, SessionNotification,
+    AudioPacket, BleDevice, BleFut, BleStream, ControlPacket, DeviceConnectionEvent,
+    SessionNotification,
 };
 
 fn notification_payload(data: Vec<u8>) -> Option<Vec<u8>> {
@@ -87,83 +90,118 @@ impl NotificationQueue {
     }
 }
 
-async fn drain_audio_before_start<F>(
-    mut try_recv: F,
-    generation: &AtomicU64,
-    queue: &NotificationQueue,
-) -> bool
-where
-    F: FnMut() -> std::io::Result<Vec<u8>>,
-{
-    loop {
-        match try_recv() {
-            Ok(data) if !data.is_empty() => {
-                queue
-                    .push(SessionNotification::Audio(AudioPacket {
-                        data,
-                        generation: generation.load(Ordering::Relaxed),
-                    }))
-                    .await;
-            }
-            Ok(_) => return false,
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return true,
-            Err(_) => return false,
+struct NotificationPaths {
+    ctl: String,
+    rx: String,
+}
+
+impl NotificationPaths {
+    fn new(chars: &AtvvChars) -> Self {
+        Self {
+            ctl: characteristic_path(&chars.ctl),
+            rx: characteristic_path(&chars.rx),
         }
     }
 }
 
-async fn coordinate_notifications(
-    ctl: bluer::gatt::CharacteristicReader,
-    rx: bluer::gatt::CharacteristicReader,
+fn characteristic_path(characteristic: &Characteristic) -> String {
+    format!(
+        "/org/bluez/{}/dev_{}/service{:04x}/char{:04x}",
+        characteristic.adapter_name(),
+        characteristic
+            .device_address()
+            .to_string()
+            .replace(':', "_"),
+        characteristic.service_id(),
+        characteristic.id()
+    )
+}
+
+async fn forward_dbus_notifications(
+    connection: Connection,
+    paths: NotificationPaths,
+    mut messages: MessageStream,
     generation: Arc<AtomicU64>,
-    streaming: Arc<AtomicBool>,
     queue: Arc<NotificationQueue>,
-) {
-    loop {
-        tokio::select! {
-            biased;
-            result = ctl.recv() => {
-                match result {
-                    Ok(data) => {
-                        let Some(data) = notification_payload(data) else { break };
-                        if !data.is_empty() && data[0] == 0x00 && streaming.load(Ordering::Relaxed)
-                            && !drain_audio_before_start(|| rx.try_recv(), &generation, &queue).await
-                        {
-                            break;
-                        }
-                        if !data.is_empty() && data[0] == 0x04 && streaming.load(Ordering::Relaxed)
-                            && !drain_audio_before_start(|| rx.try_recv(), &generation, &queue).await
-                        {
-                            break;
-                        }
-                        advance_generation_on_audio_start(&data, &generation);
-                        queue.push(SessionNotification::Control(data)).await;
-                    }
-                    Err(e) => {
-                        tracing::debug!("BLE control notification stream ended: {e}");
-                        break;
-                    }
-                }
-            }
-            result = rx.recv() => {
-                match result {
-                    Ok(data) => {
-                        let Some(data) = notification_payload(data) else { break };
-                        queue
-                            .push(SessionNotification::Audio(AudioPacket {
-                                data,
-                                generation: generation.load(Ordering::Relaxed),
-                            }))
-                            .await;
-                    }
-                    Err(e) => {
-                        tracing::debug!("BLE audio notification stream ended: {e}");
-                        break;
-                    }
-                }
-            }
+) -> Result<()> {
+    while let Some(message) = messages.next().await {
+        let message = message?;
+        let header = message.header();
+        let Some(path) = header.path() else {
+            continue;
+        };
+        let body = message.body();
+        let Ok((interface, changed, _)) =
+            body.deserialize::<(String, HashMap<String, OwnedValue>, Vec<String>)>()
+        else {
+            continue;
+        };
+        if interface != "org.bluez.GattCharacteristic1" {
+            continue;
+        }
+        let Some(value) = changed.get("Value") else {
+            continue;
+        };
+        let Ok(data) = Vec::<u8>::try_from(value.clone()) else {
+            continue;
+        };
+        let Some(data) = notification_payload(data) else {
+            continue;
+        };
+        if path.as_str() == paths.ctl {
+            advance_generation_on_audio_start(&data, &generation);
+            queue
+                .push(SessionNotification::Control(ControlPacket {
+                    data,
+                    generation: generation.load(Ordering::Relaxed),
+                }))
+                .await;
+        } else if path.as_str() == paths.rx {
+            queue
+                .push(SessionNotification::Audio(AudioPacket {
+                    data,
+                    generation: generation.load(Ordering::Relaxed),
+                }))
+                .await;
         }
     }
+    drop(connection);
+    Ok(())
+}
+
+async fn ordered_notifications(
+    chars: &AtvvChars,
+    generation: Arc<AtomicU64>,
+) -> Result<Pin<Box<dyn Stream<Item = SessionNotification> + Send>>> {
+    let paths = NotificationPaths::new(chars);
+    let connection = Connection::system().await?;
+    let rule = MatchRule::builder()
+        .msg_type(zbus::message::Type::Signal)
+        .interface("org.freedesktop.DBus.Properties")?
+        .member("PropertiesChanged")?
+        .path_namespace("/org/bluez")?
+        .build();
+    let messages = MessageStream::for_match_rule(rule, &connection, Some(256)).await?;
+    for path in [&paths.ctl, &paths.rx] {
+        Proxy::new(
+            &connection,
+            "org.bluez",
+            path.as_str(),
+            "org.bluez.GattCharacteristic1",
+        )
+        .await?
+        .call_method("StartNotify", &())
+        .await?;
+    }
+    let queue = Arc::new(NotificationQueue::default());
+    let task_queue = queue.clone();
+    let task = tokio::spawn(async move {
+        let _ =
+            forward_dbus_notifications(connection, paths, messages, generation, task_queue.clone())
+                .await;
+        task_queue.close();
+    });
+    Ok(audio_stream(task, queue))
 }
 
 fn audio_stream(
@@ -231,21 +269,14 @@ pub struct BluerDevice<'a> {
     pub device: &'a Device,
     pub chars: &'a AtvvChars,
     pub generation: Arc<AtomicU64>,
-    pub streaming: Arc<AtomicBool>,
 }
 
 impl<'a> BluerDevice<'a> {
-    pub fn new(
-        device: &'a Device,
-        chars: &'a AtvvChars,
-        generation: Arc<AtomicU64>,
-        streaming: Arc<AtomicBool>,
-    ) -> Self {
+    pub fn new(device: &'a Device, chars: &'a AtvvChars, generation: Arc<AtomicU64>) -> Self {
         Self {
             device,
             chars,
             generation,
-            streaming,
         }
     }
 }
@@ -271,27 +302,7 @@ impl BleDevice for BluerDevice<'_> {
     }
 
     fn notifications(&self) -> BleFut<'_, BleStream<SessionNotification>> {
-        Box::pin(async {
-            let ctl = self.chars.ctl.notify_io().await.context(
-                "Failed to acquire exclusive CTL notifications. \
-                          Another ATVVoice instance may be connected to this device.",
-            )?;
-            tracing::debug!("CTL AcquireNotify: exclusive access, MTU={}", ctl.mtu());
-            let rx = self.chars.rx.notify_io().await.context(
-                "Failed to acquire exclusive RX notifications. \
-                          Another ATVVoice instance may be connected to this device.",
-            )?;
-            tracing::debug!("RX AcquireNotify: exclusive access, MTU={}", rx.mtu());
-            let queue = Arc::new(NotificationQueue::default());
-            let generation = self.generation.clone();
-            let streaming = self.streaming.clone();
-            let task_queue = queue.clone();
-            let task = tokio::spawn(async move {
-                coordinate_notifications(ctl, rx, generation, streaming, task_queue.clone()).await;
-                task_queue.close();
-            });
-            Ok(audio_stream(task, queue))
-        })
+        Box::pin(async { ordered_notifications(self.chars, self.generation.clone()).await })
     }
 
     fn connection_events(&self) -> BleFut<'_, BleStream<DeviceConnectionEvent>> {
@@ -490,6 +501,35 @@ pub async fn vendor_handshake(device: &Device) -> Result<Option<crate::atvv::Ble
 mod tests {
     use super::*;
 
+    fn control_event(data: Vec<u8>, generation: u64) -> SessionNotification {
+        SessionNotification::Control(ControlPacket { data, generation })
+    }
+
+    async fn drain_audio_before_start<F>(
+        mut try_recv: F,
+        generation: &AtomicU64,
+        queue: &NotificationQueue,
+    ) -> bool
+    where
+        F: FnMut() -> std::io::Result<Vec<u8>>,
+    {
+        loop {
+            match try_recv() {
+                Ok(data) if !data.is_empty() => {
+                    queue
+                        .push(SessionNotification::Audio(AudioPacket {
+                            data,
+                            generation: generation.load(Ordering::Relaxed),
+                        }))
+                        .await;
+                }
+                Ok(_) => return false,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return true,
+                Err(_) => return false,
+            }
+        }
+    }
+
     #[test]
     fn rc003_uses_write_without_response() {
         assert!(matches!(atvv_write_op(), WriteOp::Command));
@@ -587,7 +627,7 @@ mod tests {
                 }))
                 .await;
         }
-        queue.push(SessionNotification::Control(vec![0x04])).await;
+        queue.push(control_event(vec![0x04], 0)).await;
         queue
             .push(SessionNotification::Audio(AudioPacket {
                 data: vec![1],
@@ -628,7 +668,7 @@ mod tests {
             .await
         );
         advance_generation_on_audio_start(&[0x04], &generation);
-        queue.push(SessionNotification::Control(vec![0x04])).await;
+        queue.push(control_event(vec![0x04], 0)).await;
         for expected in [1, 2] {
             let Some(SessionNotification::Audio(packet)) = queue.next().await else {
                 panic!("expected audio");
@@ -659,7 +699,7 @@ mod tests {
             )
             .await
         );
-        queue.push(SessionNotification::Control(vec![0x00])).await;
+        queue.push(control_event(vec![0x00], 1)).await;
         for expected in [1, 2, 3, 4] {
             let Some(SessionNotification::Audio(packet)) = queue.next().await else {
                 panic!("expected audio");

@@ -7,7 +7,7 @@ publish = false
 
 [features]
 default = []
-dbus = ["dep:zbus"]
+dbus = []
 
 [dependencies]
 bluer = { version = "0.17", features = ["bluetoothd"] }
@@ -21,7 +21,7 @@ tokio-stream = "0.1"
 anyhow = "1"
 num_enum = "0.7"
 bitflags = "2"
-zbus = { version = "5", features = ["tokio"], optional = true }
+zbus = { version = "5", features = ["tokio"] }
 evdev = "0.13.2"
 serde = { version = "1.0.229", features = ["derive"] }
 toml = "1.2.1"

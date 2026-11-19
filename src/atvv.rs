@@ -78,8 +78,14 @@ pub struct AudioPacket {
 }
 
 #[derive(Debug, Clone)]
+pub struct ControlPacket {
+    pub data: Vec<u8>,
+    pub generation: u64,
+}
+
+#[derive(Debug, Clone)]
 pub enum SessionNotification {
-    Control(Vec<u8>),
+    Control(ControlPacket),
     Audio(AudioPacket),
 }
 
@@ -252,11 +258,11 @@ pub async fn run_session(
                     return Ok(());
                 };
                 match event {
-                    SessionNotification::Control(data) => {
-                        if data.is_empty() {
+                    SessionNotification::Control(packet) => {
+                        if packet.data.is_empty() {
                             continue;
                         }
-                        match protocol.parse_ctl(&data) {
+                        match protocol.parse_ctl(&packet.data) {
                     CtlEvent::AudioStop { reason } => {
                         tracing::info!("AUDIO_STOP (reason={:?})", reason);
                         if pending_close == Some(reason) {
@@ -281,9 +287,7 @@ pub async fn run_session(
                         if let Some(tail_expiration) = tail_expiration {
                             tail_expiration.clear();
                         }
-                        if let Some(generation) = generation {
-                            stream_generation = generation.load(Ordering::Relaxed);
-                        }
+                        stream_generation = packet.generation;
                         stopped_generation = None;
                         pending_close = None;
                         drop_next_frame = false;
@@ -531,14 +535,22 @@ mod tests {
         event_rx: Mutex<Option<tokio_mpsc::UnboundedReceiver<DeviceConnectionEvent>>>,
     }
 
-    struct ControlSender(tokio_mpsc::UnboundedSender<SessionNotification>);
+    struct ControlSender {
+        sender: tokio_mpsc::UnboundedSender<SessionNotification>,
+        generation: Arc<AtomicU64>,
+    }
 
     impl ControlSender {
         fn send(
             &self,
             data: Vec<u8>,
         ) -> Result<(), tokio_mpsc::error::SendError<SessionNotification>> {
-            self.0.send(SessionNotification::Control(data))
+            let generation = self.generation.load(Ordering::Relaxed);
+            self.sender
+                .send(SessionNotification::Control(ControlPacket {
+                    data,
+                    generation,
+                }))
         }
     }
 
@@ -558,12 +570,14 @@ mod tests {
         ctl_tx: ControlSender,
         rx_tx: AudioSender,
         event_tx: tokio_mpsc::UnboundedSender<DeviceConnectionEvent>,
+        generation: Arc<AtomicU64>,
     }
 
     fn mock_device() -> (MockBleDevice, MockControls) {
         let (commands_tx, commands_rx) = tokio_mpsc::unbounded_channel();
         let (notification_tx, notification_rx) = tokio_mpsc::unbounded_channel();
         let (event_tx, event_rx) = tokio_mpsc::unbounded_channel();
+        let generation = Arc::new(AtomicU64::new(0));
 
         let device = MockBleDevice {
             commands: commands_tx,
@@ -573,9 +587,13 @@ mod tests {
 
         let controls = MockControls {
             commands_rx,
-            ctl_tx: ControlSender(notification_tx.clone()),
+            ctl_tx: ControlSender {
+                sender: notification_tx.clone(),
+                generation: generation.clone(),
+            },
             rx_tx: AudioSender(notification_tx),
             event_tx,
+            generation,
         };
 
         (device, controls)
@@ -950,7 +968,7 @@ mod tests {
         let (device, mut ctrl) = mock_device();
         let (audio_tx, mut audio_rx) = tokio_mpsc::channel(64);
         let (state_tx, state_rx) = tokio::sync::watch::channel(State::Connected);
-        let generation = Arc::new(AtomicU64::new(0));
+        let generation = ctrl.generation.clone();
         let streaming = Arc::new(AtomicBool::new(false));
         let streaming_for_session = streaming.clone();
         let tail_expiration = TailDeadline::new();
@@ -1724,9 +1742,9 @@ mod tests {
     async fn test_mic_on_demand_button_open_consumer_close() {
         tokio::time::pause();
 
-        let generation = Arc::new(AtomicU64::new(0));
-        let generation_for_session = generation.clone();
         let (device, mut ctrl) = mock_device();
+        let generation = ctrl.generation.clone();
+        let generation_for_session = generation.clone();
         let (audio_tx, _audio_rx) = tokio_mpsc::channel(64);
         let (state_tx, mut state_rx) = tokio::sync::watch::channel(State::Connected);
         let (consumer_tx, mut consumer_rx) =
