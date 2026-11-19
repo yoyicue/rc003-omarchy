@@ -30,6 +30,8 @@ pub struct AudioConfig {
     pub description: String,
     pub gain_db: f32,
     pub release_drain_ms: u64,
+    #[serde(default)]
+    pub frame_layout: crate::protocol::types::AudioFrameLayout,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -68,6 +70,7 @@ impl Default for Config {
                 description: "RC003 Remote Microphone".to_string(),
                 gain_db: 0.0,
                 release_drain_ms: 0,
+                frame_layout: crate::protocol::types::AudioFrameLayout::Raw,
             },
             input: InputConfig {
                 enabled: true,
@@ -156,6 +159,30 @@ mod tests {
     }
 
     #[test]
+    fn frame_layout_defaults_to_raw_and_accepts_headered() {
+        assert_eq!(
+            Config::default().audio.frame_layout,
+            crate::protocol::types::AudioFrameLayout::Raw
+        );
+        let config = toml::from_str::<Config>(
+            "[audio]\nnode_name = \"rc003\"\ndescription = \"\"\ngain_db = 0.0\nrelease_drain_ms = 0\nframe_layout = \"headered\"",
+        )
+        .unwrap();
+        assert_eq!(
+            config.audio.frame_layout,
+            crate::protocol::types::AudioFrameLayout::Headered
+        );
+        let legacy = toml::from_str::<Config>(
+            "[audio]\nnode_name = \"rc003\"\ndescription = \"\"\ngain_db = 0.0\nrelease_drain_ms = 0",
+        )
+        .unwrap();
+        assert_eq!(
+            legacy.audio.frame_layout,
+            crate::protocol::types::AudioFrameLayout::Raw
+        );
+    }
+
+    #[test]
     fn unknown_fields_are_rejected() {
         let error = toml::from_str::<Config>("unknown = true").unwrap_err();
         assert!(error.to_string().contains("unknown"));
@@ -188,6 +215,7 @@ node_name = "rc003-omarchy"
 description = "RC003 Remote Microphone"
 gain_db = 0.0
 release_drain_ms = 0
+frame_layout = "raw"
 [input]
 enabled = true
 voice_key = "F9"

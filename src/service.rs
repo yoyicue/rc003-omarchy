@@ -30,15 +30,15 @@ pub enum ServiceCommand {
     },
 }
 
-pub fn run(command: ServiceCommand) -> Result<()> {
+pub fn run(command: ServiceCommand, config: Option<&Path>) -> Result<()> {
     match command {
-        ServiceCommand::Show => show(),
+        ServiceCommand::Show => show(config),
         ServiceCommand::Status => status(),
         ServiceCommand::Install {
             apply,
             no_start,
             force,
-        } => install(apply, no_start, force),
+        } => install(apply, no_start, force, config),
         ServiceCommand::Uninstall { apply } => uninstall(apply),
     }
 }
@@ -68,13 +68,18 @@ fn quote(value: &Path) -> String {
     )
 }
 
-fn unit_text(executable: &Path, config: &Path) -> Result<String> {
+fn unit_text(executable: &Path, config: Option<&Path>) -> Result<String> {
     validate_safe_path(executable)?;
-    validate_safe_path(config)?;
+    let config_argument = if let Some(config) = config {
+        validate_safe_path(config)?;
+        format!(" --config {}", quote(config))
+    } else {
+        String::new()
+    };
     Ok(format!(
-        "{SERVICE_MARKER}\n[Unit]\nDescription=RC003 microphone and input bridge\nAfter=graphical-session.target pipewire.service\nPartOf=graphical-session.target\n\n[Service]\nType=simple\nExecStart=/usr/bin/newgrp input -c '{} run --config {}'\nRestart=on-failure\nRestartSec=2\nTimeoutStopSec=15\nKillMode=control-group\nUMask=0077\n\n[Install]\nWantedBy=graphical-session.target\n",
+        "{SERVICE_MARKER}\n[Unit]\nDescription=RC003 microphone and input bridge\nAfter=graphical-session.target pipewire.service\nPartOf=graphical-session.target\n\n[Service]\nType=simple\nExecStart=/usr/bin/newgrp input -c '{} run{}'\nRestart=on-failure\nRestartSec=2\nTimeoutStopSec=15\nKillMode=control-group\nUMask=0077\n\n[Install]\nWantedBy=graphical-session.target\n",
         quote(executable),
-        quote(config),
+        config_argument,
     ))
 }
 
@@ -99,8 +104,12 @@ fn executable_path() -> PathBuf {
     PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".local/bin/rc003-omarchy")
 }
 
-fn generated_unit() -> Result<String> {
-    unit_text(&executable_path(), &Config::default_path())
+fn generated_unit(config: Option<&Path>) -> Result<String> {
+    let config = config.map(PathBuf::from).or_else(|| {
+        let default = Config::default_path();
+        default.is_file().then_some(default)
+    });
+    unit_text(&executable_path(), config.as_deref())
 }
 
 fn install_executable() -> Result<()> {
@@ -121,8 +130,8 @@ fn install_executable() -> Result<()> {
     Ok(())
 }
 
-fn show() -> Result<()> {
-    println!("{}\n\n{}", unit_path().display(), generated_unit()?);
+fn show(config: Option<&Path>) -> Result<()> {
+    println!("{}\n\n{}", unit_path().display(), generated_unit(config)?);
     Ok(())
 }
 
@@ -142,9 +151,9 @@ fn status() -> Result<()> {
     Ok(())
 }
 
-fn install(apply: bool, no_start: bool, force: bool) -> Result<()> {
+fn install(apply: bool, no_start: bool, force: bool, config: Option<&Path>) -> Result<()> {
     let path = unit_path();
-    let unit = generated_unit()?;
+    let unit = generated_unit(config)?;
     if !apply {
         println!("Would install {}:\n\n{}", path.display(), unit);
         return Ok(());
@@ -224,12 +233,19 @@ mod tests {
     fn unit_contains_user_session_and_explicit_config() {
         let unit = unit_text(
             Path::new("/opt/rc003-omarchy"),
-            Path::new("/home/test/config.toml"),
+            Some(Path::new("/home/test/config.toml")),
         )
         .unwrap();
         assert!(unit.contains("PartOf=graphical-session.target"));
         assert!(unit.contains("/usr/bin/newgrp input -c"));
+        assert!(unit.contains("--config \"/home/test/config.toml\""));
         assert!(unit.starts_with(SERVICE_MARKER));
+    }
+
+    #[test]
+    fn unit_without_a_config_file_uses_builtin_defaults() {
+        let unit = unit_text(Path::new("/opt/rc003-omarchy"), None).unwrap();
+        assert!(!unit.contains("--config"));
     }
 
     #[test]

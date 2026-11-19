@@ -5,6 +5,14 @@
 
 use num_enum::{IntoPrimitive, TryFromPrimitive};
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AudioFrameLayout {
+    #[default]
+    Raw,
+    Headered,
+}
+
 /// ATVV protocol version.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProtocolVersion {

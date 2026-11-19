@@ -12,13 +12,23 @@ use futures::{Stream, StreamExt};
 
 use crate::atvv::{BleDevice, BleFut, BleStream, DeviceConnectionEvent};
 
+fn notification_payload(data: Vec<u8>) -> Option<Vec<u8>> {
+    (!data.is_empty()).then_some(data)
+}
+
 /// Wrap a `CharacteristicReader` (from `AcquireNotify`) into a `Stream<Item = Vec<u8>>`.
 fn reader_to_stream(
     reader: bluer::gatt::CharacteristicReader,
 ) -> Pin<Box<dyn Stream<Item = Vec<u8>> + Send>> {
     Box::pin(futures::stream::unfold(reader, |reader| async move {
         match reader.recv().await {
-            Ok(data) => Some((data, reader)),
+            Ok(data) => match notification_payload(data) {
+                Some(data) => Some((data, reader)),
+                None => {
+                    tracing::debug!("BLE notification socket reached EOF");
+                    None
+                }
+            },
             Err(e) => {
                 tracing::debug!("BLE notification stream ended: {e}");
                 None
@@ -29,6 +39,11 @@ fn reader_to_stream(
 
 fn atvv_write_op() -> WriteOp {
     WriteOp::Command
+}
+
+pub fn redact_address(address: Address) -> String {
+    let text = address.to_string();
+    format!("{}:…:{}", &text[..5], &text[text.len() - 5..])
 }
 
 /// ATVV Service UUID: AB5E0001-5A21-4F05-BC7D-AF01F617B664
@@ -169,7 +184,7 @@ pub async fn find_atvv_device(
                 tracing::info!(
                     "Found ATVV device: {} ({})",
                     device.name().await.ok().flatten().unwrap_or_default(),
-                    addr
+                    redact_address(addr)
                 );
                 return Ok(device);
             }
@@ -188,7 +203,7 @@ pub async fn find_atvv_device(
             let device = adapter.device(addr)?;
             if let Ok(Some(uuids)) = device.uuids().await {
                 if uuids.contains(&ATVV_SERVICE) {
-                    tracing::info!("Discovered ATVV device: {}", addr);
+                    tracing::info!("Discovered ATVV device: {}", redact_address(addr));
                     return Ok(device);
                 }
             }
@@ -318,5 +333,19 @@ mod tests {
     #[test]
     fn rc003_uses_write_without_response() {
         assert!(matches!(atvv_write_op(), WriteOp::Command));
+    }
+
+    #[test]
+    fn zero_length_notification_is_eof() {
+        assert_eq!(notification_payload(Vec::new()), None);
+        assert_eq!(notification_payload(vec![1, 2]), Some(vec![1, 2]));
+    }
+
+    #[test]
+    fn logs_only_contain_redacted_addresses() {
+        let address: Address = "C0:5D:39:FA:2A:1B".parse().unwrap();
+        let redacted = redact_address(address);
+        assert_eq!(redacted, "C0:5D:…:2A:1B");
+        assert!(!redacted.contains("39:FA"));
     }
 }

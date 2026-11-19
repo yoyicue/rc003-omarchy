@@ -25,6 +25,7 @@ node_name = "rc003-omarchy"
 description = "RC003 Remote Microphone"
 gain_db = 0.0
 release_drain_ms = 0
+frame_layout = "raw"
 
 [input]
 enabled = true
@@ -38,6 +39,8 @@ profile = "default"
 [logging]
 level = "info"
 ```
+
+`audio.frame_layout` 默认为 `raw`，按 CAPS 协商的帧长立即切分裸音频；只有确认固件携带 6 字节同步头时才设为 `headered`。旧配置缺少此字段时仍按 `raw` 读取。不要根据单次通知长度自动猜测格式，因为 126 字节也可能只是裸帧的一个分片。
 
 最终字段以实现的严格 schema 为准；实现不得悄悄增加云端端点或录音保存路径。
 
@@ -94,6 +97,7 @@ udev 规则应只匹配 RC003 的事件节点；uinput 规则可授权 `input` �
 - 安装时把当前二进制复制到 `~/.local/bin/rc003-omarchy`，避免 unit 指向 `target/` 构建目录；可执行文件和配置路径仅允许 ASCII 字母、数字、`.`、`_`、`/`、`-`，特殊字符直接拒绝，避免 systemd 与 shell 双层转义。覆盖安装后用一次 `restart` 启动新二进制，避免首次安装重复启动。
 - PipeWire 启动握手失败或运行中异常会使主进程失败退出，由 `Restart=on-failure` 处理，不保留“服务运行但没有麦克风”的假健康状态。
 - 退出时停止所有子任务并释放输入、F9 和音频资源。
+- 自定义 `--config` 路径原样写入 unit；默认配置文件存在时写入其路径，不存在时省略 `--config` 并使用内置默认值，避免首次安装生成无法启动的服务。
 - 默认只在用户明确安装并启用后常驻，不在首次构建时自动启动。
 
 服务状态必须区分：未安装、未启用、运行中、 degraded、权限失败和配置失败。

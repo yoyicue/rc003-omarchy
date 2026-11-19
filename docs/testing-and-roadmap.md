@@ -9,7 +9,7 @@
 - M4：实现完成，13 键及 RightAlt 已通过真机验证。
 - M5：完成。服务已通过 `newgrp input -c` 安装并启用，启动权限和遥控器断线后的自动恢复均已通过验收。
 
-自动验证：132 个单元测试、显式 uinput 集成测试、Clippy（warnings denied）和 release build 全部通过。
+自动验证：140 个单元测试、显式 uinput 集成测试、Clippy（warnings denied）和 release build 全部通过。
 
 
 ## 1. 验证原则
@@ -200,3 +200,14 @@
 - 使用 `--device` 前台运行时正确接管目标 evdev 节点；第二实例因真实 BlueZ NotPermitted 被拒绝，原服务不受影响。
 - 注入不存在的 PipeWire remote，启动以状态 1 失败退出，不再留下无麦克风的假运行进程。
 - `pw-cat` 持续连接并启用 `--mic-on-demand` 时，蓝牙重连后收到新的 AUDIO_START，验证已有消费者路径。
+
+## 15. 第八轮 review 回归覆盖
+
+- PipeWire 实时回调独占 PCM 缓冲，跨线程只发布原子会话编号；启动等待 Paused/Streaming，Error 和意外 Unconnected 会传播给守护进程。
+- v1.0 不再按通知长度猜测帧格式。默认按 CAPS 帧长解析裸数据，`120 + 120` 与 `126 + 114` 得到相同 PCM，`1 + 100×120` 不再停滞；`audio.frame_layout = "headered"` 保留显式 126 字节带头帧支持，旧配置默认 `raw`。
+- 锁定设备排除在 5 秒后过期，发现过程受排除期限约束，只有一只遥控器时也能自动重试。
+- BlueZ 通知 socket 的零字节读取按 EOF 结束流，覆盖 SOCK_SEQPACKET 对端关闭。
+- 默认配置不存在时 unit 省略 `--config`；自定义配置路径保留在生成的 unit 中。
+- 默认运行日志只输出脱敏蓝牙地址。
+
+2026-11-19 在 Redmi 重新安装新二进制后，140 个单元测试、显式 uinput 集成测试、Clippy、release build 和五项 `doctor` 检查通过。缺失默认配置与自定义配置的 unit 预览均通过；持续 `pw-cat` 消费者在真实蓝牙重连后再次收到 AUDIO_START。自动发现模式下，第二实例首次遇到真实占用，另一实例退出 5 秒后自动找回同一遥控器并完成协商。默认日志已实测脱敏，服务恢复为 enabled/active。本轮未重新生成 Superwhisper 语音记录。

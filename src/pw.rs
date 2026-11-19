@@ -9,6 +9,10 @@
 
 use crossbeam_queue::ArrayQueue;
 use std::io;
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc,
+};
 
 use pipewire::context::ContextRc;
 use pipewire::keys;
@@ -19,7 +23,7 @@ use pipewire::spa::param::ParamType;
 use pipewire::spa::pod::serialize::PodSerializer;
 use pipewire::spa::pod::{Object, Pod, Value};
 use pipewire::spa::utils::{Direction, SpaTypes};
-use pipewire::stream::{Stream, StreamFlags, StreamRc};
+use pipewire::stream::{Stream, StreamFlags, StreamRc, StreamState};
 use pipewire::types::ObjectType;
 
 /// Number of audio channels (mono).
@@ -32,7 +36,6 @@ const SAMPLE_SIZE: usize = std::mem::size_of::<i16>();
 #[derive(Debug)]
 pub enum SessionControl {
     Shutdown,
-    Reset(u64),
 }
 
 #[derive(Debug)]
@@ -46,14 +49,23 @@ fn frame_is_newer(frame_generation: u64, previous_generation: u64) -> bool {
     frame_generation > previous_generation
 }
 
-fn reset_pending(
-    pending: &mut Vec<i16>,
-    pending_generation: &std::cell::Cell<u64>,
-    generation: u64,
-) {
-    if pending_generation.get() < generation {
+fn sync_generation(pending: &mut Vec<i16>, previous: &mut u64, current: u64) {
+    if frame_is_newer(current, *previous) {
         pending.clear();
-        pending_generation.set(generation);
+        *previous = current;
+    }
+}
+
+fn stream_failure(old: &StreamState, new: &StreamState, shutting_down: bool) -> Option<String> {
+    if shutting_down {
+        return None;
+    }
+    match new {
+        StreamState::Error(error) => Some(format!("PipeWire stream error: {error}")),
+        StreamState::Unconnected if !matches!(old, StreamState::Unconnected) => {
+            Some("PipeWire stream disconnected unexpectedly".to_string())
+        }
+        _ => None,
     }
 }
 
@@ -65,49 +77,36 @@ fn reset_pending(
 /// Call from a dedicated `std::thread::spawn`.
 #[allow(clippy::too_many_arguments)]
 pub fn run_pw_source(
-    audio_rx: std::sync::Arc<ArrayQueue<PcmFrame>>,
+    audio_rx: Arc<ArrayQueue<PcmFrame>>,
+    generation: Arc<AtomicU64>,
     gain_db: f32,
     sample_rate: u32,
     node_name: &str,
     node_description: &str,
     shutdown_rx: pipewire::channel::Receiver<SessionControl>,
     startup_tx: Option<std::sync::mpsc::Sender<Result<(), String>>>,
+    failure_tx: tokio::sync::mpsc::UnboundedSender<String>,
     consumer_tx: Option<tokio::sync::watch::Sender<crate::consumer::ConsumerEvent>>,
 ) -> Result<(), pipewire::Error> {
     pipewire::init();
 
     let mainloop = MainLoopRc::new(None)?;
 
-    // Buffer of pending PCM samples not yet consumed by PipeWire callbacks.
-    let pending = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
-
     // Shared slot for the stream - set after creation, used by shutdown handler.
     let stream_slot: std::rc::Rc<std::cell::RefCell<Option<StreamRc>>> =
         std::rc::Rc::new(std::cell::RefCell::new(None));
-    let pending_generation = std::rc::Rc::new(std::cell::Cell::new(0));
-    let pending_for_reset = pending.clone();
-    let generation_for_reset = pending_generation.clone();
+    let shutting_down = std::rc::Rc::new(std::cell::Cell::new(false));
     let _receiver = shutdown_rx.attach(mainloop.loop_(), {
         let mainloop = mainloop.clone();
         let stream_slot = stream_slot.clone();
-        move |control| match control {
-            SessionControl::Shutdown => {
-                tracing::info!("PipeWire source shutting down");
-                if let Some(stream) = stream_slot.borrow().as_ref() {
-                    let _ = stream.disconnect();
-                }
-                mainloop.quit();
+        let shutting_down = shutting_down.clone();
+        move |_: SessionControl| {
+            shutting_down.set(true);
+            tracing::info!("PipeWire source shutting down");
+            if let Some(stream) = stream_slot.borrow().as_ref() {
+                let _ = stream.disconnect();
             }
-            SessionControl::Reset(generation) => {
-                if generation_for_reset.get() < generation {
-                    reset_pending(
-                        &mut pending_for_reset.borrow_mut(),
-                        &generation_for_reset,
-                        generation,
-                    );
-                    tracing::debug!("PipeWire utterance boundary reset");
-                }
-            }
+            mainloop.quit();
         }
     });
 
@@ -142,96 +141,111 @@ pub fn run_pw_source(
     let our_node_id: std::rc::Rc<std::cell::Cell<u32>> =
         std::rc::Rc::new(std::cell::Cell::new(u32::MAX));
 
-    let pending_generation_for_process = pending_generation.clone();
+    let mut startup_tx = startup_tx;
     let _listener = stream
         .add_local_listener_with_user_data(())
         .state_changed({
             let our_node_id = our_node_id.clone();
             let stream_for_id = stream.clone();
+            let mainloop = mainloop.clone();
             move |_, _, old, new| {
                 tracing::debug!("PipeWire stream state: {old:?} -> {new:?}");
-                if matches!(
-                    new,
-                    pipewire::stream::StreamState::Paused
-                        | pipewire::stream::StreamState::Streaming
-                ) {
+                if matches!(&new, StreamState::Paused | StreamState::Streaming) {
                     let id = stream_for_id.node_id();
                     if id != u32::MAX {
                         our_node_id.set(id);
                         tracing::debug!("PipeWire node ID: {id}");
                     }
+                    if let Some(startup_tx) = startup_tx.take() {
+                        let _ = startup_tx.send(Ok(()));
+                        tracing::info!(
+                            "PipeWire source running ({}kHz S16LE mono, gain={gain_db}dB)",
+                            sample_rate / 1000
+                        );
+                    }
+                }
+                if let Some(failure) = stream_failure(&old, &new, shutting_down.get()) {
+                    if let Some(startup_tx) = startup_tx.take() {
+                        let _ = startup_tx.send(Err(failure.clone()));
+                    }
+                    let _ = failure_tx.send(failure);
+                    mainloop.quit();
                 }
             }
         })
-        .process(move |stream: &Stream, _| {
-            // NOTE: Vec operations (extend, drain) allocate inside this RT callback.
-            // At ~30 fps with 257 samples/frame, allocation pressure is negligible
-            // and not a real-time concern for voice audio rates.
-            let mut buf = pending.borrow_mut();
+        .process({
+            // The RT callback exclusively owns its PCM buffer. Other threads only
+            // publish the current utterance through an atomic generation counter.
+            let mut buf = Vec::new();
+            let mut previous_generation = 0;
+            move |stream: &Stream, _| {
+                sync_generation(
+                    &mut buf,
+                    &mut previous_generation,
+                    generation.load(Ordering::Relaxed),
+                );
 
-            while let Some(mut frame) = audio_rx.pop() {
-                if frame_is_newer(frame.generation, pending_generation_for_process.get()) {
-                    buf.clear();
-                    pending_generation_for_process.set(frame.generation);
+                while let Some(mut frame) = audio_rx.pop() {
+                    sync_generation(&mut buf, &mut previous_generation, frame.generation);
+                    if frame.generation == previous_generation {
+                        crate::adpcm::apply_gain_linear(&mut frame.samples, gain_linear);
+                        buf.extend_from_slice(&frame.samples);
+                    }
                 }
-                if frame.generation == pending_generation_for_process.get() {
-                    crate::adpcm::apply_gain_linear(&mut frame.samples, gain_linear);
-                    buf.extend_from_slice(&frame.samples);
+
+                // Bound pending buffer to prevent unbounded growth under backpressure.
+                if buf.len() > MAX_PENDING {
+                    let dropped = buf.len() - MAX_PENDING;
+                    buf.drain(..dropped);
+                    tracing::warn!("audio buffer overflow: dropped {dropped} samples");
                 }
+
+                let Some(mut pw_buf) = stream.dequeue_buffer() else {
+                    return;
+                };
+
+                let requested = pw_buf.requested() as usize;
+
+                let Some(pw_data) = pw_buf.datas_mut().first_mut() else {
+                    return;
+                };
+
+                let Some(slice) = pw_data.data() else {
+                    return;
+                };
+
+                let buf_capacity = slice.len() / SAMPLE_SIZE;
+                let max_samples = if requested > 0 {
+                    buf_capacity.min(requested)
+                } else {
+                    buf_capacity
+                };
+
+                let available = buf.len().min(max_samples);
+
+                // Copy i16 samples to the output buffer as little-endian bytes.
+                for (src, dst) in buf
+                    .iter()
+                    .take(available)
+                    .zip(slice.as_chunks_mut::<SAMPLE_SIZE>().0)
+                {
+                    dst.copy_from_slice(&src.to_le_bytes());
+                }
+
+                // Zero remaining buffer bytes (silence).
+                let silence_start = available * SAMPLE_SIZE;
+                let silence_end = max_samples * SAMPLE_SIZE;
+                slice[silence_start..silence_end].fill(0);
+
+                if available > 0 {
+                    buf.drain(..available);
+                }
+
+                let chunk = pw_data.chunk_mut();
+                *chunk.offset_mut() = 0;
+                *chunk.stride_mut() = SAMPLE_SIZE as i32;
+                *chunk.size_mut() = (max_samples * SAMPLE_SIZE) as u32;
             }
-
-            // Bound pending buffer to prevent unbounded growth under backpressure.
-            if buf.len() > MAX_PENDING {
-                let dropped = buf.len() - MAX_PENDING;
-                buf.drain(..dropped);
-                tracing::warn!("audio buffer overflow: dropped {dropped} samples");
-            }
-
-            let Some(mut pw_buf) = stream.dequeue_buffer() else {
-                return;
-            };
-
-            let requested = pw_buf.requested() as usize;
-
-            let Some(pw_data) = pw_buf.datas_mut().first_mut() else {
-                return;
-            };
-
-            let Some(slice) = pw_data.data() else {
-                return;
-            };
-
-            let buf_capacity = slice.len() / SAMPLE_SIZE;
-            let max_samples = if requested > 0 {
-                buf_capacity.min(requested)
-            } else {
-                buf_capacity
-            };
-
-            let available = buf.len().min(max_samples);
-
-            // Copy i16 samples to the output buffer as little-endian bytes.
-            for (src, dst) in buf
-                .iter()
-                .take(available)
-                .zip(slice.as_chunks_mut::<SAMPLE_SIZE>().0)
-            {
-                dst.copy_from_slice(&src.to_le_bytes());
-            }
-
-            // Zero remaining buffer bytes (silence).
-            let silence_start = available * SAMPLE_SIZE;
-            let silence_end = max_samples * SAMPLE_SIZE;
-            slice[silence_start..silence_end].fill(0);
-
-            if available > 0 {
-                buf.drain(..available);
-            }
-
-            let chunk = pw_data.chunk_mut();
-            *chunk.offset_mut() = 0;
-            *chunk.stride_mut() = SAMPLE_SIZE as i32;
-            *chunk.size_mut() = (max_samples * SAMPLE_SIZE) as u32;
         })
         .register()?;
 
@@ -264,15 +278,6 @@ pub fn run_pw_source(
         StreamFlags::AUTOCONNECT | StreamFlags::MAP_BUFFERS | StreamFlags::RT_PROCESS,
         &mut params,
     )?;
-
-    if let Some(startup_tx) = startup_tx {
-        let _ = startup_tx.send(Ok(()));
-    }
-
-    tracing::info!(
-        "PipeWire source running ({}kHz S16LE mono, gain={gain_db}dB)",
-        sample_rate / 1000
-    );
 
     // Registry link monitoring for --mic-on-demand.
     //
@@ -493,16 +498,31 @@ mod tests {
     }
 
     #[test]
-    fn utterance_reset_does_not_drop_new_session_samples() {
+    fn generation_change_clears_only_older_samples() {
         let mut pending = vec![10, 11];
-        let generation = std::cell::Cell::new(1);
-        reset_pending(&mut pending, &generation, 1);
+        let mut generation = 1;
+        sync_generation(&mut pending, &mut generation, 1);
         assert_eq!(pending, vec![10, 11]);
-        reset_pending(&mut pending, &generation, 2);
+        sync_generation(&mut pending, &mut generation, 2);
         assert!(pending.is_empty());
-        assert_eq!(generation.get(), 2);
+        assert_eq!(generation, 2);
         pending.extend_from_slice(&[20, 21]);
-        reset_pending(&mut pending, &generation, 2);
+        sync_generation(&mut pending, &mut generation, 2);
         assert_eq!(pending, vec![20, 21]);
+        sync_generation(&mut pending, &mut generation, 1);
+        assert_eq!(pending, vec![20, 21]);
+    }
+
+    #[test]
+    fn stream_errors_and_unexpected_disconnects_are_failures() {
+        assert!(stream_failure(
+            &StreamState::Connecting,
+            &StreamState::Error("boom".to_string()),
+            false
+        )
+        .is_some());
+        assert!(stream_failure(&StreamState::Paused, &StreamState::Unconnected, false).is_some());
+        assert!(stream_failure(&StreamState::Paused, &StreamState::Unconnected, true).is_none());
+        assert!(stream_failure(&StreamState::Connecting, &StreamState::Paused, false).is_none());
     }
 }

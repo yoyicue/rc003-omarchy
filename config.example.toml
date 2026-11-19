@@ -11,6 +11,7 @@ node_name = "rc003-omarchy"
 description = "RC003 Remote Microphone"
 gain_db = 0.0
 release_drain_ms = 0
+frame_layout = "raw"
 
 [input]
 enabled = true

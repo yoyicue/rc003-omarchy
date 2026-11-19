@@ -1,3 +1,4 @@
+use std::path::Path;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -39,10 +40,10 @@ pub enum Command {
     },
 }
 
-pub async fn run(command: Command) -> Result<()> {
+pub async fn run(command: Command, config: Option<&Path>) -> Result<()> {
     match command {
         Command::Run | Command::TestAudio | Command::TestDictation => Ok(()),
-        Command::Service { command } => crate::service::run(command),
+        Command::Service { command } => crate::service::run(command, config),
         Command::Scan { adapter } => scan(adapter).await,
         Command::Doctor { json } => doctor(json).await,
         Command::TestKeys { seconds } => {

@@ -99,7 +99,6 @@ pub struct SessionConfig<'a> {
     pub state_tx: Option<&'a tokio::sync::watch::Sender<State>>,
     pub consumer_rx: Option<&'a mut tokio::sync::watch::Receiver<consumer::ConsumerEvent>>,
     pub generation: Option<&'a Arc<AtomicU64>>,
-    pub on_audio_start: Option<&'a (dyn Fn() + Send + Sync)>,
     pub mic_on_demand: bool,
 }
 
@@ -134,7 +133,6 @@ pub async fn run_session(
         state_tx,
         mut consumer_rx,
         generation,
-        on_audio_start,
         mic_on_demand,
     } = config;
     let mut state = State::Connected;
@@ -225,9 +223,6 @@ pub async fn run_session(
                         tracing::info!("AUDIO_START (reason={:?}, codec={:?}, stream_id={:?})", reason, codec, stream_id);
                         if let Some(generation) = generation {
                             generation.fetch_add(1, Ordering::Relaxed);
-                        }
-                        if let Some(on_audio_start) = on_audio_start {
-                            on_audio_start();
                         }
                         protocol.on_audio_start();
                         // Remote resets its sequence counter on every AUDIO_START
@@ -624,7 +619,6 @@ mod tests {
                     state_tx: Some(&state_tx),
                     consumer_rx: None,
                     generation: None,
-                    on_audio_start: None,
                     mic_on_demand: false,
                 },
             )
@@ -730,7 +724,6 @@ mod tests {
                     state_tx: Some(&state_tx),
                     consumer_rx: None,
                     generation: None,
-                    on_audio_start: None,
                     mic_on_demand: false,
                 },
             )
@@ -817,7 +810,6 @@ mod tests {
                     state_tx: Some(&state_tx),
                     consumer_rx: None,
                     generation: None,
-                    on_audio_start: None,
                     mic_on_demand: false,
                 },
             )
@@ -874,7 +866,6 @@ mod tests {
                     state_tx: Some(&state_tx),
                     consumer_rx: None,
                     generation: Some(&generation_for_session),
-                    on_audio_start: None,
                     mic_on_demand: false,
                 },
             )
@@ -928,7 +919,6 @@ mod tests {
                     state_tx: Some(&state_tx),
                     consumer_rx: None,
                     generation: None,
-                    on_audio_start: None,
                     mic_on_demand: false,
                 },
             )
@@ -984,7 +974,6 @@ mod tests {
                     state_tx: Some(&state_tx),
                     consumer_rx: None,
                     generation: None,
-                    on_audio_start: None,
                     mic_on_demand: false,
                 },
             )
@@ -1080,7 +1069,6 @@ mod tests {
                     state_tx: Some(&state_tx),
                     consumer_rx: Some(&mut consumer_rx),
                     generation: None,
-                    on_audio_start: None,
                     mic_on_demand: true,
                 },
             )
@@ -1144,7 +1132,6 @@ mod tests {
                     state_tx: Some(&state_tx),
                     consumer_rx: Some(&mut consumer_rx),
                     generation: None,
-                    on_audio_start: None,
                     mic_on_demand: true,
                 },
             )
@@ -1215,7 +1202,6 @@ mod tests {
                     state_tx: Some(&state_tx),
                     consumer_rx: Some(&mut consumer_rx),
                     generation: None,
-                    on_audio_start: None,
                     mic_on_demand: true,
                 },
             )
@@ -1300,7 +1286,6 @@ mod tests {
                     state_tx: Some(&state_tx),
                     consumer_rx: Some(&mut consumer_rx),
                     generation: None,
-                    on_audio_start: None,
                     mic_on_demand: false, // disabled
                 },
             )
@@ -1375,7 +1360,6 @@ mod tests {
                     state_tx: Some(&state_tx),
                     consumer_rx: Some(&mut consumer_rx),
                     generation: None,
-                    on_audio_start: None,
                     mic_on_demand: true,
                 },
             )
@@ -1462,7 +1446,6 @@ mod tests {
                     state_tx: Some(&state_tx),
                     consumer_rx: Some(&mut consumer_rx),
                     generation: None,
-                    on_audio_start: None,
                     mic_on_demand: true,
                 },
             )
@@ -1543,7 +1526,6 @@ mod tests {
                     state_tx: Some(&state_tx),
                     consumer_rx: Some(&mut consumer_rx),
                     generation: None,
-                    on_audio_start: None,
                     mic_on_demand: true,
                 },
             )
@@ -1633,7 +1615,6 @@ mod tests {
                     state_tx: Some(&state_tx),
                     consumer_rx: None,
                     generation: None,
-                    on_audio_start: None,
                     mic_on_demand: false,
                 },
             )

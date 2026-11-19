@@ -16,13 +16,14 @@ mod service;
 use anyhow::Context;
 use clap::Parser;
 use crossbeam_queue::ArrayQueue;
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{atomic::AtomicU64, Arc};
 use std::time::Duration;
 
 /// Capacity of the async channel between the ATVV session and the decoder task.
 const DECODER_CHANNEL_CAPACITY: usize = 64;
+const DEVICE_LOCK_EXCLUSION: Duration = Duration::from_secs(5);
 
 #[derive(Parser)]
 #[command(
@@ -104,15 +105,18 @@ impl PipeWireHandle {
         let (startup_tx, startup_rx) = std::sync::mpsc::channel::<Result<(), String>>();
         let (failure_tx, failure_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
         let generation = Arc::new(AtomicU64::new(0));
+        let thread_generation = generation.clone();
         let join = std::thread::spawn(move || {
             if let Err(error) = pw::run_pw_source(
                 pcm_rx,
+                thread_generation,
                 gain,
                 16_000,
                 &node_name,
                 &node_description,
                 shutdown_rx,
                 Some(startup_tx.clone()),
+                failure_tx.clone(),
                 consumer_tx,
             ) {
                 let message = error.to_string();
@@ -198,6 +202,16 @@ impl ShutdownSignal {
         #[cfg(not(unix))]
         let _ = tokio::signal::ctrl_c().await;
     }
+}
+
+fn active_exclusions(
+    exclusions: &mut HashMap<bluer::Address, tokio::time::Instant>,
+    now: tokio::time::Instant,
+) -> (Vec<bluer::Address>, Option<tokio::time::Instant>) {
+    exclusions.retain(|_, deadline| *deadline > now);
+    let addresses = exclusions.keys().copied().collect();
+    let next_expiry = exclusions.values().min().copied();
+    (addresses, next_expiry)
 }
 
 /// Wait for device to be connected, using event stream if possible.
@@ -302,7 +316,7 @@ async fn main() -> anyhow::Result<()> {
             commands::Command::TestDictation => {
                 println!("Focus a test input field, then hold and release the RC003 voice key.");
             }
-            other => return commands::run(other).await,
+            other => return commands::run(other, cli.config.as_deref()).await,
         }
     }
 
@@ -382,18 +396,31 @@ async fn main() -> anyhow::Result<()> {
         keepalive: std::time::Duration::from_secs(cli.keep_alive),
     };
 
-    // Addresses to skip during auto-discovery (locked by another instance).
-    let mut excluded_addrs: HashSet<bluer::Address> = HashSet::new();
+    // Locked devices are skipped briefly, then retried in case the other owner exited.
+    let mut excluded_addrs: HashMap<bluer::Address, tokio::time::Instant> = HashMap::new();
 
     // Outer loop: discover → connect → session. Restarts on lock errors in auto mode.
     'discover: loop {
-        // Find ATVV device (retries until found, interruptible by ctrl+c)
-        let excluded_vec: Vec<bluer::Address> = excluded_addrs.iter().copied().collect();
+        let (excluded_vec, exclusion_deadline) =
+            active_exclusions(&mut excluded_addrs, tokio::time::Instant::now());
         let device = loop {
             tokio::select! {
-                result = ble::find_atvv_device(&adapter, filter_addr, &excluded_vec) => {
+                result = async {
+                    let discovery = ble::find_atvv_device(&adapter, filter_addr, &excluded_vec);
+                    if let Some(deadline) = exclusion_deadline {
+                        match tokio::time::timeout_at(deadline, discovery).await {
+                            Ok(result) => result,
+                            Err(_) => anyhow::bail!("device lock exclusion expired"),
+                        }
+                    } else {
+                        discovery.await
+                    }
+                } => {
                     match result {
                         Ok(device) => break device,
+                        Err(_) if exclusion_deadline.is_some_and(|deadline| deadline <= tokio::time::Instant::now()) => {
+                            continue 'discover;
+                        }
                         Err(e) => {
                             tracing::info!("No ATVV device found ({e}), retrying in {discovery_retry_delay:?}...");
                             tokio::time::sleep(discovery_retry_delay).await;
@@ -527,14 +554,17 @@ async fn main() -> anyhow::Result<()> {
                             if filter_addr.is_some() {
                                 anyhow::bail!(
                                     "Device {} is already in use by another rc003-omarchy instance.",
-                                    device.address()
+                                    ble::redact_address(device.address())
                                 );
                             } else {
                                 tracing::warn!(
                                     "Device {} is locked by another instance, looking for another device...",
-                                    device.address()
+                                    ble::redact_address(device.address())
                                 );
-                                excluded_addrs.insert(device.address());
+                                excluded_addrs.insert(
+                                    device.address(),
+                                    tokio::time::Instant::now() + DEVICE_LOCK_EXCLUSION,
+                                );
                                 continue 'discover;
                             }
                         }
@@ -557,7 +587,10 @@ async fn main() -> anyhow::Result<()> {
             excluded_addrs.remove(&device.address());
             let _ = state_tx.send(atvv::State::Connected);
             let (mut session_protocol, codec) = match protocol::create_protocol(&caps) {
-                Ok((p, c)) => (p, c),
+                Ok((mut p, c)) => {
+                    p.set_frame_layout(config.audio.frame_layout);
+                    (p, c)
+                }
                 Err(e) => {
                     tracing::error!("Protocol creation failed: {e}");
                     tokio::select! {
@@ -602,15 +635,6 @@ async fn main() -> anyhow::Result<()> {
                 }
             });
 
-            let on_audio_start = {
-                let shutdown_tx = _pw_handle.shutdown_tx.clone();
-                let generation = _pw_handle.generation.clone();
-                move || {
-                    let generation = generation.load(std::sync::atomic::Ordering::Relaxed);
-                    let _ = shutdown_tx.send(pw::SessionControl::Reset(generation));
-                }
-            };
-
             let session_result = tokio::select! {
                 result = atvv::run_session(
                     &ble_device,
@@ -629,7 +653,6 @@ async fn main() -> anyhow::Result<()> {
                         state_tx: Some(&state_tx),
                         consumer_rx: consumer_rx.as_mut(),
                         generation: Some(&_pw_handle.generation),
-                        on_audio_start: Some(&on_audio_start),
                         mic_on_demand: cli.mic_on_demand,
                     },
                 ) => result,
@@ -662,15 +685,18 @@ async fn main() -> anyhow::Result<()> {
                         // Explicit --device: fatal, user asked for this specific device.
                         anyhow::bail!(
                             "Device {} is already in use by another rc003-omarchy instance.",
-                            device.address()
+                            ble::redact_address(device.address())
                         );
                     } else {
                         // Auto mode: skip this device, try to find another.
                         tracing::warn!(
                             "Device {} is locked by another instance, looking for another device...",
-                            device.address()
+                            ble::redact_address(device.address())
                         );
-                        excluded_addrs.insert(device.address());
+                        excluded_addrs.insert(
+                            device.address(),
+                            tokio::time::Instant::now() + DEVICE_LOCK_EXCLUSION,
+                        );
                         continue 'discover;
                     }
                 }
@@ -745,6 +771,19 @@ async fn main() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn locked_device_exclusions_expire() {
+        let address: bluer::Address = "C0:5D:39:FA:2A:1B".parse().unwrap();
+        let now = tokio::time::Instant::now();
+        let mut exclusions = HashMap::from([(address, now + Duration::from_secs(1))]);
+        let (active, deadline) = active_exclusions(&mut exclusions, now);
+        assert_eq!(active, vec![address]);
+        assert!(deadline.is_some());
+        let (active, deadline) = active_exclusions(&mut exclusions, now + Duration::from_secs(2));
+        assert!(active.is_empty());
+        assert!(deadline.is_none());
+    }
 
     #[test]
     fn only_not_permitted_counts_as_device_lock() {

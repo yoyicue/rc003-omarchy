@@ -5,7 +5,7 @@ Xiaomi Bluetooth Remote 2 Pro (RC003) integration for Omarchy, focused on native
 ## Features
 
 - BlueZ ATVV discovery, capability negotiation, command writes, reconnects, and session handling.
-- RC003-specific 16 kHz IMA/DVI ADPCM decoding, including 120-byte raw frames, 126-byte headered frames, and fragmented/coalesced notifications.
+- RC003-specific 16 kHz IMA/DVI ADPCM decoding, including 120-byte raw frames by default, explicitly configured 126-byte headered frames, and fragmented/coalesced notifications.
 - Native PipeWire `Audio/Source` named `rc003-omarchy`, visible to Superwhisper without changing system defaults.
 - Device-specific evdev/uinput handling for all 13 RC003 keys, with RightAlt/F9 down/up for native Superwhisper dictation and release cleanup on exit/disconnect.
 - Strict TOML configuration, `scan`, `doctor`, `test-keys`, `test-audio`, and `test-dictation` commands.
@@ -109,11 +109,11 @@ target/release/rc003-omarchy service status
 target/release/rc003-omarchy service uninstall --apply
 ```
 
-The service uses `newgrp input -c` so the daemon starts with the required input group. PCM frames carry a session generation, and only frame metadata decides what to play or discard. A bounded `ArrayQueue` drops the oldest frame when full, preserving continuous real-time audio without a shared receiver mutex. Session generations are assigned in `run_session` when each frame is received. Every AUDIO_START advances the session generation so consecutive dictations cannot replay the previous utterance's tail. The executable is installed to `~/.local/bin/rc003-omarchy` instead of a `target/` path, and the PipeWire source stays alive across BLE reconnects. Real dictation has passed on Redmi; the service is installed and enabled.
+The service uses `newgrp input -c` so the daemon starts with the required input group. PCM frames carry a session generation, and a bounded `ArrayQueue` drops the oldest frame when full. Every AUDIO_START atomically advances the generation; the PipeWire real-time callback exclusively owns its PCM buffer and discards older generations, with no `RefCell` or `Cell` shared with the main loop. Startup succeeds only after the stream reaches Paused or Streaming, and asynchronous stream failures reach the daemon. The executable is installed to `~/.local/bin/rc003-omarchy` instead of a `target/` path, and the PipeWire source stays alive across BLE reconnects. Real dictation has passed on Redmi; the service is installed and enabled.
 
 ## Validation status
 
-- 132 unit tests pass, plus the explicit uinput integration test.
+- 140 unit tests pass, plus the explicit uinput integration test.
 - Clippy passes with warnings denied; release build succeeds.
 - Real BlueZ negotiation passed with ATVV v1.0, 16 kHz, and 120-byte frames.
 - Superwhisper enumerates `RC003 Remote Microphone` as 16 kHz mono S16LE.
