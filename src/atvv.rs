@@ -260,7 +260,7 @@ pub async fn run_session(
             }
             Some(data) = rx_stream.next() => {
                 if state == State::Streaming {
-                    for frame in protocol.decode_audio(&data) {
+                    for mut frame in protocol.decode_audio(&data) {
                         // Reset frame timer on every audio frame
                         if frame_timeout_enabled {
                             frame_timer.as_mut().reset(Instant::now() + timeouts.frame_timeout);
@@ -280,6 +280,9 @@ pub async fn run_session(
                         }
                         last_seq = Some(frame.seq);
 
+                        if let Some(generation) = generation {
+                            frame.generation = generation.load(Ordering::Relaxed);
+                        }
                         if audio_tx.send(frame).await.is_err() {
                             tracing::warn!("audio frame dropped: receiver channel closed");
                         }

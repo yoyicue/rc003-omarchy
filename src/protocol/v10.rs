@@ -218,6 +218,7 @@ impl Protocol for ProtocolV10 {
                 seq,
                 codec,
                 samples,
+                generation: 0,
             });
         }
         frames

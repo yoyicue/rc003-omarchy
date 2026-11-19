@@ -9,7 +9,7 @@
 - M4：实现完成，13 键及 RightAlt 已通过真机验证。
 - M5：完成。服务已通过 `newgrp input -c` 安装并启用，启动权限和遥控器断线后的自动恢复均已通过验收。
 
-自动验证：124 个单元测试、显式 uinput 集成测试、Clippy（warnings denied）和 release build 全部通过。
+自动验证：125 个单元测试、显式 uinput 集成测试、Clippy（warnings denied）和 release build 全部通过。
 
 
 ## 1. 验证原则
@@ -172,3 +172,9 @@
 - PCM 通道满时先丢弃最旧帧，再写入新帧，保持实时音频连续。
 - 每次 `AUDIO_START` 都递增会话编号，连续两次开始也有测试验证，避免上一句尾音混入下一句。
 - 帧编号只用于判断会话新旧，不再依赖读取当前编号与取帧之间的时序。
+
+## 12. 第六轮 review 回归覆盖
+
+- `ArrayQueue::force_push` 在容量满时覆盖最旧帧，新增测试验证保留最新音频。
+- 会话编号在 `run_session` 收到帧时写入 `AudioFrame`，避免旧帧被错误标成新会话。
+- `frame_is_newer` 的文档注释已移到正确函数。

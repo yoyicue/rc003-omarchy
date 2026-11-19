@@ -25,6 +25,7 @@ evdev = "0.13.2"
 serde = { version = "1.0.229", features = ["derive"] }
 toml = "1.2.1"
 serde_json = "1.0.154"
+crossbeam-queue = "0.3.14"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["test-util"] }

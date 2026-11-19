@@ -257,6 +257,7 @@ pub struct AudioFrame {
     pub seq: u16,
     pub codec: Codec,
     pub samples: Vec<i16>,
+    pub generation: u64,
 }
 
 #[cfg(test)]

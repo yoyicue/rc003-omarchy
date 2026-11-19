@@ -7,9 +7,8 @@
 //! Uses `MainLoopRc` so the shutdown handler can clone the mainloop reference,
 //! and normal Rust drop order handles teardown after `mainloop.run()` returns.
 
+use crossbeam_queue::ArrayQueue;
 use std::io;
-use std::sync::mpsc;
-use std::sync::{Arc, Mutex};
 
 use pipewire::context::ContextRc;
 use pipewire::keys;
@@ -41,18 +40,19 @@ pub struct PcmFrame {
     pub samples: Vec<i16>,
 }
 
+/// Return true when a frame belongs to a newer utterance.
+fn frame_is_newer(frame_generation: u64, previous_generation: u64) -> bool {
+    frame_generation > previous_generation
+}
+
 /// Run the PipeWire audio source on the current thread (blocking).
 ///
 /// Reads decoded PCM frames from `audio_rx` and pushes them to PipeWire as a
 /// virtual microphone. Returns when `shutdown_rx` receives a [`Shutdown`] message.
 ///
 /// Call from a dedicated `std::thread::spawn`.
-fn frame_is_newer(frame_generation: u64, previous_generation: u64) -> bool {
-    frame_generation > previous_generation
-}
-
 pub fn run_pw_source(
-    audio_rx: Arc<Mutex<mpsc::Receiver<PcmFrame>>>,
+    audio_rx: std::sync::Arc<ArrayQueue<PcmFrame>>,
     gain_db: f32,
     sample_rate: u32,
     node_name: &str,
@@ -140,7 +140,7 @@ pub fn run_pw_source(
             // and not a real-time concern for voice audio rates.
             let mut buf = pending.borrow_mut();
 
-            while let Ok(Ok(mut frame)) = audio_rx.try_lock().map(|rx| rx.try_recv()) {
+            while let Some(mut frame) = audio_rx.pop() {
                 if frame_is_newer(frame.generation, previous_generation) {
                     buf.clear();
                     previous_generation = frame.generation;
@@ -440,6 +440,19 @@ pub fn run_pw_source(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn array_queue_drops_oldest_frame_when_full() {
+        let queue = ArrayQueue::new(2);
+        for generation in 1..=3 {
+            let _ = queue.force_push(PcmFrame {
+                generation,
+                samples: vec![generation as i16],
+            });
+        }
+        assert_eq!(queue.pop().unwrap().generation, 2);
+        assert_eq!(queue.pop().unwrap().generation, 3);
+    }
 
     #[test]
     fn only_current_session_frames_are_accepted() {

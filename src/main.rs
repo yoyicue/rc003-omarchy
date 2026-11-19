@@ -15,13 +15,10 @@ mod service;
 
 use anyhow::Context;
 use clap::Parser;
+use crossbeam_queue::ArrayQueue;
 use std::collections::HashSet;
 use std::path::PathBuf;
-use std::sync::Mutex;
-use std::sync::{
-    atomic::{AtomicU64, Ordering},
-    Arc,
-};
+use std::sync::{atomic::AtomicU64, Arc};
 use std::time::Duration;
 
 /// Capacity of the async channel between the ATVV session and the decoder task.
@@ -96,7 +93,7 @@ struct PipeWireHandle {
 
 impl PipeWireHandle {
     fn new(
-        pcm_rx: Arc<Mutex<std::sync::mpsc::Receiver<pw::PcmFrame>>>,
+        pcm_rx: std::sync::Arc<ArrayQueue<pw::PcmFrame>>,
         gain: f32,
         node_name: String,
         node_description: String,
@@ -476,8 +473,8 @@ async fn main() -> anyhow::Result<()> {
             (None, None)
         };
 
-        let (pcm_tx, pcm_rx) = std::sync::mpsc::sync_channel::<pw::PcmFrame>(32);
-        let pcm_rx = Arc::new(Mutex::new(pcm_rx));
+        let pcm_tx = std::sync::Arc::new(ArrayQueue::new(32));
+        let pcm_rx = pcm_tx.clone();
         let (consumer_tx, mut consumer_rx) = if cli.mic_on_demand {
             let (tx, rx) = tokio::sync::mpsc::channel(16);
             (Some(tx), Some(rx))
@@ -568,28 +565,17 @@ async fn main() -> anyhow::Result<()> {
             let (frame_tx, mut frame_rx) =
                 tokio::sync::mpsc::channel::<protocol::types::AudioFrame>(DECODER_CHANNEL_CAPACITY);
             let pcm_tx = pcm_tx.clone();
-            let pcm_rx = pcm_rx.clone();
             // Post-processing task: Protocol already decoded the audio,
             // so we just apply declip/lowpass/gain and forward PCM.
-            let generation = _pw_handle.generation.clone();
             let decoder_handle = tokio::spawn(async move {
                 while let Some(frame) = frame_rx.recv().await {
                     let mut samples = frame.samples;
                     adpcm::declip(&mut samples);
                     adpcm::lowpass(&mut samples);
-                    match pcm_tx.try_send(pw::PcmFrame {
-                        generation: generation.load(Ordering::Relaxed),
+                    let _ = pcm_tx.force_push(pw::PcmFrame {
+                        generation: frame.generation,
                         samples,
-                    }) {
-                        Ok(()) => {}
-                        Err(std::sync::mpsc::TrySendError::Full(frame)) => {
-                            if let Ok(rx) = pcm_rx.try_lock() {
-                                let _ = rx.try_recv();
-                            }
-                            let _ = pcm_tx.try_send(frame);
-                        }
-                        Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {}
-                    }
+                    });
                 }
             });
 
