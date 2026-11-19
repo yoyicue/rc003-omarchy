@@ -22,6 +22,8 @@ pub enum State {
     Streaming,
 }
 
+const AUDIO_TAIL_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
+
 impl std::fmt::Display for State {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -177,11 +179,13 @@ pub async fn run_session(
         }
     }
 
+    let mut tail_deadline: Option<Instant> = None;
     macro_rules! close_mic_reset {
         ($state:ident, $last_seq:ident, $current_stream_id:ident) => {
             set_state(State::Connected, &mut $state);
             $last_seq = None;
             $current_stream_id = None;
+            tail_deadline = Some(Instant::now() + AUDIO_TAIL_DRAIN_TIMEOUT);
         };
     }
 
@@ -236,6 +240,7 @@ pub async fn run_session(
                     }
                     CtlEvent::AudioStart { reason, codec, stream_id } => {
                         tracing::info!("AUDIO_START (reason={:?}, codec={:?}, stream_id={:?})", reason, codec, stream_id);
+                        tail_deadline = None;
                         if let Some(generation) = generation {
                             generation.fetch_add(1, Ordering::Relaxed);
                         }
@@ -390,13 +395,36 @@ pub async fn run_session(
                                 frame_timer.as_mut().reset(Instant::now() + timeouts.frame_timeout);
                             }
                         }
-                        if count == 0 && (state == State::Streaming || state == State::Opening) {
-                            tracing::info!("All consumers disconnected, closing mic");
-                            let sid = current_stream_id.unwrap_or(StreamId::MIC_OPEN);
-                            let _ = ble.write_command(&protocol.mic_close_cmd(sid)).await;
-                            close_mic_reset!(state, last_seq, current_stream_id);
+                        if count == 0 {
+                            let invalidate_tail = tail_deadline.is_some()
+                                || matches!(state, State::Streaming | State::Opening);
+                            if state == State::Streaming || state == State::Opening {
+                                tracing::info!("All consumers disconnected, closing mic");
+                                let sid = current_stream_id.unwrap_or(StreamId::MIC_OPEN);
+                                let _ = ble.write_command(&protocol.mic_close_cmd(sid)).await;
+                                close_mic_reset!(state, last_seq, current_stream_id);
+                            }
+                            if invalidate_tail {
+                                tail_deadline = None;
+                                if let Some(generation) = generation {
+                                    generation.fetch_add(1, Ordering::Relaxed);
+                                }
+                            }
                         }
                     }
+                }
+            }
+            () = async {
+                if let Some(deadline) = tail_deadline {
+                    time::sleep_until(deadline).await;
+                } else {
+                    std::future::pending::<()>().await;
+                }
+            } => {
+                tail_deadline = None;
+                if let Some(generation) = generation {
+                    generation.fetch_add(1, Ordering::Relaxed);
+                    tracing::debug!("Audio tail drain expired; invalidated remaining PCM");
                 }
             }
             // Keepalive: protocol handles the version-appropriate command
@@ -898,16 +926,21 @@ mod tests {
         ctrl.ctl_tx.send(vec![CTL_AUDIO_STOP]).unwrap();
         tokio::time::advance(Duration::from_millis(1)).await;
         assert_eq!(generation.load(Ordering::Relaxed), 1);
+        tokio::time::advance(Duration::from_millis(999)).await;
+        assert_eq!(generation.load(Ordering::Relaxed), 1);
+        tokio::time::advance(Duration::from_millis(2)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(generation.load(Ordering::Relaxed), 2);
 
         ctrl.ctl_tx.send(vec![CTL_AUDIO_START]).unwrap();
         tokio::time::advance(Duration::from_millis(1)).await;
-        assert_eq!(generation.load(Ordering::Relaxed), 2);
+        assert_eq!(generation.load(Ordering::Relaxed), 3);
         ctrl.event_tx
             .send(DeviceConnectionEvent::Disconnected)
             .unwrap();
         assert!(session.await.unwrap().is_ok());
         assert!(generation.load(Ordering::Relaxed) > queued.generation);
-        assert_eq!(generation.load(Ordering::Relaxed), 3);
+        assert_eq!(generation.load(Ordering::Relaxed), 4);
     }
 
     #[tokio::test]
@@ -1515,6 +1548,8 @@ mod tests {
     async fn test_mic_on_demand_button_open_consumer_close() {
         tokio::time::pause();
 
+        let generation = Arc::new(AtomicU64::new(0));
+        let generation_for_session = generation.clone();
         let (device, mut ctrl) = mock_device();
         let (audio_tx, _audio_rx) = tokio_mpsc::channel(64);
         let (state_tx, mut state_rx) = tokio::sync::watch::channel(State::Connected);
@@ -1551,7 +1586,7 @@ mod tests {
                     command_rx: None,
                     state_tx: Some(&state_tx),
                     consumer_rx: Some(&mut consumer_rx),
-                    generation: None,
+                    generation: Some(&generation_for_session),
                     mic_on_demand: true,
                 },
             )
@@ -1584,6 +1619,7 @@ mod tests {
             .unwrap();
         tokio::time::advance(Duration::from_millis(1)).await;
         assert!(wait_for_state(&mut state_rx, State::Connected, Duration::from_millis(10)).await);
+        assert_eq!(generation.load(Ordering::Relaxed), 2);
 
         let cmds = try_recv_all_commands(&mut ctrl.commands_rx).await;
         assert_eq!(cmds, vec![V04_MIC_CLOSE.to_vec()]);

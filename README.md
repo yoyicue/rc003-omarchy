@@ -114,7 +114,7 @@ The service uses `newgrp input -c` so the daemon starts with the required input 
 ## Validation status
 
 - Previous Redmi baseline: 140 unit tests plus the explicit uinput integration test; Clippy passed with warnings denied and the release build succeeded.
-- Latest lifecycle changes: 123 portable tests pass on macOS, including disconnect invalidation, consumed failure notifications, closed failure channels, and relative config paths. Full Redmi build and PipeWire fault-injection validation are still pending.
+- Latest lifecycle changes: 124 portable tests pass on macOS, including intentional source teardown versus real failures, bounded tail draining, consumer departure, and interruptible reconnect backoff. Full Redmi build and PipeWire fault-injection validation are still pending.
 - Real BlueZ negotiation passed with ATVV v1.0, 16 kHz, and 120-byte frames.
 - Superwhisper enumerates `RC003 Remote Microphone` as 16 kHz mono S16LE.
 - Virtual RC003 input is verified end to end as RightAlt/F9 down/up through evdev/uinput.

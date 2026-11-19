@@ -204,6 +204,21 @@ impl ShutdownSignal {
         self.pipewire_failure_rx = Some(receiver);
     }
 
+    fn unwatch_pipewire(&mut self) {
+        if self.pipewire_failure.is_none() {
+            self.pipewire_failure = self.pipewire_failure();
+        }
+        self.pipewire_failure_rx = None;
+    }
+
+    fn result(&self) -> anyhow::Result<()> {
+        if let Some(failure) = self.pipewire_failure() {
+            Err(anyhow::anyhow!("PipeWire failure: {failure}"))
+        } else {
+            Ok(())
+        }
+    }
+
     fn pipewire_failure(&self) -> Option<String> {
         self.pipewire_failure.clone().or_else(|| {
             self.pipewire_failure_rx
@@ -482,13 +497,16 @@ async fn main() -> anyhow::Result<()> {
                         }
                         Err(e) => {
                             tracing::info!("No ATVV device found ({e}), retrying in {discovery_retry_delay:?}...");
-                            tokio::time::sleep(discovery_retry_delay).await;
+                            tokio::select! {
+                                _ = tokio::time::sleep(discovery_retry_delay) => {}
+                                _ = shutdown.wait() => return shutdown.result(),
+                            }
                         }
                     }
                 }
                 _ = shutdown.wait() => {
                     tracing::info!("Shutting down");
-                    return Ok(());
+                    return shutdown.result();
                 }
             }
         };
@@ -497,7 +515,7 @@ async fn main() -> anyhow::Result<()> {
             _ = ensure_connected(&device, retry_delay) => {}
             _ = shutdown.wait() => {
                 tracing::info!("Shutting down");
-                return Ok(());
+                return shutdown.result();
             }
         }
 
@@ -514,13 +532,16 @@ async fn main() -> anyhow::Result<()> {
                             tracing::warn!(
                                 "Failed to resolve characteristics ({e}), retrying in 2s..."
                             );
-                            tokio::time::sleep(retry_delay).await;
+                            tokio::select! {
+                                _ = tokio::time::sleep(retry_delay) => {}
+                                _ = shutdown.wait() => return shutdown.result(),
+                            }
                         }
                     }
                 }
                 _ = shutdown.wait() => {
                     tracing::info!("Shutting down");
-                    return Ok(());
+                    return shutdown.result();
                 }
             }
         };
@@ -629,6 +650,8 @@ async fn main() -> anyhow::Result<()> {
                                     device.address(),
                                     tokio::time::Instant::now() + DEVICE_LOCK_EXCLUSION,
                                 );
+                                shutdown.unwatch_pipewire();
+                                drop(_pw_handle);
                                 continue 'discover;
                             }
                         }
@@ -757,6 +780,8 @@ async fn main() -> anyhow::Result<()> {
                             device.address(),
                             tokio::time::Instant::now() + DEVICE_LOCK_EXCLUSION,
                         );
+                        shutdown.unwatch_pipewire();
+                        drop(_pw_handle);
                         continue 'discover;
                     }
                 }
@@ -799,12 +824,15 @@ async fn main() -> anyhow::Result<()> {
                             Ok(c) => {
                                 tracing::info!("ATVV characteristics re-resolved");
                                 // Re-run vendor handshake (e.g. Philips remotes reset state on reconnect)
-                                _vendor_ff02_stream = match ble::vendor_handshake(&device).await {
-                                    Ok(stream) => stream,
-                                    Err(e) => {
-                                        tracing::warn!("Vendor handshake failed after reconnect: {e}");
-                                        None
-                                    }
+                                _vendor_ff02_stream = tokio::select! {
+                                    result = ble::vendor_handshake(&device) => match result {
+                                        Ok(stream) => stream,
+                                        Err(e) => {
+                                            tracing::warn!("Vendor handshake failed after reconnect: {e}");
+                                            None
+                                        }
+                                    },
+                                    _ = shutdown.wait() => break 'discover,
                                 };
                                 break c;
                             }
@@ -812,7 +840,10 @@ async fn main() -> anyhow::Result<()> {
                                 tracing::warn!(
                                     "Failed to re-resolve characteristics ({e}), retrying in 2s..."
                                 );
-                                tokio::time::sleep(retry_delay).await;
+                                tokio::select! {
+                                    _ = tokio::time::sleep(retry_delay) => {}
+                                    _ = shutdown.wait() => break 'discover,
+                                }
                             }
                         }
                     }
@@ -825,15 +856,28 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    if let Some(failure) = shutdown.pipewire_failure() {
-        return Err(anyhow::anyhow!("PipeWire failure: {failure}"));
-    }
-    Ok(())
+    shutdown.result()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn unwatch_ignores_normal_close_and_preserves_real_failure() {
+        let mut shutdown = ShutdownSignal::new().unwrap();
+        let (failure_tx, failure_rx) = tokio::sync::watch::channel(None);
+        shutdown.watch_pipewire(failure_rx);
+        shutdown.unwatch_pipewire();
+        drop(failure_tx);
+        assert!(shutdown.result().is_ok());
+
+        let (failure_tx, failure_rx) = tokio::sync::watch::channel(None);
+        shutdown.watch_pipewire(failure_rx);
+        failure_tx.send(Some("real failure".to_string())).unwrap();
+        shutdown.unwatch_pipewire();
+        assert!(shutdown.result().is_err());
+    }
 
     #[tokio::test]
     async fn pipewire_failure_survives_a_consumed_notification() {
