@@ -189,12 +189,11 @@ impl Protocol for ProtocolV10 {
             } else if buffered.is_multiple_of(plain_size) {
                 self.header_mode = Some(false);
             } else {
-                tracing::warn!(
+                tracing::debug!(
                     buffered,
                     plain_size,
-                    "unable to determine RC003 audio frame layout; waiting for a new sync"
+                    "RC003 audio frame layout is still indeterminate; retaining buffered data"
                 );
-                self.audio_buffer.clear();
                 return Vec::new();
             }
         }
@@ -530,6 +529,19 @@ mod tests {
         assert_eq!(p.frame_seq, 0);
         assert_eq!(p.decoder.predictor(), 0);
         assert_eq!(p.decoder.step_index(), 0);
+    }
+
+    #[test]
+    fn test_rc003_indeterminate_fragments_are_retained() {
+        let mut p = ProtocolV10::new();
+        p.selected_codec = Some(Codec::Adpcm16kHz);
+        p.audio_frame_size = AudioFrameSize(120);
+        assert!(p.decode_audio(&[0u8; 80]).is_empty());
+        assert!(p.decode_audio(&[0u8; 80]).is_empty());
+        let frames = p.decode_audio(&[0u8; 80]);
+        assert_eq!(frames.len(), 2);
+        assert_eq!(frames[0].samples.len(), 240);
+        assert_eq!(frames[1].samples.len(), 240);
     }
 
     // ── parse_caps_resp_payload tests ───────────────────────────────

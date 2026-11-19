@@ -74,7 +74,7 @@ PCM 后处理第一版保持简单：可选三抽头平滑、可调数字增益�
 
 源常驻是为了减少 Superwhisper 启动录音时的设备发现延迟。没有语音会话时不得伪造现场环境音；实现可以输出静音或暂停流，但不得把缓存中的上一段语音重放。
 
-`--mic-on-demand` 不是第一版默认行为。是否按需打开由后续真机延迟和隐私测试决定。
+`--mic-on-demand` 已实现但不是默认行为。PipeWire 通过 watch 通道保留最新消费者数量；每个新 ATVV 会话开始时都会读取该值，因此录音客户端跨蓝牙重连保持连接时也能重新触发 MIC_OPEN。2026-11-19 已在 Redmi 用持续连接的 `pw-cat` 消费者验证，蓝牙恢复后收到了新的 AUDIO_START。是否改为默认仍需长期延迟和隐私测试。
 
 ## 6. 缓冲与背压
 
@@ -131,4 +131,4 @@ ATVVoice 已下载到 `~/Work/tries/atvvoice`，其 `src/pw.rs` 是本项目原�
 
 ## 11. 跨会话虚拟源生命周期
 
-`rc003-omarchy` 的 PipeWire 源在进程生命周期内常驻。BLE 重连只结束当前 ATVV 会话并替换 PCM 生产者，不销毁或重新创建虚拟源，避免 Superwhisper 因源 ID 变化而回退或要求重新选择。进程收到 SIGINT/SIGTERM 后才统一关闭源。每次 `AUDIO_START` 都递增会话编号，连续听写也会隔离上一句尾音。PipeWire 只依据帧里的编号判断：更大的编号开启新会话并清空旧缓冲，相同编号接收，较小编号丢弃，因此不会因为读取当前编号与取帧之间的竞态而误删首帧。PCM 使用容量 32 的 `crossbeam_queue::ArrayQueue`，通过 `force_push` 在队列满时覆盖最旧帧，保持实时音频连续且无需共享接收端或 Mutex。会话编号在 `run_session` 收到帧时写入 `AudioFrame`，不再由下游解码任务补写。协商出的采样率不是 16 kHz 时会拒绝运行。
+`rc003-omarchy` 的 PipeWire 源在进程生命周期内常驻。BLE 重连只结束当前 ATVV 会话并替换 PCM 生产者，不销毁或重新创建虚拟源，避免 Superwhisper 因源 ID 变化而回退或要求重新选择。进程收到 SIGINT/SIGTERM 后才统一关闭源。每次 `AUDIO_START` 都先递增会话编号，再请求 PipeWire 立即淘汰旧会话 PCM，连续听写不会重放上一句尾音。复位携带新会话编号：如果新句 PCM 已先到达，则不会误删其开头；PipeWire 仍依据每帧编号接收当前会话并丢弃旧帧。PCM 使用容量 32 的 `crossbeam_queue::ArrayQueue`，通过 `force_push` 在队列满时覆盖最旧帧，保持实时音频连续且无需共享接收端或 Mutex。会话编号在 `run_session` 收到帧时写入 `AudioFrame`，不再由下游解码任务补写。协商出的采样率不是 16 kHz 时会拒绝运行。

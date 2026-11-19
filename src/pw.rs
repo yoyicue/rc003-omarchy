@@ -1,7 +1,7 @@
 //! PipeWire virtual audio source.
 //!
 //! Runs on a dedicated OS thread (not tokio-compatible). Receives decoded PCM
-//! frames via [`std::sync::mpsc`] and pushes them to PipeWire as a virtual
+//! frames via [`crossbeam_queue::ArrayQueue`] and pushes them to PipeWire as a virtual
 //! microphone source.
 //!
 //! Uses `MainLoopRc` so the shutdown handler can clone the mainloop reference,
@@ -32,6 +32,7 @@ const SAMPLE_SIZE: usize = std::mem::size_of::<i16>();
 #[derive(Debug)]
 pub enum SessionControl {
     Shutdown,
+    Reset(u64),
 }
 
 #[derive(Debug)]
@@ -45,12 +46,24 @@ fn frame_is_newer(frame_generation: u64, previous_generation: u64) -> bool {
     frame_generation > previous_generation
 }
 
+fn reset_pending(
+    pending: &mut Vec<i16>,
+    pending_generation: &std::cell::Cell<u64>,
+    generation: u64,
+) {
+    if pending_generation.get() < generation {
+        pending.clear();
+        pending_generation.set(generation);
+    }
+}
+
 /// Run the PipeWire audio source on the current thread (blocking).
 ///
 /// Reads decoded PCM frames from `audio_rx` and pushes them to PipeWire as a
-/// virtual microphone. Returns when `shutdown_rx` receives a [`Shutdown`] message.
+/// virtual microphone. Returns when `shutdown_rx` receives a [`SessionControl::Shutdown`] message.
 ///
 /// Call from a dedicated `std::thread::spawn`.
+#[allow(clippy::too_many_arguments)]
 pub fn run_pw_source(
     audio_rx: std::sync::Arc<ArrayQueue<PcmFrame>>,
     gain_db: f32,
@@ -58,7 +71,8 @@ pub fn run_pw_source(
     node_name: &str,
     node_description: &str,
     shutdown_rx: pipewire::channel::Receiver<SessionControl>,
-    consumer_tx: Option<tokio::sync::mpsc::Sender<crate::consumer::ConsumerEvent>>,
+    startup_tx: Option<std::sync::mpsc::Sender<Result<(), String>>>,
+    consumer_tx: Option<tokio::sync::watch::Sender<crate::consumer::ConsumerEvent>>,
 ) -> Result<(), pipewire::Error> {
     pipewire::init();
 
@@ -70,15 +84,30 @@ pub fn run_pw_source(
     // Shared slot for the stream - set after creation, used by shutdown handler.
     let stream_slot: std::rc::Rc<std::cell::RefCell<Option<StreamRc>>> =
         std::rc::Rc::new(std::cell::RefCell::new(None));
+    let pending_generation = std::rc::Rc::new(std::cell::Cell::new(0));
+    let pending_for_reset = pending.clone();
+    let generation_for_reset = pending_generation.clone();
     let _receiver = shutdown_rx.attach(mainloop.loop_(), {
         let mainloop = mainloop.clone();
         let stream_slot = stream_slot.clone();
-        move |_: SessionControl| {
-            tracing::info!("PipeWire source shutting down");
-            if let Some(stream) = stream_slot.borrow().as_ref() {
-                let _ = stream.disconnect();
+        move |control| match control {
+            SessionControl::Shutdown => {
+                tracing::info!("PipeWire source shutting down");
+                if let Some(stream) = stream_slot.borrow().as_ref() {
+                    let _ = stream.disconnect();
+                }
+                mainloop.quit();
             }
-            mainloop.quit();
+            SessionControl::Reset(generation) => {
+                if generation_for_reset.get() < generation {
+                    reset_pending(
+                        &mut pending_for_reset.borrow_mut(),
+                        &generation_for_reset,
+                        generation,
+                    );
+                    tracing::debug!("PipeWire utterance boundary reset");
+                }
+            }
         }
     });
 
@@ -113,7 +142,7 @@ pub fn run_pw_source(
     let our_node_id: std::rc::Rc<std::cell::Cell<u32>> =
         std::rc::Rc::new(std::cell::Cell::new(u32::MAX));
 
-    let mut previous_generation = 0;
+    let pending_generation_for_process = pending_generation.clone();
     let _listener = stream
         .add_local_listener_with_user_data(())
         .state_changed({
@@ -141,11 +170,11 @@ pub fn run_pw_source(
             let mut buf = pending.borrow_mut();
 
             while let Some(mut frame) = audio_rx.pop() {
-                if frame_is_newer(frame.generation, previous_generation) {
+                if frame_is_newer(frame.generation, pending_generation_for_process.get()) {
                     buf.clear();
-                    previous_generation = frame.generation;
+                    pending_generation_for_process.set(frame.generation);
                 }
-                if frame.generation == previous_generation {
+                if frame.generation == pending_generation_for_process.get() {
                     crate::adpcm::apply_gain_linear(&mut frame.samples, gain_linear);
                     buf.extend_from_slice(&frame.samples);
                 }
@@ -236,6 +265,10 @@ pub fn run_pw_source(
         &mut params,
     )?;
 
+    if let Some(startup_tx) = startup_tx {
+        let _ = startup_tx.send(Ok(()));
+    }
+
     tracing::info!(
         "PipeWire source running ({}kHz S16LE mono, gain={gain_db}dB)",
         sample_rate / 1000
@@ -295,8 +328,7 @@ pub fn run_pw_source(
                 if count != last_count.get() {
                     last_count.set(count);
                     tracing::debug!("PipeWire consumer count: {count}");
-                    if let Err(e) =
-                        consumer_tx.try_send(crate::consumer::ConsumerEvent::Changed(count))
+                    if let Err(e) = consumer_tx.send(crate::consumer::ConsumerEvent::Changed(count))
                     {
                         tracing::warn!("Consumer event dropped: {e}");
                     }
@@ -458,5 +490,19 @@ mod tests {
     fn only_current_session_frames_are_accepted() {
         assert!(frame_is_newer(7, 6));
         assert!(!frame_is_newer(6, 7));
+    }
+
+    #[test]
+    fn utterance_reset_does_not_drop_new_session_samples() {
+        let mut pending = vec![10, 11];
+        let generation = std::cell::Cell::new(1);
+        reset_pending(&mut pending, &generation, 1);
+        assert_eq!(pending, vec![10, 11]);
+        reset_pending(&mut pending, &generation, 2);
+        assert!(pending.is_empty());
+        assert_eq!(generation.get(), 2);
+        pending.extend_from_slice(&[20, 21]);
+        reset_pending(&mut pending, &generation, 2);
+        assert_eq!(pending, vec![20, 21]);
     }
 }

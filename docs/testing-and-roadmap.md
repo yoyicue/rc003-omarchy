@@ -1,6 +1,6 @@
 # 测试与实施路线
 
-## 当前实现与验收状态（2026-11-18）
+## 当前实现与验收状态（2026-11-19）
 
 - M0：完成。Rust 工具链、构建、配置和只读诊断均可用。
 - M1：完成。目标 RC003-MC 已验证配对、ATVV v1.0、16 kHz、120 字节帧及 13/13 键码。
@@ -9,7 +9,7 @@
 - M4：实现完成，13 键及 RightAlt 已通过真机验证。
 - M5：完成。服务已通过 `newgrp input -c` 安装并启用，启动权限和遥控器断线后的自动恢复均已通过验收。
 
-自动验证：125 个单元测试、显式 uinput 集成测试、Clippy（warnings denied）和 release build 全部通过。
+自动验证：132 个单元测试、显式 uinput 集成测试、Clippy（warnings denied）和 release build 全部通过。
 
 
 ## 1. 验证原则
@@ -178,3 +178,25 @@
 - `ArrayQueue::force_push` 在容量满时覆盖最旧帧，新增测试验证保留最新音频。
 - 会话编号在 `run_session` 收到帧时写入 `AudioFrame`，避免旧帧被错误标成新会话。
 - `frame_is_newer` 的文档注释已移到正确函数。
+
+## 13. 第七轮 review 回归覆盖
+
+- 无法判定帧格式的分片保留在缓冲中；`80 + 80 + 80` 字节通知可解出两个 120 字节裸帧。
+- 只把底层 `bluer::ErrorKind::NotPermitted` 判为设备占用；重新选中设备时清除排除标记。CTL、RX 和设备事件流的 EOF 均退出当前会话以便重连，订阅连接事件后再次检查当前状态。
+- PipeWire 创建音源前完成启动握手，启动失败或运行中错误会传回主循环并使服务失败退出。
+- `AUDIO_START` 先推进会话编号再请求 PipeWire 复位；复位只清理更旧会话的 PCM，不误删已到达的新句开头。按需录音用 watch 保存最新消费者数，新会话发现已有消费者时立即发送 MIC_OPEN。
+- `--device` 同时约束 BLE 和 evdev，输入节点通过 `unique_name()` 匹配选定的蓝牙地址。
+- 显式配置路径不存在时拒绝启动；卸载仅处理本项目生成的 unit，停用失败时保留文件并返回错误。
+- udev 规则更名为 `70-rc003-omarchy.rules`，先于 systemd 的 `73-seat-late.rules` 添加 `uaccess`。
+
+## 14. 第七轮真机回归
+
+2026-11-19 在 Redmi 对新构建和安装后的 `~/.local/bin/rc003-omarchy` 完成以下检查：
+
+- `doctor` 的 bluetooth、uinput、input、PipeWire 和 Superwhisper 五项全部通过，服务为 enabled/active。
+- 停止常驻服务后，显式 `uinput_end_to_end_voice_mapping` 集成测试通过；随后恢复服务。
+- SIGTERM 停止时日志确认 MIC_CLOSE、PipeWire 和 input manager 均完成清理。
+- 主动断开蓝牙后服务保持运行，自动重连并在首次 CAPS 超时后重试成功。
+- 使用 `--device` 前台运行时正确接管目标 evdev 节点；第二实例因真实 BlueZ NotPermitted 被拒绝，原服务不受影响。
+- 注入不存在的 PipeWire remote，启动以状态 1 失败退出，不再留下无麦克风的假运行进程。
+- `pw-cat` 持续连接并启用 `--mic-on-demand` 时，蓝牙重连后收到新的 AUDIO_START，验证已有消费者路径。

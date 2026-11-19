@@ -97,8 +97,9 @@ pub struct SessionConfig<'a> {
     pub timeouts: &'a SessionTimeouts,
     pub command_rx: Option<&'a mut mpsc::Receiver<ExternalCommand>>,
     pub state_tx: Option<&'a tokio::sync::watch::Sender<State>>,
-    pub consumer_rx: Option<&'a mut tokio::sync::mpsc::Receiver<consumer::ConsumerEvent>>,
+    pub consumer_rx: Option<&'a mut tokio::sync::watch::Receiver<consumer::ConsumerEvent>>,
     pub generation: Option<&'a Arc<AtomicU64>>,
+    pub on_audio_start: Option<&'a (dyn Fn() + Send + Sync)>,
     pub mic_on_demand: bool,
 }
 
@@ -111,6 +112,12 @@ pub struct SessionConfig<'a> {
 ///
 /// # Errors
 ///
+fn current_consumer_count(rx: &mut tokio::sync::watch::Receiver<consumer::ConsumerEvent>) -> u32 {
+    match *rx.borrow() {
+        consumer::ConsumerEvent::Changed(count) => count,
+    }
+}
+
 /// Returns an error if a BLE write to the TX characteristic fails (e.g. the
 /// device disconnects mid-command). Timeout-triggered `MIC_CLOSE` writes are
 /// best-effort and do not propagate errors.
@@ -127,6 +134,7 @@ pub async fn run_session(
         state_tx,
         mut consumer_rx,
         generation,
+        on_audio_start,
         mic_on_demand,
     } = config;
     let mut state = State::Connected;
@@ -146,6 +154,16 @@ pub async fn run_session(
     // Helper: reset session state after mic close. Used in multiple `tokio::select!`
     // match arms where the pattern (set state → Connected, clear seq/stream_id) repeats.
     // Inlines `set_state` logic to avoid borrow conflicts.
+    if mic_on_demand {
+        if let Some(rx) = consumer_rx.as_mut() {
+            let initial_count = current_consumer_count(rx);
+            if initial_count > 0 && state == State::Connected {
+                ble.write_command(&protocol.mic_open_cmd()).await?;
+                set_state(State::Opening, &mut state);
+            }
+        }
+    }
+
     macro_rules! close_mic_reset {
         ($state:ident, $last_seq:ident, $current_stream_id:ident) => {
             set_state(State::Connected, &mut $state);
@@ -182,7 +200,11 @@ pub async fn run_session(
 
     loop {
         tokio::select! {
-            Some(data) = ctl_stream.next() => {
+            data = ctl_stream.next() => {
+                let Some(data) = data else {
+                    tracing::info!("CTL stream ended");
+                    return Ok(());
+                };
                 if data.is_empty() {
                     continue;
                 }
@@ -203,6 +225,9 @@ pub async fn run_session(
                         tracing::info!("AUDIO_START (reason={:?}, codec={:?}, stream_id={:?})", reason, codec, stream_id);
                         if let Some(generation) = generation {
                             generation.fetch_add(1, Ordering::Relaxed);
+                        }
+                        if let Some(on_audio_start) = on_audio_start {
+                            on_audio_start();
                         }
                         protocol.on_audio_start();
                         // Remote resets its sequence counter on every AUDIO_START
@@ -258,7 +283,11 @@ pub async fn run_session(
                     }
                 }
             }
-            Some(data) = rx_stream.next() => {
+            data = rx_stream.next() => {
+                let Some(data) = data else {
+                    tracing::info!("RX stream ended");
+                    return Ok(());
+                };
                 if state == State::Streaming {
                     for mut frame in protocol.decode_audio(&data) {
                         // Reset frame timer on every audio frame
@@ -334,13 +363,15 @@ pub async fn run_session(
             }
             // Consumer presence events (PipeWire consumer connect/disconnect)
             event = async {
-                match consumer_rx.as_mut() {
-                    Some(rx) => rx.recv().await,
-                    None => std::future::pending::<Option<consumer::ConsumerEvent>>().await,
+                if let Some(rx) = consumer_rx.as_mut() {
+                    rx.changed().await
+                } else {
+                    std::future::pending::<Result<(), tokio::sync::watch::error::RecvError>>().await
                 }
             } => {
-                if let Some(consumer::ConsumerEvent::Changed(count)) = event {
-                    if mic_on_demand {
+                if mic_on_demand && event.is_ok() {
+                    if let Some(rx) = consumer_rx.as_mut() {
+                        let count = current_consumer_count(rx);
                         if count > 0 && state == State::Connected {
                             ble.write_command(&protocol.mic_open_cmd()).await?;
                             tracing::info!("Sent MIC_OPEN (consumer connected, on-demand)");
@@ -372,7 +403,11 @@ pub async fn run_session(
                 let _ = ble.write_command(&protocol.mic_close_cmd(sid)).await;
                 close_mic_reset!(state, last_seq, current_stream_id);
             }
-            Some(event) = device_events.next() => {
+            event = device_events.next() => {
+                let Some(event) = event else {
+                    tracing::info!("device event stream ended");
+                    return Ok(());
+                };
                 match event {
                     DeviceConnectionEvent::Disconnected => {
                         tracing::info!("Device disconnected");
@@ -589,6 +624,7 @@ mod tests {
                     state_tx: Some(&state_tx),
                     consumer_rx: None,
                     generation: None,
+                    on_audio_start: None,
                     mic_on_demand: false,
                 },
             )
@@ -694,6 +730,7 @@ mod tests {
                     state_tx: Some(&state_tx),
                     consumer_rx: None,
                     generation: None,
+                    on_audio_start: None,
                     mic_on_demand: false,
                 },
             )
@@ -780,6 +817,7 @@ mod tests {
                     state_tx: Some(&state_tx),
                     consumer_rx: None,
                     generation: None,
+                    on_audio_start: None,
                     mic_on_demand: false,
                 },
             )
@@ -836,6 +874,7 @@ mod tests {
                     state_tx: Some(&state_tx),
                     consumer_rx: None,
                     generation: Some(&generation_for_session),
+                    on_audio_start: None,
                     mic_on_demand: false,
                 },
             )
@@ -850,6 +889,53 @@ mod tests {
         ctrl.event_tx
             .send(DeviceConnectionEvent::Disconnected)
             .unwrap();
+        let result = session.await.unwrap();
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_ctl_stream_eof_returns_session() {
+        tokio::time::pause();
+
+        let (device, ctrl) = mock_device();
+        let (audio_tx, _audio_rx) = tokio_mpsc::channel(64);
+        let (state_tx, _state_rx) = tokio::sync::watch::channel(State::Connected);
+        let timeouts = SessionTimeouts {
+            frame_timeout: Duration::ZERO,
+            keepalive: Duration::ZERO,
+        };
+        let caps = Capabilities {
+            version: ProtocolVersion::V0_4,
+            codecs: Codecs::ADPCM_8KHZ,
+            interaction_model: InteractionModel::OnRequest,
+            audio_frame_size: AudioFrameSize(134),
+        };
+        let mut protocol = ProtocolV04::new();
+        protocol.on_caps_resp(&caps).unwrap();
+        let ctl = device.ctl_notifications().await.unwrap();
+        let rx = device.rx_notifications().await.unwrap();
+        let events = device.connection_events().await.unwrap();
+        let streams = BleStreams { ctl, rx, events };
+        let session = tokio::spawn(async move {
+            run_session(
+                &device,
+                &mut protocol,
+                streams,
+                SessionConfig {
+                    audio_tx,
+                    timeouts: &timeouts,
+                    command_rx: None,
+                    state_tx: Some(&state_tx),
+                    consumer_rx: None,
+                    generation: None,
+                    on_audio_start: None,
+                    mic_on_demand: false,
+                },
+            )
+            .await
+        });
+        drop(ctrl.ctl_tx);
+        tokio::time::advance(Duration::from_millis(1)).await;
         let result = session.await.unwrap();
         assert!(result.is_ok());
     }
@@ -898,6 +984,7 @@ mod tests {
                     state_tx: Some(&state_tx),
                     consumer_rx: None,
                     generation: None,
+                    on_audio_start: None,
                     mic_on_demand: false,
                 },
             )
@@ -953,6 +1040,66 @@ mod tests {
         assert!(result.is_ok());
     }
 
+    // ── Test: Existing consumer opens MIC when a new session starts ────
+
+    #[tokio::test]
+    async fn test_mic_on_demand_existing_consumer_opens_on_session_start() {
+        tokio::time::pause();
+
+        let (device, mut ctrl) = mock_device();
+        let (audio_tx, _audio_rx) = tokio_mpsc::channel(64);
+        let (state_tx, mut state_rx) = tokio::sync::watch::channel(State::Connected);
+        let (_consumer_tx, mut consumer_rx) =
+            tokio::sync::watch::channel(consumer::ConsumerEvent::Changed(1));
+        let timeouts = SessionTimeouts {
+            frame_timeout: Duration::ZERO,
+            keepalive: Duration::ZERO,
+        };
+        let caps = Capabilities {
+            version: ProtocolVersion::V0_4,
+            codecs: Codecs::ADPCM_8KHZ,
+            interaction_model: InteractionModel::OnRequest,
+            audio_frame_size: AudioFrameSize(134),
+        };
+        let mut protocol = ProtocolV04::new();
+        protocol.on_caps_resp(&caps).unwrap();
+        let streams = BleStreams {
+            ctl: device.ctl_notifications().await.unwrap(),
+            rx: device.rx_notifications().await.unwrap(),
+            events: device.connection_events().await.unwrap(),
+        };
+        let session = tokio::spawn(async move {
+            run_session(
+                &device,
+                &mut protocol,
+                streams,
+                SessionConfig {
+                    audio_tx,
+                    timeouts: &timeouts,
+                    command_rx: None,
+                    state_tx: Some(&state_tx),
+                    consumer_rx: Some(&mut consumer_rx),
+                    generation: None,
+                    on_audio_start: None,
+                    mic_on_demand: true,
+                },
+            )
+            .await
+        });
+
+        tokio::time::advance(Duration::from_millis(1)).await;
+        assert!(wait_for_state(&mut state_rx, State::Opening, Duration::from_millis(10)).await);
+        assert_eq!(
+            try_recv_all_commands(&mut ctrl.commands_rx).await,
+            vec![V04_MIC_OPEN.to_vec()]
+        );
+
+        ctrl.event_tx
+            .send(DeviceConnectionEvent::Disconnected)
+            .unwrap();
+        assert!(session.await.unwrap().is_ok());
+    }
+
     // ── Test: Consumer connect triggers MIC_OPEN when Connected ────
 
     #[tokio::test]
@@ -962,7 +1109,8 @@ mod tests {
         let (device, mut ctrl) = mock_device();
         let (audio_tx, _audio_rx) = tokio_mpsc::channel(64);
         let (state_tx, mut state_rx) = tokio::sync::watch::channel(State::Connected);
-        let (consumer_tx, mut consumer_rx) = tokio_mpsc::channel(16);
+        let (consumer_tx, mut consumer_rx) =
+            tokio::sync::watch::channel(consumer::ConsumerEvent::Changed(0));
 
         let timeouts = SessionTimeouts {
             frame_timeout: Duration::ZERO,
@@ -996,6 +1144,7 @@ mod tests {
                     state_tx: Some(&state_tx),
                     consumer_rx: Some(&mut consumer_rx),
                     generation: None,
+                    on_audio_start: None,
                     mic_on_demand: true,
                 },
             )
@@ -1008,7 +1157,6 @@ mod tests {
         // Consumer connects → should trigger MIC_OPEN and transition to Opening
         consumer_tx
             .send(consumer::ConsumerEvent::Changed(1))
-            .await
             .unwrap();
         tokio::time::advance(Duration::from_millis(1)).await;
         assert!(wait_for_state(&mut state_rx, State::Opening, Duration::from_millis(10)).await);
@@ -1033,7 +1181,8 @@ mod tests {
         let (device, mut ctrl) = mock_device();
         let (audio_tx, _audio_rx) = tokio_mpsc::channel(64);
         let (state_tx, mut state_rx) = tokio::sync::watch::channel(State::Connected);
-        let (consumer_tx, mut consumer_rx) = tokio_mpsc::channel(16);
+        let (consumer_tx, mut consumer_rx) =
+            tokio::sync::watch::channel(consumer::ConsumerEvent::Changed(0));
 
         let timeouts = SessionTimeouts {
             frame_timeout: Duration::ZERO,
@@ -1066,6 +1215,7 @@ mod tests {
                     state_tx: Some(&state_tx),
                     consumer_rx: Some(&mut consumer_rx),
                     generation: None,
+                    on_audio_start: None,
                     mic_on_demand: true,
                 },
             )
@@ -1078,7 +1228,6 @@ mod tests {
         // Consumer connects → MIC_OPEN → Opening
         consumer_tx
             .send(consumer::ConsumerEvent::Changed(1))
-            .await
             .unwrap();
         tokio::time::advance(Duration::from_millis(1)).await;
         assert!(wait_for_state(&mut state_rx, State::Opening, Duration::from_millis(10)).await);
@@ -1092,7 +1241,6 @@ mod tests {
         // All consumers disconnect → immediate MIC_CLOSE
         consumer_tx
             .send(consumer::ConsumerEvent::Changed(0))
-            .await
             .unwrap();
         tokio::time::advance(Duration::from_millis(1)).await;
         assert!(wait_for_state(&mut state_rx, State::Connected, Duration::from_millis(10)).await);
@@ -1117,7 +1265,8 @@ mod tests {
         let (device, mut ctrl) = mock_device();
         let (audio_tx, _audio_rx) = tokio_mpsc::channel(64);
         let (state_tx, mut state_rx) = tokio::sync::watch::channel(State::Connected);
-        let (consumer_tx, mut consumer_rx) = tokio_mpsc::channel(16);
+        let (consumer_tx, mut consumer_rx) =
+            tokio::sync::watch::channel(consumer::ConsumerEvent::Changed(0));
 
         let timeouts = SessionTimeouts {
             frame_timeout: Duration::ZERO,
@@ -1151,6 +1300,7 @@ mod tests {
                     state_tx: Some(&state_tx),
                     consumer_rx: Some(&mut consumer_rx),
                     generation: None,
+                    on_audio_start: None,
                     mic_on_demand: false, // disabled
                 },
             )
@@ -1163,7 +1313,6 @@ mod tests {
         // Consumer connects — should be ignored because mic_on_demand=false
         consumer_tx
             .send(consumer::ConsumerEvent::Changed(1))
-            .await
             .unwrap();
         tokio::time::advance(Duration::from_millis(10)).await;
 
@@ -1191,7 +1340,8 @@ mod tests {
         let (device, mut ctrl) = mock_device();
         let (audio_tx, _audio_rx) = tokio_mpsc::channel(64);
         let (state_tx, mut state_rx) = tokio::sync::watch::channel(State::Connected);
-        let (consumer_tx, mut consumer_rx) = tokio_mpsc::channel(16);
+        let (consumer_tx, mut consumer_rx) =
+            tokio::sync::watch::channel(consumer::ConsumerEvent::Changed(0));
 
         let timeouts = SessionTimeouts {
             frame_timeout: Duration::ZERO,
@@ -1225,6 +1375,7 @@ mod tests {
                     state_tx: Some(&state_tx),
                     consumer_rx: Some(&mut consumer_rx),
                     generation: None,
+                    on_audio_start: None,
                     mic_on_demand: true,
                 },
             )
@@ -1247,7 +1398,6 @@ mod tests {
         // Another consumer connects while already streaming — no additional MIC_OPEN
         consumer_tx
             .send(consumer::ConsumerEvent::Changed(2))
-            .await
             .unwrap();
         tokio::time::advance(Duration::from_millis(10)).await;
 
@@ -1278,7 +1428,8 @@ mod tests {
         let (device, mut ctrl) = mock_device();
         let (audio_tx, _audio_rx) = tokio_mpsc::channel(64);
         let (state_tx, mut state_rx) = tokio::sync::watch::channel(State::Connected);
-        let (consumer_tx, mut consumer_rx) = tokio_mpsc::channel(16);
+        let (consumer_tx, mut consumer_rx) =
+            tokio::sync::watch::channel(consumer::ConsumerEvent::Changed(0));
 
         let timeouts = SessionTimeouts {
             frame_timeout: Duration::ZERO,
@@ -1311,6 +1462,7 @@ mod tests {
                     state_tx: Some(&state_tx),
                     consumer_rx: Some(&mut consumer_rx),
                     generation: None,
+                    on_audio_start: None,
                     mic_on_demand: true,
                 },
             )
@@ -1322,7 +1474,6 @@ mod tests {
         // Consumer connects → MIC_OPEN → Opening
         consumer_tx
             .send(consumer::ConsumerEvent::Changed(1))
-            .await
             .unwrap();
         tokio::time::advance(Duration::from_millis(1)).await;
         assert!(wait_for_state(&mut state_rx, State::Opening, Duration::from_millis(10)).await);
@@ -1331,7 +1482,6 @@ mod tests {
         // Consumer disconnects BEFORE AUDIO_START → should close immediately
         consumer_tx
             .send(consumer::ConsumerEvent::Changed(0))
-            .await
             .unwrap();
         tokio::time::advance(Duration::from_millis(1)).await;
         assert!(wait_for_state(&mut state_rx, State::Connected, Duration::from_millis(10)).await);
@@ -1359,7 +1509,8 @@ mod tests {
         let (device, mut ctrl) = mock_device();
         let (audio_tx, _audio_rx) = tokio_mpsc::channel(64);
         let (state_tx, mut state_rx) = tokio::sync::watch::channel(State::Connected);
-        let (consumer_tx, mut consumer_rx) = tokio_mpsc::channel(16);
+        let (consumer_tx, mut consumer_rx) =
+            tokio::sync::watch::channel(consumer::ConsumerEvent::Changed(0));
 
         let timeouts = SessionTimeouts {
             frame_timeout: Duration::ZERO,
@@ -1392,6 +1543,7 @@ mod tests {
                     state_tx: Some(&state_tx),
                     consumer_rx: Some(&mut consumer_rx),
                     generation: None,
+                    on_audio_start: None,
                     mic_on_demand: true,
                 },
             )
@@ -1414,7 +1566,6 @@ mod tests {
         // PW consumer connects (count 0→1)
         consumer_tx
             .send(consumer::ConsumerEvent::Changed(1))
-            .await
             .unwrap();
         tokio::time::advance(Duration::from_millis(1)).await;
         assert_eq!(*state_rx.borrow(), State::Streaming); // still streaming
@@ -1422,7 +1573,6 @@ mod tests {
         // PW consumer disconnects (count 1→0) → closes mic regardless of how it was opened
         consumer_tx
             .send(consumer::ConsumerEvent::Changed(0))
-            .await
             .unwrap();
         tokio::time::advance(Duration::from_millis(1)).await;
         assert!(wait_for_state(&mut state_rx, State::Connected, Duration::from_millis(10)).await);
@@ -1483,6 +1633,7 @@ mod tests {
                     state_tx: Some(&state_tx),
                     consumer_rx: None,
                     generation: None,
+                    on_audio_start: None,
                     mic_on_demand: false,
                 },
             )

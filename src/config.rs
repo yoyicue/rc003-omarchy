@@ -95,7 +95,11 @@ impl Config {
     }
 
     pub fn load(path: Option<&Path>) -> Result<Self> {
+        let explicit = path.is_some();
         let path = path.map(PathBuf::from).unwrap_or_else(Self::default_path);
+        if explicit && !path.exists() {
+            anyhow::bail!("explicit config file does not exist: {}", path.display());
+        }
         let config = if path.exists() {
             let text = std::fs::read_to_string(&path)
                 .with_context(|| format!("read config {}", path.display()))?;
@@ -162,6 +166,12 @@ mod tests {
         let mut config = Config::default();
         config.audio.gain_db = 25.0;
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn explicit_missing_path_is_an_error() {
+        let path = Path::new("/definitely/not/a/config.toml");
+        assert!(Config::load(Some(path)).is_err());
     }
 
     #[test]

@@ -249,11 +249,17 @@ impl ManagedDevice {
         release_drain: Duration,
         voice_code: u16,
         mapping_enabled: bool,
+        address: Option<&str>,
     ) -> Result<Self> {
         let mut device = Device::open(path).with_context(|| format!("open {}", path.display()))?;
         let id = device.input_id();
         if id.vendor() != RC003_VENDOR_ID || id.product() != RC003_PRODUCT_ID {
             anyhow::bail!("not RC003");
+        }
+        if let Some(address) = address {
+            if !address_matches(device.unique_name().unwrap_or_default(), address) {
+                anyhow::bail!("not selected RC003");
+            }
         }
         device.set_nonblocking(true)?;
         device
@@ -312,7 +318,7 @@ pub struct InputManagerHandle {
 impl InputManagerHandle {
     #[cfg(test)]
     pub fn start() -> Result<Self> {
-        Self::start_with_release_grab(true, Duration::ZERO, KEY_F9, true)
+        Self::start_with_release_grab(true, Duration::ZERO, KEY_F9, true, None)
     }
 
     pub fn start_with_release_grab(
@@ -320,6 +326,7 @@ impl InputManagerHandle {
         release_drain: Duration,
         voice_code: u16,
         mapping_enabled: bool,
+        address: Option<String>,
     ) -> Result<Self> {
         let (shutdown_tx, shutdown_rx) = mpsc::channel();
         let join = std::thread::Builder::new()
@@ -331,6 +338,7 @@ impl InputManagerHandle {
                     release_drain,
                     voice_code,
                     mapping_enabled,
+                    address,
                 )
             })
             .context("start RC003 input thread")?;
@@ -358,6 +366,7 @@ fn run_input_manager(
     release_drain: Duration,
     voice_code: u16,
     mapping_enabled: bool,
+    address: Option<String>,
 ) {
     let mut devices: HashMap<PathBuf, ManagedDevice> = HashMap::new();
     let mut ignored_nodes: HashMap<PathBuf, (u64, u64)> = HashMap::new();
@@ -374,6 +383,7 @@ fn run_input_manager(
                 voice_code,
                 mapping_enabled,
                 &mut ignored_nodes,
+                address.as_deref(),
             );
             next_scan = Instant::now() + INPUT_SCAN_INTERVAL;
         }
@@ -412,6 +422,7 @@ fn scan_devices(
     voice_code: u16,
     mapping_enabled: bool,
     ignored_nodes: &mut HashMap<PathBuf, (u64, u64)>,
+    address: Option<&str>,
 ) {
     ignored_nodes.retain(|path, identity| node_identity(path) == Some(*identity));
     let Ok(entries) = std::fs::read_dir("/dev/input") else {
@@ -436,6 +447,7 @@ fn scan_devices(
             release_drain,
             voice_code,
             mapping_enabled,
+            address,
         ) {
             Ok(device) => {
                 tracing::info!(path = %path.display(), "RC003 input ready");
@@ -520,12 +532,22 @@ fn node_identity(path: &Path) -> Option<(u64, u64)> {
     Some((metadata.dev(), metadata.ino()))
 }
 
+fn address_matches(unique: &str, address: &str) -> bool {
+    unique.eq_ignore_ascii_case(address)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn key_event(code: u16, value: i32) -> InputEvent {
         InputEvent::new(EventType::KEY.0, code, value)
+    }
+
+    #[test]
+    fn selected_address_matches_are_case_insensitive() {
+        assert!(address_matches("c0:5d:39:fa:2a:1b", "C0:5D:39:FA:2A:1B"));
+        assert!(!address_matches("aa:bb:cc:dd:ee:ff", "C0:5D:39:FA:2A:1B"));
     }
 
     #[test]

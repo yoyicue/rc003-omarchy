@@ -88,6 +88,7 @@ struct Cli {
 struct PipeWireHandle {
     shutdown_tx: pipewire::channel::Sender<pw::SessionControl>,
     generation: Arc<AtomicU64>,
+    failure_rx: tokio::sync::mpsc::UnboundedReceiver<String>,
     join: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -97,9 +98,11 @@ impl PipeWireHandle {
         gain: f32,
         node_name: String,
         node_description: String,
-        consumer_tx: Option<tokio::sync::mpsc::Sender<consumer::ConsumerEvent>>,
-    ) -> Self {
+        consumer_tx: Option<tokio::sync::watch::Sender<consumer::ConsumerEvent>>,
+    ) -> anyhow::Result<Self> {
         let (shutdown_tx, shutdown_rx) = pipewire::channel::channel::<pw::SessionControl>();
+        let (startup_tx, startup_rx) = std::sync::mpsc::channel::<Result<(), String>>();
+        let (failure_tx, failure_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
         let generation = Arc::new(AtomicU64::new(0));
         let join = std::thread::spawn(move || {
             if let Err(error) = pw::run_pw_source(
@@ -109,19 +112,34 @@ impl PipeWireHandle {
                 &node_name,
                 &node_description,
                 shutdown_rx,
+                Some(startup_tx.clone()),
                 consumer_tx,
             ) {
-                tracing::error!("PipeWire error: {error}");
+                let message = error.to_string();
+                let _ = startup_tx.send(Err(message.clone()));
+                let _ = failure_tx.send(message);
             }
         });
-        Self {
-            shutdown_tx,
-            generation,
-            join: Some(join),
+        match startup_rx.recv_timeout(Duration::from_secs(3)) {
+            Ok(Ok(())) => Ok(Self {
+                shutdown_tx,
+                generation,
+                failure_rx,
+                join: Some(join),
+            }),
+            Ok(Err(error)) => {
+                let _ = shutdown_tx.send(pw::SessionControl::Shutdown);
+                let _ = join.join();
+                anyhow::bail!(error)
+            }
+            Err(error) => {
+                let _ = shutdown_tx.send(pw::SessionControl::Shutdown);
+                let _ = join.join();
+                anyhow::bail!("PipeWire startup timed out: {error}")
+            }
         }
     }
 }
-
 impl Drop for PipeWireHandle {
     fn drop(&mut self) {
         let _ = self.shutdown_tx.send(pw::SessionControl::Shutdown);
@@ -191,6 +209,9 @@ async fn ensure_connected(device: &bluer::Device, retry_delay: Duration) {
     }
     tracing::info!("Waiting for device to connect...");
     if let Ok(mut events) = device.events().await {
+        if matches!(device.is_connected().await, Ok(true)) {
+            return;
+        }
         while let Some(event) = futures::StreamExt::next(&mut events).await {
             if let bluer::DeviceEvent::PropertyChanged(bluer::DeviceProperty::Connected(true)) =
                 event
@@ -212,8 +233,8 @@ async fn ensure_connected(device: &bluer::Device, retry_delay: Duration) {
 
 /// Check if an error indicates the device is locked by another instance.
 fn is_device_locked_error(e: &anyhow::Error) -> bool {
-    let msg = e.to_string();
-    msg.contains("exclusive") || msg.contains("NotPermitted") || msg.contains("InProgress")
+    e.downcast_ref::<bluer::Error>()
+        .is_some_and(|error| matches!(error.kind, bluer::ErrorKind::NotPermitted))
 }
 
 /// Timeout waiting for CAPS_RESP during negotiation.
@@ -334,6 +355,7 @@ async fn main() -> anyhow::Result<()> {
             Duration::from_millis(config.audio.release_drain_ms),
             input::voice_key_code(&config.input.voice_key)?,
             config.mapping.enabled,
+            cli.device.clone(),
         )?)
     };
 
@@ -476,18 +498,18 @@ async fn main() -> anyhow::Result<()> {
         let pcm_tx = std::sync::Arc::new(ArrayQueue::new(32));
         let pcm_rx = pcm_tx.clone();
         let (consumer_tx, mut consumer_rx) = if cli.mic_on_demand {
-            let (tx, rx) = tokio::sync::mpsc::channel(16);
+            let (tx, rx) = tokio::sync::watch::channel(consumer::ConsumerEvent::Changed(0));
             (Some(tx), Some(rx))
         } else {
             (None, None)
         };
-        let _pw_handle = PipeWireHandle::new(
+        let mut _pw_handle = PipeWireHandle::new(
             pcm_rx.clone(),
             gain,
             node_name.clone(),
             node_description.clone(),
             consumer_tx,
-        );
+        )?;
 
         // Inner loop: session → reconnect (same device).
         loop {
@@ -532,6 +554,7 @@ async fn main() -> anyhow::Result<()> {
                     break 'discover;
                 }
             };
+            excluded_addrs.remove(&device.address());
             let _ = state_tx.send(atvv::State::Connected);
             let (mut session_protocol, codec) = match protocol::create_protocol(&caps) {
                 Ok((p, c)) => (p, c),
@@ -579,6 +602,15 @@ async fn main() -> anyhow::Result<()> {
                 }
             });
 
+            let on_audio_start = {
+                let shutdown_tx = _pw_handle.shutdown_tx.clone();
+                let generation = _pw_handle.generation.clone();
+                move || {
+                    let generation = generation.load(std::sync::atomic::Ordering::Relaxed);
+                    let _ = shutdown_tx.send(pw::SessionControl::Reset(generation));
+                }
+            };
+
             let session_result = tokio::select! {
                 result = atvv::run_session(
                     &ble_device,
@@ -597,9 +629,14 @@ async fn main() -> anyhow::Result<()> {
                         state_tx: Some(&state_tx),
                         consumer_rx: consumer_rx.as_mut(),
                         generation: Some(&_pw_handle.generation),
+                        on_audio_start: Some(&on_audio_start),
                         mic_on_demand: cli.mic_on_demand,
                     },
                 ) => result,
+                Some(failure) = _pw_handle.failure_rx.recv() => {
+                    tracing::error!(%failure, "PipeWire thread failed");
+                    return Err(anyhow::anyhow!(failure));
+                },
                 _ = shutdown.wait() => {
                     let mic_close = session_protocol.mic_close_cmd(
                         protocol::types::StreamId::ANY,
@@ -703,4 +740,26 @@ async fn main() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_not_permitted_counts_as_device_lock() {
+        let locked = bluer::Error {
+            kind: bluer::ErrorKind::NotPermitted,
+            message: "exclusive acquire failed".to_string(),
+        };
+        assert!(is_device_locked_error(&anyhow::Error::new(locked)));
+        let in_progress = bluer::Error {
+            kind: bluer::ErrorKind::InProgress,
+            message: "temporary disconnect".to_string(),
+        };
+        assert!(!is_device_locked_error(&anyhow::Error::new(in_progress)));
+        assert!(!is_device_locked_error(&anyhow::Error::msg(
+            "exclusive acquire failed"
+        )));
+    }
 }

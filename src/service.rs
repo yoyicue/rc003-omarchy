@@ -178,16 +178,20 @@ fn uninstall(apply: bool) -> Result<()> {
         println!("Would stop, disable, and remove {}", path.display());
         return Ok(());
     }
-    if path.exists() {
-        let content = std::fs::read_to_string(&path)?;
-        validate_owned_unit(&content)?;
+    if !path.exists() {
+        println!("{} is not installed", path.display());
+        return Ok(());
     }
-    let _ = std::process::Command::new("systemctl")
+    let content = std::fs::read_to_string(&path)?;
+    validate_owned_unit(&content)?;
+    let status = std::process::Command::new("systemctl")
         .args(["--user", "disable", "--now", SERVICE_NAME])
-        .status();
-    if path.exists() {
-        std::fs::remove_file(&path)?;
+        .status()
+        .context("systemctl --user disable --now")?;
+    if !status.success() {
+        anyhow::bail!("failed to stop and disable {SERVICE_NAME}; unit was left in place");
     }
+    std::fs::remove_file(&path)?;
     systemctl(&["daemon-reload"])?;
     println!("Removed {}", path.display());
     Ok(())

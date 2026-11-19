@@ -49,10 +49,10 @@ sudo usermod -a -G input "$USER"
 mise exec -- cargo test -- --ignored uinput_end_to_end_voice_mapping
 ```
 
-The included udev rule grants RC003 and uinput access through both `uaccess` and the `input` group:
+The included udev rule grants RC003 and uinput access through both `uaccess` and the `input` group. Its `70-` priority adds `uaccess` before systemd's `73-seat-late.rules` processes seat ACLs:
 
 ```bash
-sudo install -m 0644 udev/99-rc003-omarchy.rules /etc/udev/rules.d/
+sudo install -m 0644 udev/70-rc003-omarchy.rules /etc/udev/rules.d/
 sudo udevadm control --reload-rules
 sudo udevadm trigger --subsystem-match=input
 sudo udevadm trigger --subsystem-match=misc --sysname-match=uinput
@@ -113,13 +113,14 @@ The service uses `newgrp input -c` so the daemon starts with the required input 
 
 ## Validation status
 
-- 125 unit tests pass, plus the explicit uinput integration test.
+- 132 unit tests pass, plus the explicit uinput integration test.
 - Clippy passes with warnings denied; release build succeeds.
 - Real BlueZ negotiation passed with ATVV v1.0, 16 kHz, and 120-byte frames.
 - Superwhisper enumerates `RC003 Remote Microphone` as 16 kHz mono S16LE.
 - Virtual RC003 input is verified end to end as RightAlt/F9 down/up through evdev/uinput.
 - Physical RC003-to-Superwhisper dictation passed with RightAlt: three real recordings were transcribed and inserted by Superwhisper.
 - The systemd user service is installed and enabled with `newgrp input -c`; startup, input-group, and Bluetooth wake/reconnect acceptance have all passed.
+- Post-review Redmi checks cover SIGTERM cleanup, forced PipeWire startup failure, BlueZ busy classification, `--device` evdev matching, and on-demand recording with a persistent consumer across Bluetooth reconnect.
 
 ## References
 
