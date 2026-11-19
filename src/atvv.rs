@@ -1,6 +1,6 @@
 use std::pin::Pin;
 use std::sync::{
-    atomic::{AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
     Arc,
 };
 use std::time::Duration;
@@ -111,17 +111,22 @@ pub struct SessionConfig<'a> {
     pub consumer_rx: Option<&'a mut tokio::sync::watch::Receiver<consumer::ConsumerEvent>>,
     pub generation: Option<&'a Arc<AtomicU64>>,
     pub tail_expiration: Option<&'a TailDeadline>,
+    pub streaming: Option<&'a Arc<AtomicBool>>,
     pub mic_on_demand: bool,
 }
 
 struct InvalidateGenerationOnExit<'a> {
     generation: Option<&'a Arc<AtomicU64>>,
+    streaming: Option<&'a Arc<AtomicBool>>,
 }
 
 impl Drop for InvalidateGenerationOnExit<'_> {
     fn drop(&mut self) {
         if let Some(generation) = self.generation {
             generation.fetch_add(1, Ordering::Relaxed);
+        }
+        if let Some(streaming) = self.streaming {
+            streaming.store(false, Ordering::Relaxed);
         }
     }
 }
@@ -158,11 +163,15 @@ pub async fn run_session(
         mut consumer_rx,
         generation,
         tail_expiration,
+        streaming,
         mic_on_demand,
     } = config;
     // Normal AUDIO_STOP keeps the same generation so its tail can drain. Any
     // connection exit, including future cancellation, invalidates queued PCM.
-    let _invalidate_generation = InvalidateGenerationOnExit { generation };
+    let _invalidate_generation = InvalidateGenerationOnExit {
+        generation,
+        streaming,
+    };
     let mut state = State::Connected;
 
     // set_state takes &mut State as a parameter rather than capturing it because
@@ -201,6 +210,9 @@ pub async fn run_session(
                     tail_expiration.arm_after(AUDIO_TAIL_DRAIN_TIMEOUT);
                 }
                 stopped_generation = Some(stream_generation);
+            }
+            if let Some(streaming) = streaming {
+                streaming.store(false, Ordering::Relaxed);
             }
             set_state(State::Connected, &mut $state);
             $last_seq = None;
@@ -280,6 +292,9 @@ pub async fn run_session(
                         last_seq = None;
                         current_stream_id = Some(stream_id);
                         set_state(State::Streaming, &mut state);
+                        if let Some(streaming) = streaming {
+                            streaming.store(true, Ordering::Relaxed);
+                        }
                         // Reset keepalive timer when streaming starts/restarts
                         if keepalive_enabled {
                             keepalive_timer.as_mut().reset(Instant::now() + keepalive_interval);
@@ -707,6 +722,7 @@ mod tests {
                     consumer_rx: None,
                     generation: None,
                     tail_expiration: None,
+                    streaming: None,
                     mic_on_demand: false,
                 },
             )
@@ -817,6 +833,7 @@ mod tests {
                     consumer_rx: None,
                     generation: None,
                     tail_expiration: None,
+                    streaming: None,
                     mic_on_demand: false,
                 },
             )
@@ -906,6 +923,7 @@ mod tests {
                     consumer_rx: None,
                     generation: None,
                     tail_expiration: None,
+                    streaming: None,
                     mic_on_demand: false,
                 },
             )
@@ -933,6 +951,8 @@ mod tests {
         let (audio_tx, mut audio_rx) = tokio_mpsc::channel(64);
         let (state_tx, state_rx) = tokio::sync::watch::channel(State::Connected);
         let generation = Arc::new(AtomicU64::new(0));
+        let streaming = Arc::new(AtomicBool::new(false));
+        let streaming_for_session = streaming.clone();
         let tail_expiration = TailDeadline::new();
         let timeouts = SessionTimeouts {
             frame_timeout: Duration::ZERO,
@@ -967,6 +987,7 @@ mod tests {
                     consumer_rx: None,
                     generation: Some(&generation_for_session),
                     tail_expiration: Some(&tail_for_session),
+                    streaming: Some(&streaming_for_session),
                     mic_on_demand: false,
                 },
             )
@@ -977,6 +998,7 @@ mod tests {
         ctrl.ctl_tx.send(audio_start.to_vec()).unwrap();
         tokio::time::advance(Duration::from_millis(1)).await;
         assert_eq!(generation.load(Ordering::Relaxed), 1);
+        assert!(streaming.load(Ordering::Relaxed));
 
         ctrl.rx_tx.send(audio_packet(vec![0; 120], 1)).unwrap();
         tokio::time::advance(Duration::from_millis(1)).await;
@@ -1023,6 +1045,7 @@ mod tests {
         tokio::time::advance(Duration::from_millis(1)).await;
         assert_eq!(generation.load(Ordering::Relaxed), 4);
         assert!(tail_expiration.is_armed());
+        assert!(!streaming.load(Ordering::Relaxed));
         let first_deadline = tail_expiration.deadline_ms();
         std::thread::sleep(Duration::from_millis(3));
         ctrl.ctl_tx.send(vec![CTL_START_SEARCH]).unwrap();
@@ -1056,12 +1079,14 @@ mod tests {
         tokio::time::advance(Duration::from_millis(1)).await;
         assert_eq!(generation.load(Ordering::Relaxed), 5);
         assert!(!tail_expiration.is_armed());
+        assert!(streaming.load(Ordering::Relaxed));
         ctrl.event_tx
             .send(DeviceConnectionEvent::Disconnected)
             .unwrap();
         assert!(session.await.unwrap().is_ok());
         assert!(generation.load(Ordering::Relaxed) > queued.generation);
         assert_eq!(generation.load(Ordering::Relaxed), 6);
+        assert!(!streaming.load(Ordering::Relaxed));
     }
 
     #[tokio::test]
@@ -1102,6 +1127,7 @@ mod tests {
                     consumer_rx: None,
                     generation: None,
                     tail_expiration: None,
+                    streaming: None,
                     mic_on_demand: false,
                 },
             )
@@ -1161,6 +1187,7 @@ mod tests {
                     consumer_rx: None,
                     generation: None,
                     tail_expiration: None,
+                    streaming: None,
                     mic_on_demand: false,
                 },
             )
@@ -1256,6 +1283,7 @@ mod tests {
                     consumer_rx: Some(&mut consumer_rx),
                     generation: None,
                     tail_expiration: None,
+                    streaming: None,
                     mic_on_demand: true,
                 },
             )
@@ -1322,6 +1350,7 @@ mod tests {
                     consumer_rx: Some(&mut consumer_rx),
                     generation: None,
                     tail_expiration: None,
+                    streaming: None,
                     mic_on_demand: true,
                 },
             )
@@ -1395,6 +1424,7 @@ mod tests {
                     consumer_rx: Some(&mut consumer_rx),
                     generation: None,
                     tail_expiration: None,
+                    streaming: None,
                     mic_on_demand: true,
                 },
             )
@@ -1482,6 +1512,7 @@ mod tests {
                     consumer_rx: Some(&mut consumer_rx),
                     generation: None,
                     tail_expiration: None,
+                    streaming: None,
                     mic_on_demand: false, // disabled
                 },
             )
@@ -1559,6 +1590,7 @@ mod tests {
                     consumer_rx: Some(&mut consumer_rx),
                     generation: None,
                     tail_expiration: None,
+                    streaming: None,
                     mic_on_demand: true,
                 },
             )
@@ -1648,6 +1680,7 @@ mod tests {
                     consumer_rx: Some(&mut consumer_rx),
                     generation: None,
                     tail_expiration: None,
+                    streaming: None,
                     mic_on_demand: true,
                 },
             )
@@ -1733,6 +1766,7 @@ mod tests {
                     consumer_rx: Some(&mut consumer_rx),
                     generation: Some(&generation_for_session),
                     tail_expiration: None,
+                    streaming: None,
                     mic_on_demand: true,
                 },
             )
@@ -1827,6 +1861,7 @@ mod tests {
                     consumer_rx: None,
                     generation: None,
                     tail_expiration: None,
+                    streaming: None,
                     mic_on_demand: false,
                 },
             )

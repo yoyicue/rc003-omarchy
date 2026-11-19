@@ -19,7 +19,10 @@ use clap::Parser;
 use crossbeam_queue::ArrayQueue;
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::{atomic::AtomicU64, Arc};
+use std::sync::{
+    atomic::{AtomicBool, AtomicU64},
+    Arc,
+};
 use std::time::Duration;
 
 /// Capacity of the async channel between the ATVV session and the decoder task.
@@ -90,6 +93,7 @@ struct Cli {
 struct PipeWireHandle {
     shutdown_tx: pipewire::channel::Sender<pw::SessionControl>,
     generation: Arc<AtomicU64>,
+    streaming: Arc<AtomicBool>,
     tail_expiration: audio::TailDeadline,
     failure_rx: Option<tokio::sync::watch::Receiver<Option<String>>>,
     join: Option<std::thread::JoinHandle<()>>,
@@ -133,6 +137,7 @@ impl PipeWireHandle {
             Ok(Ok(())) => Ok(Self {
                 shutdown_tx,
                 generation,
+                streaming: Arc::new(AtomicBool::new(false)),
                 tail_expiration,
                 failure_rx: Some(failure_rx),
                 join: Some(join),
@@ -629,7 +634,12 @@ async fn main() -> anyhow::Result<()> {
 
         // Inner loop: session → reconnect (same device).
         loop {
-            let ble_device = ble::BluerDevice::new(&device, &chars, _pw_handle.generation.clone());
+            let ble_device = ble::BluerDevice::new(
+                &device,
+                &chars,
+                _pw_handle.generation.clone(),
+                _pw_handle.streaming.clone(),
+            );
 
             // Negotiate protocol version
             let (caps, streams) = tokio::select! {
@@ -746,6 +756,7 @@ async fn main() -> anyhow::Result<()> {
                         },
                         generation: Some(&_pw_handle.generation),
                         tail_expiration: Some(&_pw_handle.tail_expiration),
+                        streaming: Some(&_pw_handle.streaming),
                         mic_on_demand: cli.mic_on_demand,
                     },
                 ) => result,

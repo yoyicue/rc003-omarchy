@@ -116,6 +116,7 @@ async fn coordinate_notifications(
     ctl: bluer::gatt::CharacteristicReader,
     rx: bluer::gatt::CharacteristicReader,
     generation: Arc<AtomicU64>,
+    streaming: Arc<AtomicBool>,
     queue: Arc<NotificationQueue>,
 ) {
     loop {
@@ -125,7 +126,12 @@ async fn coordinate_notifications(
                 match result {
                     Ok(data) => {
                         let Some(data) = notification_payload(data) else { break };
-                        if !data.is_empty() && data[0] == 0x04
+                        if !data.is_empty() && data[0] == 0x00 && streaming.load(Ordering::Relaxed)
+                            && !drain_audio_before_start(|| rx.try_recv(), &generation, &queue).await
+                        {
+                            break;
+                        }
+                        if !data.is_empty() && data[0] == 0x04 && streaming.load(Ordering::Relaxed)
                             && !drain_audio_before_start(|| rx.try_recv(), &generation, &queue).await
                         {
                             break;
@@ -225,14 +231,21 @@ pub struct BluerDevice<'a> {
     pub device: &'a Device,
     pub chars: &'a AtvvChars,
     pub generation: Arc<AtomicU64>,
+    pub streaming: Arc<AtomicBool>,
 }
 
 impl<'a> BluerDevice<'a> {
-    pub fn new(device: &'a Device, chars: &'a AtvvChars, generation: Arc<AtomicU64>) -> Self {
+    pub fn new(
+        device: &'a Device,
+        chars: &'a AtvvChars,
+        generation: Arc<AtomicU64>,
+        streaming: Arc<AtomicBool>,
+    ) -> Self {
         Self {
             device,
             chars,
             generation,
+            streaming,
         }
     }
 }
@@ -271,9 +284,10 @@ impl BleDevice for BluerDevice<'_> {
             tracing::debug!("RX AcquireNotify: exclusive access, MTU={}", rx.mtu());
             let queue = Arc::new(NotificationQueue::default());
             let generation = self.generation.clone();
+            let streaming = self.streaming.clone();
             let task_queue = queue.clone();
             let task = tokio::spawn(async move {
-                coordinate_notifications(ctl, rx, generation, task_queue.clone()).await;
+                coordinate_notifications(ctl, rx, generation, streaming, task_queue.clone()).await;
                 task_queue.close();
             });
             Ok(audio_stream(task, queue))
@@ -621,6 +635,37 @@ mod tests {
             };
             assert_eq!(packet.data, vec![expected]);
             assert_eq!(packet.generation, 0);
+        }
+        assert!(matches!(
+            queue.next().await,
+            Some(SessionNotification::Control(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn pre_stop_tail_is_delivered_before_control() {
+        let queue = NotificationQueue::default();
+        let generation = AtomicU64::new(1);
+        let mut packets = VecDeque::from([Ok(vec![1]), Ok(vec![2]), Ok(vec![3]), Ok(vec![4])]);
+        assert!(
+            drain_audio_before_start(
+                || {
+                    packets.pop_front().unwrap_or_else(|| {
+                        Err(std::io::Error::from(std::io::ErrorKind::WouldBlock))
+                    })
+                },
+                &generation,
+                &queue,
+            )
+            .await
+        );
+        queue.push(SessionNotification::Control(vec![0x00])).await;
+        for expected in [1, 2, 3, 4] {
+            let Some(SessionNotification::Audio(packet)) = queue.next().await else {
+                panic!("expected audio");
+            };
+            assert_eq!(packet.data, vec![expected]);
+            assert_eq!(packet.generation, 1);
         }
         assert!(matches!(
             queue.next().await,
