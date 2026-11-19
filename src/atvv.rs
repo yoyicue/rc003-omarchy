@@ -184,12 +184,14 @@ pub async fn run_session(
 
     macro_rules! close_mic_reset {
         ($state:ident, $last_seq:ident, $current_stream_id:ident) => {
+            if $state != State::Connected {
+                if let Some(tail_expiration) = tail_expiration {
+                    tail_expiration.arm_after(AUDIO_TAIL_DRAIN_TIMEOUT);
+                }
+            }
             set_state(State::Connected, &mut $state);
             $last_seq = None;
             $current_stream_id = None;
-            if let Some(tail_expiration) = tail_expiration {
-                tail_expiration.arm_after(AUDIO_TAIL_DRAIN_TIMEOUT);
-            }
         };
     }
 
@@ -233,14 +235,14 @@ pub async fn run_session(
                     CtlEvent::AudioStop { reason } => {
                         tracing::info!("AUDIO_STOP (reason={:?})", reason);
                         // For HTT button release, remote already stopped — don't send `MIC_CLOSE`
-                        if !matches!(reason, AudioStopReason::HttButtonRelease)
-                            && state == State::Streaming
-                        {
-                            let sid = current_stream_id.unwrap_or(StreamId::MIC_OPEN);
+                        let should_close = !matches!(reason, AudioStopReason::HttButtonRelease)
+                            && state == State::Streaming;
+                        let sid = current_stream_id.unwrap_or(StreamId::MIC_OPEN);
+                        close_mic_reset!(state, last_seq, current_stream_id);
+                        if should_close {
                             ble.write_command(&protocol.mic_close_cmd(sid)).await?;
                             tracing::info!("Sent MIC_CLOSE");
                         }
-                        close_mic_reset!(state, last_seq, current_stream_id);
                     }
                     CtlEvent::AudioStart { reason, codec, stream_id } => {
                         tracing::info!("AUDIO_START (reason={:?}, codec={:?}, stream_id={:?})", reason, codec, stream_id);
@@ -928,6 +930,10 @@ mod tests {
         tokio::time::advance(Duration::from_millis(1)).await;
         assert_eq!(generation.load(Ordering::Relaxed), 1);
         assert!(tail_expiration.is_armed());
+        let first_deadline = tail_expiration.deadline_ms();
+        ctrl.ctl_tx.send(vec![CTL_AUDIO_STOP]).unwrap();
+        tokio::time::advance(Duration::from_millis(1)).await;
+        assert_eq!(tail_expiration.deadline_ms(), first_deadline);
 
         ctrl.ctl_tx.send(vec![CTL_AUDIO_START]).unwrap();
         tokio::time::advance(Duration::from_millis(1)).await;

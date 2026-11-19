@@ -114,7 +114,7 @@ The service uses `newgrp input -c` so the daemon starts with the required input 
 ## Validation status
 
 - Previous Redmi baseline: 140 unit tests plus the explicit uinput integration test; Clippy passed with warnings denied and the release build succeeded.
-- Latest lifecycle changes: 148 unit tests plus the explicit uinput integration test pass on Redmi; Clippy and the release build pass. Default-mode consumer switching, intentional source teardown, and PipeWire restart recovery while Bluetooth is offline have also been verified on hardware. A fresh physical RC003-to-Superwhisper dictation was transcribed and inserted successfully.
+- Latest lifecycle changes: 149 unit tests plus the explicit uinput integration test pass on Redmi; Clippy and the release build pass. Default-mode consumer switching, intentional source teardown, and PipeWire restart recovery while Bluetooth is offline have also been verified on hardware. A fresh physical RC003-to-Superwhisper dictation was transcribed and inserted successfully.
 - Real BlueZ negotiation passed with ATVV v1.0, 16 kHz, and 120-byte frames.
 - Superwhisper enumerates `RC003 Remote Microphone` as 16 kHz mono S16LE.
 - Virtual RC003 input is verified end to end as RightAlt/F9 down/up through evdev/uinput.

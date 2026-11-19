@@ -30,6 +30,11 @@ impl TailDeadline {
         self.deadline_ms.load(Ordering::Relaxed) != 0
     }
 
+    #[cfg(test)]
+    pub fn deadline_ms(&self) -> u64 {
+        self.deadline_ms.load(Ordering::Relaxed)
+    }
+
     pub fn expire_if_due(&self) -> bool {
         self.expire_at(self.started.elapsed())
     }

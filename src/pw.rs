@@ -62,9 +62,14 @@ fn sync_consumer_generation(generation: &AtomicU64, previous: u32, current: u32)
     }
 }
 
+fn advance_generation_if_current(generation: &AtomicU64, current: u64) {
+    let _ = generation.compare_exchange(current, current + 1, Ordering::Relaxed, Ordering::Relaxed);
+}
+
 fn expire_tail_generation(tail: &crate::audio::TailDeadline, generation: &AtomicU64) {
+    let current = generation.load(Ordering::Relaxed);
     if tail.expire_if_due() {
-        generation.fetch_add(1, Ordering::Relaxed);
+        advance_generation_if_current(generation, current);
     }
 }
 
@@ -540,6 +545,15 @@ mod tests {
         sync_consumer_generation(&generation, 0, 1);
         assert_eq!(generation.load(Ordering::Relaxed), 1);
         sync_consumer_generation(&generation, 1, 0);
+        assert_eq!(generation.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn stale_expiry_does_not_advance_a_new_recording() {
+        let generation = AtomicU64::new(1);
+        let expired_generation = generation.load(Ordering::Relaxed);
+        generation.fetch_add(1, Ordering::Relaxed);
+        advance_generation_if_current(&generation, expired_generation);
         assert_eq!(generation.load(Ordering::Relaxed), 2);
     }
 
