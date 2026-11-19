@@ -9,7 +9,7 @@
 - M4：实现完成，13 键及 RightAlt 已通过真机验证。
 - M5：完成。服务已通过 `newgrp input -c` 安装并启用，启动权限和遥控器断线后的自动恢复均已通过验收。
 
-此前 Redmi 基线：140 个单元测试、显式 uinput 集成测试、Clippy（warnings denied）和 release build 全部通过。第九轮有 123 项、第十轮有 124 项可移植测试通过；完整 Redmi 验证要求见第 16、17 节。
+此前 Redmi 基线：140 个单元测试、显式 uinput 集成测试、Clippy（warnings denied）和 release build 全部通过。第九、十轮分别有 123、124 项可移植测试通过；第十一轮已有 148 个单元测试及显式 uinput 集成测试在 Redmi 通过，详见第 18 节。
 
 
 ## 1. 验证原则
@@ -228,3 +228,10 @@
 - 发现、首次特征解析、重连特征解析及厂商握手的嵌套等待全部与故障通知竞争，不再被 sleep 屏蔽。
 
 当前验证：rustfmt 和差异检查通过；124 项可移植测试在 macOS 全部通过。项目完整 144 项单元测试、Clippy、release build 和 Redmi 真机复验仍待中午设备恢复后执行。本轮修复尚未安装到 Redmi。
+
+## 18. 第十一轮 review 回归覆盖
+
+- 默认和按需模式都始终监听 PipeWire 消费者，输出侧在每次真实 `1→0` 时推进 generation，覆盖 watch 合并的快速 `1→0→1`。
+- 新增共享 `TailDeadline`，以单调时钟和原子 compare-exchange 管理尾音期限；输出回调独立使过期 PCM 失效，不等待 BLE 写入或 ATVV 定时器。
+
+Redmi 验证：148 个单元测试及显式 uinput 集成测试通过，Clippy、release build 和五项 `doctor` 通过。默认模式实测消费者计数 `1→0→1`；蓝牙离线期间重启 PipeWire 会以状态 1 退出并由 systemd 换新 PID，恢复后五项检查通过。第二实例正常销毁旧音源后继续发现，并在占用解除 5 秒后自动完成协商。新二进制已安装到 `~/.local/bin/rc003-omarchy`，服务恢复为 enabled/active。随后通过实体语音键完成一次真实 HoldToTalk 听写，日志确认完整 AUDIO_START/AUDIO_STOP，Superwhisper 新增一条来自 `RC003 Remote Microphone` 的识别记录并成功上屏。

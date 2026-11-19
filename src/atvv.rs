@@ -10,6 +10,7 @@ use futures::{Stream, StreamExt};
 use tokio::sync::mpsc;
 use tokio::time::{self, Instant};
 
+use crate::audio::TailDeadline;
 use crate::consumer;
 use crate::protocol::types::{AudioFrame, AudioStopReason, CtlEvent, StreamId};
 use crate::protocol::Protocol;
@@ -101,6 +102,7 @@ pub struct SessionConfig<'a> {
     pub state_tx: Option<&'a tokio::sync::watch::Sender<State>>,
     pub consumer_rx: Option<&'a mut tokio::sync::watch::Receiver<consumer::ConsumerEvent>>,
     pub generation: Option<&'a Arc<AtomicU64>>,
+    pub tail_expiration: Option<&'a TailDeadline>,
     pub mic_on_demand: bool,
 }
 
@@ -147,6 +149,7 @@ pub async fn run_session(
         state_tx,
         mut consumer_rx,
         generation,
+        tail_expiration,
         mic_on_demand,
     } = config;
     // Normal AUDIO_STOP keeps the same generation so its tail can drain. Any
@@ -179,13 +182,14 @@ pub async fn run_session(
         }
     }
 
-    let mut tail_deadline: Option<Instant> = None;
     macro_rules! close_mic_reset {
         ($state:ident, $last_seq:ident, $current_stream_id:ident) => {
             set_state(State::Connected, &mut $state);
             $last_seq = None;
             $current_stream_id = None;
-            tail_deadline = Some(Instant::now() + AUDIO_TAIL_DRAIN_TIMEOUT);
+            if let Some(tail_expiration) = tail_expiration {
+                tail_expiration.arm_after(AUDIO_TAIL_DRAIN_TIMEOUT);
+            }
         };
     }
 
@@ -240,7 +244,9 @@ pub async fn run_session(
                     }
                     CtlEvent::AudioStart { reason, codec, stream_id } => {
                         tracing::info!("AUDIO_START (reason={:?}, codec={:?}, stream_id={:?})", reason, codec, stream_id);
-                        tail_deadline = None;
+                        if let Some(tail_expiration) = tail_expiration {
+                            tail_expiration.clear();
+                        }
                         if let Some(generation) = generation {
                             generation.fetch_add(1, Ordering::Relaxed);
                         }
@@ -396,7 +402,7 @@ pub async fn run_session(
                             }
                         }
                         if count == 0 {
-                            let invalidate_tail = tail_deadline.is_some()
+                            let invalidate_tail = tail_expiration.is_some_and(|tail| tail.is_armed())
                                 || matches!(state, State::Streaming | State::Opening);
                             if state == State::Streaming || state == State::Opening {
                                 tracing::info!("All consumers disconnected, closing mic");
@@ -405,26 +411,15 @@ pub async fn run_session(
                                 close_mic_reset!(state, last_seq, current_stream_id);
                             }
                             if invalidate_tail {
-                                tail_deadline = None;
+                                if let Some(tail_expiration) = tail_expiration {
+                                    tail_expiration.clear();
+                                }
                                 if let Some(generation) = generation {
                                     generation.fetch_add(1, Ordering::Relaxed);
                                 }
                             }
                         }
                     }
-                }
-            }
-            () = async {
-                if let Some(deadline) = tail_deadline {
-                    time::sleep_until(deadline).await;
-                } else {
-                    std::future::pending::<()>().await;
-                }
-            } => {
-                tail_deadline = None;
-                if let Some(generation) = generation {
-                    generation.fetch_add(1, Ordering::Relaxed);
-                    tracing::debug!("Audio tail drain expired; invalidated remaining PCM");
                 }
             }
             // Keepalive: protocol handles the version-appropriate command
@@ -662,6 +657,7 @@ mod tests {
                     state_tx: Some(&state_tx),
                     consumer_rx: None,
                     generation: None,
+                    tail_expiration: None,
                     mic_on_demand: false,
                 },
             )
@@ -767,6 +763,7 @@ mod tests {
                     state_tx: Some(&state_tx),
                     consumer_rx: None,
                     generation: None,
+                    tail_expiration: None,
                     mic_on_demand: false,
                 },
             )
@@ -853,6 +850,7 @@ mod tests {
                     state_tx: Some(&state_tx),
                     consumer_rx: None,
                     generation: None,
+                    tail_expiration: None,
                     mic_on_demand: false,
                 },
             )
@@ -880,6 +878,7 @@ mod tests {
         let (audio_tx, mut audio_rx) = tokio_mpsc::channel(64);
         let (state_tx, _state_rx) = tokio::sync::watch::channel(State::Connected);
         let generation = Arc::new(AtomicU64::new(0));
+        let tail_expiration = TailDeadline::new();
         let timeouts = SessionTimeouts {
             frame_timeout: Duration::ZERO,
             keepalive: Duration::ZERO,
@@ -897,6 +896,7 @@ mod tests {
         let events = device.connection_events().await.unwrap();
         let streams = BleStreams { ctl, rx, events };
         let generation_for_session = generation.clone();
+        let tail_for_session = tail_expiration.clone();
         let session = tokio::spawn(async move {
             run_session(
                 &device,
@@ -909,6 +909,7 @@ mod tests {
                     state_tx: Some(&state_tx),
                     consumer_rx: None,
                     generation: Some(&generation_for_session),
+                    tail_expiration: Some(&tail_for_session),
                     mic_on_demand: false,
                 },
             )
@@ -926,21 +927,18 @@ mod tests {
         ctrl.ctl_tx.send(vec![CTL_AUDIO_STOP]).unwrap();
         tokio::time::advance(Duration::from_millis(1)).await;
         assert_eq!(generation.load(Ordering::Relaxed), 1);
-        tokio::time::advance(Duration::from_millis(999)).await;
-        assert_eq!(generation.load(Ordering::Relaxed), 1);
-        tokio::time::advance(Duration::from_millis(2)).await;
-        tokio::task::yield_now().await;
-        assert_eq!(generation.load(Ordering::Relaxed), 2);
+        assert!(tail_expiration.is_armed());
 
         ctrl.ctl_tx.send(vec![CTL_AUDIO_START]).unwrap();
         tokio::time::advance(Duration::from_millis(1)).await;
-        assert_eq!(generation.load(Ordering::Relaxed), 3);
+        assert_eq!(generation.load(Ordering::Relaxed), 2);
+        assert!(!tail_expiration.is_armed());
         ctrl.event_tx
             .send(DeviceConnectionEvent::Disconnected)
             .unwrap();
         assert!(session.await.unwrap().is_ok());
         assert!(generation.load(Ordering::Relaxed) > queued.generation);
-        assert_eq!(generation.load(Ordering::Relaxed), 4);
+        assert_eq!(generation.load(Ordering::Relaxed), 3);
     }
 
     #[tokio::test]
@@ -978,6 +976,7 @@ mod tests {
                     state_tx: Some(&state_tx),
                     consumer_rx: None,
                     generation: None,
+                    tail_expiration: None,
                     mic_on_demand: false,
                 },
             )
@@ -1033,6 +1032,7 @@ mod tests {
                     state_tx: Some(&state_tx),
                     consumer_rx: None,
                     generation: None,
+                    tail_expiration: None,
                     mic_on_demand: false,
                 },
             )
@@ -1128,6 +1128,7 @@ mod tests {
                     state_tx: Some(&state_tx),
                     consumer_rx: Some(&mut consumer_rx),
                     generation: None,
+                    tail_expiration: None,
                     mic_on_demand: true,
                 },
             )
@@ -1191,6 +1192,7 @@ mod tests {
                     state_tx: Some(&state_tx),
                     consumer_rx: Some(&mut consumer_rx),
                     generation: None,
+                    tail_expiration: None,
                     mic_on_demand: true,
                 },
             )
@@ -1261,6 +1263,7 @@ mod tests {
                     state_tx: Some(&state_tx),
                     consumer_rx: Some(&mut consumer_rx),
                     generation: None,
+                    tail_expiration: None,
                     mic_on_demand: true,
                 },
             )
@@ -1345,6 +1348,7 @@ mod tests {
                     state_tx: Some(&state_tx),
                     consumer_rx: Some(&mut consumer_rx),
                     generation: None,
+                    tail_expiration: None,
                     mic_on_demand: false, // disabled
                 },
             )
@@ -1419,6 +1423,7 @@ mod tests {
                     state_tx: Some(&state_tx),
                     consumer_rx: Some(&mut consumer_rx),
                     generation: None,
+                    tail_expiration: None,
                     mic_on_demand: true,
                 },
             )
@@ -1505,6 +1510,7 @@ mod tests {
                     state_tx: Some(&state_tx),
                     consumer_rx: Some(&mut consumer_rx),
                     generation: None,
+                    tail_expiration: None,
                     mic_on_demand: true,
                 },
             )
@@ -1587,6 +1593,7 @@ mod tests {
                     state_tx: Some(&state_tx),
                     consumer_rx: Some(&mut consumer_rx),
                     generation: Some(&generation_for_session),
+                    tail_expiration: None,
                     mic_on_demand: true,
                 },
             )
@@ -1677,6 +1684,7 @@ mod tests {
                     state_tx: Some(&state_tx),
                     consumer_rx: None,
                     generation: None,
+                    tail_expiration: None,
                     mic_on_demand: false,
                 },
             )

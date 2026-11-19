@@ -56,6 +56,18 @@ fn sync_generation(pending: &mut Vec<i16>, previous: &mut u64, current: u64) {
     }
 }
 
+fn sync_consumer_generation(generation: &AtomicU64, previous: u32, current: u32) {
+    if previous > 0 && current == 0 {
+        generation.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+fn expire_tail_generation(tail: &crate::audio::TailDeadline, generation: &AtomicU64) {
+    if tail.expire_if_due() {
+        generation.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
 fn stream_failure(old: &StreamState, new: &StreamState, shutting_down: bool) -> Option<String> {
     if shutting_down {
         return None;
@@ -79,6 +91,7 @@ fn stream_failure(old: &StreamState, new: &StreamState, shutting_down: bool) -> 
 pub fn run_pw_source(
     audio_rx: Arc<ArrayQueue<PcmFrame>>,
     generation: Arc<AtomicU64>,
+    tail_expiration: crate::audio::TailDeadline,
     gain_db: f32,
     sample_rate: u32,
     node_name: &str,
@@ -141,6 +154,7 @@ pub fn run_pw_source(
     let our_node_id: std::rc::Rc<std::cell::Cell<u32>> =
         std::rc::Rc::new(std::cell::Cell::new(u32::MAX));
 
+    let consumer_generation = generation.clone();
     let mut startup_tx = startup_tx;
     let _listener = stream
         .add_local_listener_with_user_data(())
@@ -179,6 +193,7 @@ pub fn run_pw_source(
             let mut buf = Vec::new();
             let mut previous_generation = 0;
             move |stream: &Stream, _| {
+                expire_tail_generation(&tail_expiration, &generation);
                 sync_generation(
                     &mut buf,
                     &mut previous_generation,
@@ -330,7 +345,9 @@ pub fn run_pw_source(
                     .values()
                     .filter(|other_node| monitors.get(other_node) != Some(&true))
                     .count() as u32;
-                if count != last_count.get() {
+                let previous = last_count.get();
+                if count != previous {
+                    sync_consumer_generation(&consumer_generation, previous, count);
                     last_count.set(count);
                     tracing::debug!("PipeWire consumer count: {count}");
                     if let Err(e) = consumer_tx.send(crate::consumer::ConsumerEvent::Changed(count))
@@ -511,6 +528,31 @@ mod tests {
         assert_eq!(pending, vec![20, 21]);
         sync_generation(&mut pending, &mut generation, 1);
         assert_eq!(pending, vec![20, 21]);
+    }
+
+    #[test]
+    fn every_last_consumer_disconnect_invalidates_audio() {
+        let generation = AtomicU64::new(0);
+        sync_consumer_generation(&generation, 0, 1);
+        assert_eq!(generation.load(Ordering::Relaxed), 0);
+        sync_consumer_generation(&generation, 1, 0);
+        assert_eq!(generation.load(Ordering::Relaxed), 1);
+        sync_consumer_generation(&generation, 0, 1);
+        assert_eq!(generation.load(Ordering::Relaxed), 1);
+        sync_consumer_generation(&generation, 1, 0);
+        assert_eq!(generation.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn output_expiry_invalidates_tail_without_ble() {
+        let generation = AtomicU64::new(0);
+        let tail = crate::audio::TailDeadline::new();
+        tail.arm_after(std::time::Duration::from_millis(1));
+        std::thread::sleep(std::time::Duration::from_millis(3));
+        expire_tail_generation(&tail, &generation);
+        assert_eq!(generation.load(Ordering::Relaxed), 1);
+        expire_tail_generation(&tail, &generation);
+        assert_eq!(generation.load(Ordering::Relaxed), 1);
     }
 
     #[test]

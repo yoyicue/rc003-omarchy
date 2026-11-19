@@ -131,4 +131,4 @@ ATVVoice 已下载到 `~/Work/tries/atvvoice`，其 `src/pw.rs` 是本项目原�
 
 ## 11. 跨会话虚拟源生命周期
 
-`rc003-omarchy` 的 PipeWire 源在进程生命周期内常驻。BLE 重连只结束当前 ATVV 会话并替换 PCM 生产者，不销毁或重新创建虚拟源。每次 `AUDIO_START` 都通过 `Arc<AtomicU64>` 推进会话编号；正常 `AUDIO_STOP` 最多保留一秒尾音，最后一个消费者离开会立即使剩余尾音失效，任何连接退出或会话取消也通过退出守卫使旧 PCM 失效。实时音频回调独占缓冲，主循环不与其共享 `RefCell` 或 `Cell`。PipeWire 只有进入 Paused 或 Streaming 才确认启动成功；watch 保存最新故障状态并覆盖所有嵌套退避。主动销毁旧音源前先注销对应 watch，正常通道关闭不会误判为故障，已发生的真实故障仍会保留并返回非零状态。协商出的采样率不是 16 kHz 时会拒绝运行。
+`rc003-omarchy` 的 PipeWire 源在进程生命周期内常驻。BLE 重连只结束当前 ATVV 会话并替换 PCM 生产者，不销毁或重新创建虚拟源。两种模式都始终监听 PipeWire 消费者；每次真实 `1→0` 都在输出侧直接推进 generation，即使 watch 随后合并了 `1→0→1`，旧 PCM 也已失效。ATVV 在正常停止时只设置共享尾音截止时间，输出回调使用单调时钟独立检查，一秒期限不受 BLE 写入阻塞影响；compare-exchange 防止过期清理覆盖新会话。连接退出或会话取消同样使旧 PCM 失效。主动销毁旧音源前注销故障 watch，正常关闭不报错，真实故障仍返回非零状态。

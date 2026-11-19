@@ -2,6 +2,7 @@
 
 mod adpcm;
 mod atvv;
+mod audio;
 mod ble;
 mod commands;
 mod config;
@@ -89,6 +90,7 @@ struct Cli {
 struct PipeWireHandle {
     shutdown_tx: pipewire::channel::Sender<pw::SessionControl>,
     generation: Arc<AtomicU64>,
+    tail_expiration: audio::TailDeadline,
     failure_rx: Option<tokio::sync::watch::Receiver<Option<String>>>,
     join: Option<std::thread::JoinHandle<()>>,
 }
@@ -106,10 +108,13 @@ impl PipeWireHandle {
         let (failure_tx, failure_rx) = tokio::sync::watch::channel::<Option<String>>(None);
         let generation = Arc::new(AtomicU64::new(0));
         let thread_generation = generation.clone();
+        let tail_expiration = audio::TailDeadline::new();
+        let thread_tail_expiration = tail_expiration.clone();
         let join = std::thread::spawn(move || {
             if let Err(error) = pw::run_pw_source(
                 pcm_rx,
                 thread_generation,
+                thread_tail_expiration,
                 gain,
                 16_000,
                 &node_name,
@@ -128,6 +133,7 @@ impl PipeWireHandle {
             Ok(Ok(())) => Ok(Self {
                 shutdown_tx,
                 generation,
+                tail_expiration,
                 failure_rx: Some(failure_rx),
                 join: Some(join),
             }),
@@ -604,18 +610,14 @@ async fn main() -> anyhow::Result<()> {
 
         let pcm_tx = std::sync::Arc::new(ArrayQueue::new(32));
         let pcm_rx = pcm_tx.clone();
-        let (consumer_tx, mut consumer_rx) = if cli.mic_on_demand {
-            let (tx, rx) = tokio::sync::watch::channel(consumer::ConsumerEvent::Changed(0));
-            (Some(tx), Some(rx))
-        } else {
-            (None, None)
-        };
+        let (consumer_tx, mut consumer_rx) =
+            tokio::sync::watch::channel(consumer::ConsumerEvent::Changed(0));
         let mut _pw_handle = PipeWireHandle::new(
             pcm_rx.clone(),
             gain,
             node_name.clone(),
             node_description.clone(),
-            consumer_tx,
+            Some(consumer_tx),
         )?;
         let failure_rx = _pw_handle
             .failure_rx
@@ -738,8 +740,13 @@ async fn main() -> anyhow::Result<()> {
                             { None }
                         },
                         state_tx: Some(&state_tx),
-                        consumer_rx: consumer_rx.as_mut(),
+                        consumer_rx: if cli.mic_on_demand {
+                            Some(&mut consumer_rx)
+                        } else {
+                            None
+                        },
                         generation: Some(&_pw_handle.generation),
+                        tail_expiration: Some(&_pw_handle.tail_expiration),
                         mic_on_demand: cli.mic_on_demand,
                     },
                 ) => result,

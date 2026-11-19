@@ -57,7 +57,7 @@ RC003 HID ────▶ evdev input             │                      │
 | `discovery` | 查找已配对 RC003、核对名称/UUID、保存用户指定设备 | 不自动配对，不信任未确认设备 |
 | `atvv` | 能力协商、MIC_OPEN/CLOSE、控制事件和会话状态机 | 不处理桌面快捷键 |
 | `decode` | 帧累积、同步、IMA/DVI ADPCM 解码、PCM 后处理 | 不调用 ASR |
-| `audio` | 创建 PipeWire 源、写入实时 PCM、处理欠载与背压 | 不修改默认音频设备 |
+| `audio` | 创建 PipeWire 源、写入实时 PCM、处理欠载与背压、消费者断开和尾音期限 | 不修改默认音频设备 |
 | `input` | 发现 RC003 event 节点、独占、热插拔、原始 down/up | 不读取其他键盘 |
 | `mapping` | 语音键透传、13 键映射、层和动作状态机 | 不拦截 ATVV 音频 |
 | `integrate` | Hyprland 窗口动作和 Superwhisper 就绪检查 | 不调用文件转写代替实时界面 |
