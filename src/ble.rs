@@ -67,6 +67,7 @@ impl Drop for AudioNotificationStream {
 struct NotificationQueue {
     events: tokio::sync::Mutex<VecDeque<SessionNotification>>,
     closed: AtomicBool,
+    notify: tokio::sync::Notify,
 }
 
 impl NotificationQueue {
@@ -82,17 +83,20 @@ impl NotificationQueue {
             }
         }
         events.push_back(event);
+        drop(events);
+        self.notify.notify_one();
     }
 
     async fn next(&self) -> Option<SessionNotification> {
         loop {
+            let notified = self.notify.notified();
             if let Some(event) = self.events.lock().await.pop_front() {
                 return Some(event);
             }
             if self.closed.load(Ordering::Relaxed) {
                 return None;
             }
-            tokio::time::sleep(Duration::from_millis(1)).await;
+            notified.await;
         }
     }
 
@@ -100,6 +104,8 @@ impl NotificationQueue {
         let mut events = self.events.lock().await;
         events.clear();
         self.closed.store(true, Ordering::Relaxed);
+        drop(events);
+        self.notify.notify_one();
     }
 }
 
@@ -781,6 +787,20 @@ mod tests {
         queue.push(control_event(vec![0x04], 0)).await;
         queue.close().await;
         assert!(queue.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn close_wakes_empty_queue_reader() {
+        let queue = Arc::new(NotificationQueue::default());
+        let reader_queue = queue.clone();
+        let reader = tokio::spawn(async move { reader_queue.next().await });
+        tokio::task::yield_now().await;
+        queue.close().await;
+        let event = tokio::time::timeout(Duration::from_secs(1), reader)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(event.is_none());
     }
 
     #[test]

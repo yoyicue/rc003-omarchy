@@ -15,14 +15,16 @@ pub(crate) const fn generation_is_blocked(generation: u64) -> bool {
     generation & GENERATION_BLOCKED != 0
 }
 
+#[allow(deprecated)]
 pub(crate) fn advance_unblocked_generation(generation: &AtomicU64) {
-    let _ = generation.try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+    let _ = generation.fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
         Some(generation_number(current).wrapping_add(1))
     });
 }
 
+#[allow(deprecated)]
 pub(crate) fn advance_blocked_generation(generation: &AtomicU64) {
-    let _ = generation.try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+    let _ = generation.fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
         Some(generation_number(current).wrapping_add(1) | GENERATION_BLOCKED)
     });
 }
