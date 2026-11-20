@@ -56,27 +56,33 @@ fn sync_generation(pending: &mut Vec<i16>, previous: &mut u64, current: u64) {
     }
 }
 
+const NO_DISCONNECTION: u64 = u64::MAX;
+
 fn frame_is_output_current(
     frame_generation: u64,
     previous_generation: u64,
-    disconnected: Option<u64>,
+    disconnected: u64,
 ) -> bool {
-    frame_generation == previous_generation && Some(frame_generation) != disconnected
+    frame_generation == previous_generation
+        && (disconnected == NO_DISCONNECTION || frame_generation != disconnected)
 }
 
 fn sync_consumer_generation(
     generation: &AtomicU64,
-    disconnected: &std::cell::Cell<Option<u64>>,
+    disconnected: &AtomicU64,
     previous: u32,
     current: u32,
 ) {
     match (previous == 0, current == 0) {
         (false, true) => {
-            disconnected.set(Some(generation.fetch_add(1, Ordering::Relaxed) + 1));
+            let expired = generation.fetch_add(1, Ordering::Relaxed) + 1;
+            disconnected.store(expired, Ordering::Release);
         }
         (true, false) => {
-            if let Some(expired) = disconnected.take() {
+            let expired = disconnected.load(Ordering::Acquire);
+            if expired != NO_DISCONNECTION {
                 advance_generation_if_current(generation, expired);
+                disconnected.store(NO_DISCONNECTION, Ordering::Release);
             }
         }
         _ => {}
@@ -207,7 +213,7 @@ pub fn run_pw_source(
         std::rc::Rc::new(std::cell::Cell::new(u32::MAX));
 
     let consumer_generation = generation.clone();
-    let disconnected_generation = std::rc::Rc::new(std::cell::Cell::new(None));
+    let disconnected_generation = Arc::new(AtomicU64::new(NO_DISCONNECTION));
     let mut startup_tx = startup_tx;
     let _listener = stream
         .add_local_listener_with_user_data(())
@@ -247,6 +253,7 @@ pub fn run_pw_source(
             let mut previous_generation = 0;
             let disconnected_generation = disconnected_generation.clone();
             move |stream: &Stream, _| {
+                let disconnected = disconnected_generation.load(Ordering::Acquire);
                 expire_tail_generation(&tail_expiration, &generation);
                 sync_generation(
                     &mut buf,
@@ -256,11 +263,8 @@ pub fn run_pw_source(
 
                 while let Some(mut frame) = audio_rx.pop() {
                     sync_generation(&mut buf, &mut previous_generation, frame.generation);
-                    if frame_is_output_current(
-                        frame.generation,
-                        previous_generation,
-                        disconnected_generation.get(),
-                    ) {
+                    if frame_is_output_current(frame.generation, previous_generation, disconnected)
+                    {
                         crate::adpcm::apply_gain_linear(&mut frame.samples, gain_linear);
                         buf.extend_from_slice(&frame.samples);
                     }
@@ -610,10 +614,10 @@ mod tests {
 
     #[test]
     fn disconnected_generation_blocks_only_its_backlog() {
-        assert!(frame_is_output_current(1, 1, None));
-        assert!(!frame_is_output_current(1, 1, Some(1)));
-        assert!(frame_is_output_current(2, 2, Some(1)));
-        assert!(!frame_is_output_current(1, 2, None));
+        assert!(frame_is_output_current(1, 1, NO_DISCONNECTION));
+        assert!(!frame_is_output_current(1, 1, 1));
+        assert!(frame_is_output_current(2, 2, 1));
+        assert!(!frame_is_output_current(1, 2, NO_DISCONNECTION));
     }
 
     #[test]
@@ -666,13 +670,15 @@ mod tests {
     #[test]
     fn consumer_presence_transitions_invalidate_audio() {
         let generation = AtomicU64::new(0);
-        let disconnected = std::cell::Cell::new(None);
+        let disconnected = AtomicU64::new(NO_DISCONNECTION);
         sync_consumer_generation(&generation, &disconnected, 0, 1);
         assert_eq!(generation.load(Ordering::Relaxed), 0);
         sync_consumer_generation(&generation, &disconnected, 1, 0);
         assert_eq!(generation.load(Ordering::Relaxed), 1);
+        assert_eq!(disconnected.load(Ordering::Relaxed), 1);
         sync_consumer_generation(&generation, &disconnected, 0, 1);
         assert_eq!(generation.load(Ordering::Relaxed), 2);
+        assert_eq!(disconnected.load(Ordering::Relaxed), NO_DISCONNECTION);
         sync_consumer_generation(&generation, &disconnected, 1, 0);
         assert_eq!(generation.load(Ordering::Relaxed), 3);
         generation.fetch_add(1, Ordering::Relaxed);
