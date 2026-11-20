@@ -75,8 +75,8 @@ fn sync_consumer_generation(
     }
 }
 
-fn is_real_consumer(monitor: Option<&bool>) -> bool {
-    monitor == Some(&false)
+fn is_active_consumer(passive: Option<bool>, monitor: Option<&bool>) -> bool {
+    passive == Some(false) && monitor == Some(&false)
 }
 
 fn is_audio_consumer(media_class: Option<&str>) -> bool {
@@ -343,10 +343,11 @@ pub fn run_pw_source(
     let (_registry, _registry_listener, _proxies) = if let Some(consumer_tx) = consumer_tx {
         let registry = core_clone.get_registry_rc()?;
 
-        // Links to our node: link_id → other_node_id.
-        let our_links: std::rc::Rc<std::cell::RefCell<std::collections::HashMap<u32, u32>>> =
-            std::rc::Rc::new(std::cell::RefCell::new(std::collections::HashMap::new()));
-        // Whether each Stream/Input/Audio node is a monitor (from bound Node info).
+        // Links to our node: link_id → (other_node_id, passive after Link info).
+        let our_links: std::rc::Rc<
+            std::cell::RefCell<std::collections::HashMap<u32, (u32, Option<bool>)>>,
+        > = std::rc::Rc::new(std::cell::RefCell::new(std::collections::HashMap::new()));
+        // Whether each potential consumer node is a monitor (from bound Node info).
         // true = monitor (don't count), false = real consumer.
         // Nodes not yet in the map are ignored until their first info arrives.
         let node_is_monitor: std::rc::Rc<std::cell::RefCell<std::collections::HashMap<u32, bool>>> =
@@ -360,7 +361,7 @@ pub fn run_pw_source(
             std::cell::RefCell<std::collections::HashMap<u32, Box<dyn std::any::Any>>>,
         > = std::rc::Rc::new(std::cell::RefCell::new(std::collections::HashMap::new()));
 
-        // Count only links whose other node is classified as a real consumer.
+        // Count only classified, non-passive links to real consumers.
         let recount = {
             let our_links = our_links.clone();
             let node_is_monitor = node_is_monitor.clone();
@@ -372,7 +373,9 @@ pub fn run_pw_source(
                 let monitors = node_is_monitor.borrow();
                 let count = links
                     .values()
-                    .filter(|other_node| is_real_consumer(monitors.get(other_node)))
+                    .filter(|(other_node, passive)| {
+                        is_active_consumer(*passive, monitors.get(other_node))
+                    })
                     .count() as u32;
                 let previous = last_count.get();
                 if count != previous {
@@ -479,10 +482,39 @@ pub fn run_pw_source(
                             tracing::debug!(
                                 "PipeWire link to our node (id={link_id}, other_node={other_id})"
                             );
-                            our_links.borrow_mut().insert(link_id, other_id);
-                            // Recount — if node info is already cached, this will
-                            // immediately include or exclude the link. If not yet
-                            // cached, the node's info callback will trigger recount.
+                            our_links.borrow_mut().insert(link_id, (other_id, None));
+                            let Ok(link) = registry.bind::<pipewire::link::Link, _>(global) else {
+                                our_links.borrow_mut().remove(&link_id);
+                                return;
+                            };
+                            let link_listener = link
+                                .add_listener_local()
+                                .info({
+                                    let our_links = our_links.clone();
+                                    let recount = recount.clone();
+                                    move |info| {
+                                        let passive =
+                                            info.props().and_then(|p| p.get("link.passive"))
+                                                == Some("true");
+                                        let changed = {
+                                            let mut links = our_links.borrow_mut();
+                                            match links.get_mut(&link_id) {
+                                                Some((_, state)) if *state != Some(passive) => {
+                                                    *state = Some(passive);
+                                                    true
+                                                }
+                                                _ => false,
+                                            }
+                                        };
+                                        if changed {
+                                            recount();
+                                        }
+                                    }
+                                })
+                                .register();
+                            proxies
+                                .borrow_mut()
+                                .insert(link_id, Box::new((link, link_listener)));
                             recount();
                         }
                         _ => {}
@@ -573,10 +605,12 @@ mod tests {
     }
 
     #[test]
-    fn unclassified_nodes_are_not_consumers() {
-        assert!(!is_real_consumer(None));
-        assert!(!is_real_consumer(Some(&true)));
-        assert!(is_real_consumer(Some(&false)));
+    fn unclassified_or_passive_links_are_not_consumers() {
+        assert!(!is_active_consumer(None, Some(&false)));
+        assert!(!is_active_consumer(Some(false), None));
+        assert!(!is_active_consumer(Some(true), Some(&false)));
+        assert!(!is_active_consumer(Some(false), Some(&true)));
+        assert!(is_active_consumer(Some(false), Some(&false)));
     }
 
     #[test]
