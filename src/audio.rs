@@ -1,5 +1,31 @@
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc,
+};
 use std::time::{Duration, Instant};
+
+pub(crate) const GENERATION_BLOCKED: u64 = 1 << 63;
+const GENERATION_NUMBER_MASK: u64 = !GENERATION_BLOCKED;
+
+pub(crate) const fn generation_number(generation: u64) -> u64 {
+    generation & GENERATION_NUMBER_MASK
+}
+
+pub(crate) const fn generation_is_blocked(generation: u64) -> bool {
+    generation & GENERATION_BLOCKED != 0
+}
+
+pub(crate) fn advance_unblocked_generation(generation: &AtomicU64) {
+    let _ = generation.try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+        Some(generation_number(current).wrapping_add(1))
+    });
+}
+
+pub(crate) fn advance_blocked_generation(generation: &AtomicU64) {
+    let _ = generation.try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+        Some(generation_number(current).wrapping_add(1) | GENERATION_BLOCKED)
+    });
+}
 
 #[derive(Clone, Copy, Debug, Default)]
 struct TailState {

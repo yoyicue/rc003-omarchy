@@ -129,7 +129,7 @@ struct InvalidateGenerationOnExit<'a> {
 impl Drop for InvalidateGenerationOnExit<'_> {
     fn drop(&mut self) {
         if let Some(generation) = self.generation {
-            generation.fetch_add(1, Ordering::Relaxed);
+            crate::audio::advance_blocked_generation(generation);
         }
         if let Some(streaming) = self.streaming {
             streaming.store(false, Ordering::Relaxed);
@@ -352,11 +352,13 @@ pub async fn run_session(
             }
                     SessionNotification::Audio(packet) => {
                         if state == State::Streaming {
-                    if packet.generation > stream_generation {
+                    let packet_number = crate::audio::generation_number(packet.generation);
+                    let stream_number = crate::audio::generation_number(stream_generation);
+                    if packet_number > stream_number {
                         drop_next_frame = protocol.has_partial_audio();
                         stream_generation = packet.generation;
                     }
-                    if packet.generation < stream_generation {
+                    if packet_number < stream_number {
                         continue;
                     }
                     for mut frame in protocol.decode_audio(&packet.data) {
@@ -1099,8 +1101,10 @@ mod tests {
             .send(DeviceConnectionEvent::Disconnected)
             .unwrap();
         assert!(session.await.unwrap().is_ok());
-        assert!(generation.load(Ordering::Relaxed) > queued.generation);
-        assert_eq!(generation.load(Ordering::Relaxed), 6);
+        let disconnected = generation.load(Ordering::Relaxed);
+        assert!(crate::audio::generation_number(disconnected) > queued.generation);
+        assert_eq!(crate::audio::generation_number(disconnected), 6);
+        assert!(crate::audio::generation_is_blocked(disconnected));
         assert!(!streaming.load(Ordering::Relaxed));
     }
 

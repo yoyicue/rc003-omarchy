@@ -29,7 +29,7 @@ fn notification_payload(data: Vec<u8>) -> Option<Vec<u8>> {
 
 fn advance_generation_on_audio_start(data: &[u8], generation: &AtomicU64) {
     if !data.is_empty() && data[0] == 0x04 {
-        generation.fetch_add(1, Ordering::Relaxed);
+        crate::audio::advance_unblocked_generation(generation);
     }
 }
 
@@ -779,6 +779,9 @@ mod tests {
         assert_eq!(generation.load(Ordering::Relaxed), 1);
         advance_generation_on_audio_start(&[0x04], &generation);
         assert_eq!(generation.load(Ordering::Relaxed), 2);
+        generation.store(crate::audio::GENERATION_BLOCKED | 2, Ordering::Relaxed);
+        advance_generation_on_audio_start(&[0x04], &generation);
+        assert_eq!(generation.load(Ordering::Relaxed), 3);
     }
 
     #[test]

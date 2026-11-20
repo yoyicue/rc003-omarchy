@@ -46,7 +46,8 @@ pub struct PcmFrame {
 
 /// Return true when a frame belongs to a newer utterance.
 fn frame_is_newer(frame_generation: u64, previous_generation: u64) -> bool {
-    frame_generation > previous_generation
+    crate::audio::generation_number(frame_generation)
+        > crate::audio::generation_number(previous_generation)
 }
 
 fn sync_generation(pending: &mut Vec<i16>, previous: &mut u64, current: u64) {
@@ -56,40 +57,26 @@ fn sync_generation(pending: &mut Vec<i16>, previous: &mut u64, current: u64) {
     }
 }
 
-const NO_DISCONNECTION: u64 = u64::MAX;
-
-fn frame_is_output_current(
-    frame_generation: u64,
-    previous_generation: u64,
-    disconnected: u64,
-) -> bool {
+fn frame_is_output_current(frame_generation: u64, previous_generation: u64, current: u64) -> bool {
     frame_generation == previous_generation
-        && (disconnected == NO_DISCONNECTION || frame_generation != disconnected)
+        && previous_generation == current
+        && !crate::audio::generation_is_blocked(current)
 }
 
-fn sync_output_buffer(pending: &mut Vec<i16>, previous: &mut u64, current: u64, disconnected: u64) {
+fn sync_output_buffer(pending: &mut Vec<i16>, previous: &mut u64, current: u64) {
     sync_generation(pending, previous, current);
-    if *previous == disconnected {
+    if crate::audio::generation_is_blocked(current) {
         pending.clear();
     }
 }
 
-fn sync_consumer_generation(
-    generation: &AtomicU64,
-    disconnected: &AtomicU64,
-    previous: u32,
-    current: u32,
-) {
+fn sync_consumer_generation(generation: &AtomicU64, previous: u32, current: u32) {
     match (previous == 0, current == 0) {
-        (false, true) => {
-            let expired = generation.fetch_add(1, Ordering::Relaxed) + 1;
-            disconnected.store(expired, Ordering::Release);
-        }
+        (false, true) => crate::audio::advance_blocked_generation(generation),
         (true, false) => {
-            let expired = disconnected.load(Ordering::Acquire);
-            if expired != NO_DISCONNECTION {
-                advance_generation_if_current(generation, expired);
-                disconnected.store(NO_DISCONNECTION, Ordering::Release);
+            let current = generation.load(Ordering::Acquire);
+            if crate::audio::generation_is_blocked(current) {
+                advance_unblocked_generation_if_current(generation, current);
             }
         }
         _ => {}
@@ -124,7 +111,14 @@ fn is_audio_consumer(media_class: Option<&str>) -> bool {
 }
 
 fn advance_generation_if_current(generation: &AtomicU64, current: u64) {
-    let _ = generation.compare_exchange(current, current + 1, Ordering::Relaxed, Ordering::Relaxed);
+    let next = crate::audio::generation_number(current).wrapping_add(1)
+        | (current & crate::audio::GENERATION_BLOCKED);
+    let _ = generation.compare_exchange(current, next, Ordering::AcqRel, Ordering::Acquire);
+}
+
+fn advance_unblocked_generation_if_current(generation: &AtomicU64, current: u64) {
+    let next = crate::audio::generation_number(current).wrapping_add(1);
+    let _ = generation.compare_exchange(current, next, Ordering::AcqRel, Ordering::Acquire);
 }
 
 fn expire_tail_generation(tail: &crate::audio::TailDeadline, generation: &AtomicU64) {
@@ -220,7 +214,6 @@ pub fn run_pw_source(
         std::rc::Rc::new(std::cell::Cell::new(u32::MAX));
 
     let consumer_generation = generation.clone();
-    let disconnected_generation = Arc::new(AtomicU64::new(NO_DISCONNECTION));
     let mut startup_tx = startup_tx;
     let _listener = stream
         .add_local_listener_with_user_data(())
@@ -258,21 +251,18 @@ pub fn run_pw_source(
             // publish the current utterance through an atomic generation counter.
             let mut buf = Vec::new();
             let mut previous_generation = 0;
-            let disconnected_generation = disconnected_generation.clone();
             move |stream: &Stream, _| {
-                let disconnected = disconnected_generation.load(Ordering::Acquire);
                 expire_tail_generation(&tail_expiration, &generation);
                 sync_output_buffer(
                     &mut buf,
                     &mut previous_generation,
-                    generation.load(Ordering::Relaxed),
-                    disconnected,
+                    generation.load(Ordering::Acquire),
                 );
 
                 while let Some(mut frame) = audio_rx.pop() {
                     sync_generation(&mut buf, &mut previous_generation, frame.generation);
-                    if frame_is_output_current(frame.generation, previous_generation, disconnected)
-                    {
+                    let current = generation.load(Ordering::Acquire);
+                    if frame_is_output_current(frame.generation, previous_generation, current) {
                         crate::adpcm::apply_gain_linear(&mut frame.samples, gain_linear);
                         buf.extend_from_slice(&frame.samples);
                     }
@@ -306,12 +296,10 @@ pub fn run_pw_source(
                     buf_capacity
                 };
 
-                let disconnected = disconnected_generation.load(Ordering::Acquire);
                 sync_output_buffer(
                     &mut buf,
                     &mut previous_generation,
-                    generation.load(Ordering::Relaxed),
-                    disconnected,
+                    generation.load(Ordering::Acquire),
                 );
                 let available = buf.len().min(max_samples);
 
@@ -414,7 +402,6 @@ pub fn run_pw_source(
             let our_links = our_links.clone();
             let node_is_monitor = node_is_monitor.clone();
             let last_count = last_count.clone();
-            let disconnected_generation = disconnected_generation.clone();
             let consumer_tx = consumer_tx.clone();
             move || {
                 let links = our_links.borrow();
@@ -427,12 +414,7 @@ pub fn run_pw_source(
                     .count() as u32;
                 let previous = last_count.get();
                 if count != previous {
-                    sync_consumer_generation(
-                        &consumer_generation,
-                        &disconnected_generation,
-                        previous,
-                        count,
-                    );
+                    sync_consumer_generation(&consumer_generation, previous, count);
                     last_count.set(count);
                     tracing::debug!("PipeWire consumer count: {count}");
                     if let Err(e) = consumer_tx.send(crate::consumer::ConsumerEvent::Changed(count))
@@ -629,21 +611,34 @@ mod tests {
 
     #[test]
     fn disconnected_generation_blocks_only_its_backlog() {
-        assert!(frame_is_output_current(1, 1, NO_DISCONNECTION));
-        assert!(!frame_is_output_current(1, 1, 1));
-        assert!(frame_is_output_current(2, 2, 1));
-        assert!(!frame_is_output_current(1, 2, NO_DISCONNECTION));
+        assert!(frame_is_output_current(1, 1, 1));
+        assert!(!frame_is_output_current(
+            1,
+            1,
+            crate::audio::GENERATION_BLOCKED | 1
+        ));
+        assert!(!frame_is_output_current(
+            2,
+            2,
+            crate::audio::GENERATION_BLOCKED | 1
+        ));
+        assert!(frame_is_output_current(2, 2, 2));
+        assert!(!frame_is_output_current(1, 2, 2));
     }
 
     #[test]
     fn output_buffer_is_revalidated_before_writing() {
         let mut pending = vec![10, 11];
         let mut generation = 1;
-        sync_output_buffer(&mut pending, &mut generation, 1, 1);
+        sync_output_buffer(
+            &mut pending,
+            &mut generation,
+            crate::audio::GENERATION_BLOCKED | 1,
+        );
         assert!(pending.is_empty());
-        sync_output_buffer(&mut pending, &mut generation, 2, 1);
+        sync_output_buffer(&mut pending, &mut generation, 2);
         pending.extend_from_slice(&[20, 21]);
-        sync_output_buffer(&mut pending, &mut generation, 2, 1);
+        sync_output_buffer(&mut pending, &mut generation, 2);
         assert_eq!(pending, vec![20, 21]);
     }
 
@@ -697,21 +692,24 @@ mod tests {
     #[test]
     fn consumer_presence_transitions_invalidate_audio() {
         let generation = AtomicU64::new(0);
-        let disconnected = AtomicU64::new(NO_DISCONNECTION);
-        sync_consumer_generation(&generation, &disconnected, 0, 1);
+        sync_consumer_generation(&generation, 0, 1);
         assert_eq!(generation.load(Ordering::Relaxed), 0);
-        sync_consumer_generation(&generation, &disconnected, 1, 0);
-        assert_eq!(generation.load(Ordering::Relaxed), 1);
-        assert_eq!(disconnected.load(Ordering::Relaxed), 1);
-        sync_consumer_generation(&generation, &disconnected, 0, 1);
+        sync_consumer_generation(&generation, 1, 0);
+        assert_eq!(
+            generation.load(Ordering::Relaxed),
+            crate::audio::GENERATION_BLOCKED | 1
+        );
+        sync_consumer_generation(&generation, 0, 1);
         assert_eq!(generation.load(Ordering::Relaxed), 2);
-        assert_eq!(disconnected.load(Ordering::Relaxed), NO_DISCONNECTION);
-        sync_consumer_generation(&generation, &disconnected, 1, 0);
-        assert_eq!(generation.load(Ordering::Relaxed), 3);
-        generation.fetch_add(1, Ordering::Relaxed);
-        sync_consumer_generation(&generation, &disconnected, 0, 1);
+        sync_consumer_generation(&generation, 1, 0);
+        assert_eq!(
+            generation.load(Ordering::Relaxed),
+            crate::audio::GENERATION_BLOCKED | 3
+        );
+        crate::audio::advance_unblocked_generation(&generation);
+        sync_consumer_generation(&generation, 0, 1);
         assert_eq!(generation.load(Ordering::Relaxed), 4);
-        sync_consumer_generation(&generation, &disconnected, 1, 2);
+        sync_consumer_generation(&generation, 1, 2);
         assert_eq!(generation.load(Ordering::Relaxed), 4);
     }
 
