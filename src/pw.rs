@@ -67,6 +67,13 @@ fn frame_is_output_current(
         && (disconnected == NO_DISCONNECTION || frame_generation != disconnected)
 }
 
+fn sync_output_buffer(pending: &mut Vec<i16>, previous: &mut u64, current: u64, disconnected: u64) {
+    sync_generation(pending, previous, current);
+    if *previous == disconnected {
+        pending.clear();
+    }
+}
+
 fn sync_consumer_generation(
     generation: &AtomicU64,
     disconnected: &AtomicU64,
@@ -255,10 +262,11 @@ pub fn run_pw_source(
             move |stream: &Stream, _| {
                 let disconnected = disconnected_generation.load(Ordering::Acquire);
                 expire_tail_generation(&tail_expiration, &generation);
-                sync_generation(
+                sync_output_buffer(
                     &mut buf,
                     &mut previous_generation,
                     generation.load(Ordering::Relaxed),
+                    disconnected,
                 );
 
                 while let Some(mut frame) = audio_rx.pop() {
@@ -298,6 +306,13 @@ pub fn run_pw_source(
                     buf_capacity
                 };
 
+                let disconnected = disconnected_generation.load(Ordering::Acquire);
+                sync_output_buffer(
+                    &mut buf,
+                    &mut previous_generation,
+                    generation.load(Ordering::Relaxed),
+                    disconnected,
+                );
                 let available = buf.len().min(max_samples);
 
                 // Copy i16 samples to the output buffer as little-endian bytes.
@@ -618,6 +633,18 @@ mod tests {
         assert!(!frame_is_output_current(1, 1, 1));
         assert!(frame_is_output_current(2, 2, 1));
         assert!(!frame_is_output_current(1, 2, NO_DISCONNECTION));
+    }
+
+    #[test]
+    fn output_buffer_is_revalidated_before_writing() {
+        let mut pending = vec![10, 11];
+        let mut generation = 1;
+        sync_output_buffer(&mut pending, &mut generation, 1, 1);
+        assert!(pending.is_empty());
+        sync_output_buffer(&mut pending, &mut generation, 2, 1);
+        pending.extend_from_slice(&[20, 21]);
+        sync_output_buffer(&mut pending, &mut generation, 2, 1);
+        assert_eq!(pending, vec![20, 21]);
     }
 
     #[test]
