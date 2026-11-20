@@ -75,6 +75,10 @@ fn sync_consumer_generation(
     }
 }
 
+fn is_real_consumer(monitor: Option<&bool>) -> bool {
+    monitor == Some(&false)
+}
+
 fn advance_generation_if_current(generation: &AtomicU64, current: u64) {
     let _ = generation.compare_exchange(current, current + 1, Ordering::Relaxed, Ordering::Relaxed);
 }
@@ -337,8 +341,7 @@ pub fn run_pw_source(
             std::rc::Rc::new(std::cell::RefCell::new(std::collections::HashMap::new()));
         // Whether each Stream/Input/Audio node is a monitor (from bound Node info).
         // true = monitor (don't count), false = real consumer.
-        // Nodes not yet in the map haven't received info yet — treated as "not
-        // monitor" so real consumers work before info arrives.
+        // Nodes not yet in the map are ignored until their first info arrives.
         let node_is_monitor: std::rc::Rc<std::cell::RefCell<std::collections::HashMap<u32, bool>>> =
             std::rc::Rc::new(std::cell::RefCell::new(std::collections::HashMap::new()));
         // Last emitted consumer count (to avoid duplicate events).
@@ -350,7 +353,7 @@ pub fn run_pw_source(
             std::cell::RefCell<std::collections::HashMap<u32, Box<dyn std::any::Any>>>,
         > = std::rc::Rc::new(std::cell::RefCell::new(std::collections::HashMap::new()));
 
-        // Count links where the other node is NOT a monitor. Emit Changed if count changed.
+        // Count only links whose other node is classified as a real consumer.
         let recount = {
             let our_links = our_links.clone();
             let node_is_monitor = node_is_monitor.clone();
@@ -362,7 +365,7 @@ pub fn run_pw_source(
                 let monitors = node_is_monitor.borrow();
                 let count = links
                     .values()
-                    .filter(|other_node| monitors.get(other_node) != Some(&true))
+                    .filter(|other_node| is_real_consumer(monitors.get(other_node)))
                     .count() as u32;
                 let previous = last_count.get();
                 if count != previous {
@@ -552,6 +555,13 @@ mod tests {
         assert_eq!(pending, vec![20, 21]);
         sync_generation(&mut pending, &mut generation, 1);
         assert_eq!(pending, vec![20, 21]);
+    }
+
+    #[test]
+    fn unclassified_nodes_are_not_consumers() {
+        assert!(!is_real_consumer(None));
+        assert!(!is_real_consumer(Some(&true)));
+        assert!(is_real_consumer(Some(&false)));
     }
 
     #[test]

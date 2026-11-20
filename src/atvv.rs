@@ -470,9 +470,6 @@ pub async fn run_session(
                                 if let Some(tail_expiration) = tail_expiration {
                                     tail_expiration.clear();
                                 }
-                                if let Some(generation) = generation {
-                                    generation.fetch_add(1, Ordering::Relaxed);
-                                }
                             }
                         }
                     }
@@ -1818,7 +1815,7 @@ mod tests {
             .unwrap();
         tokio::time::advance(Duration::from_millis(1)).await;
         assert!(wait_for_state(&mut state_rx, State::Connected, Duration::from_millis(10)).await);
-        assert_eq!(generation.load(Ordering::Relaxed), 2);
+        assert_eq!(generation.load(Ordering::Relaxed), 1);
 
         let cmds = try_recv_all_commands(&mut ctrl.commands_rx).await;
         assert_eq!(cmds, vec![V04_MIC_CLOSE.to_vec()]);
