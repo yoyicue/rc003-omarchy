@@ -56,6 +56,14 @@ fn sync_generation(pending: &mut Vec<i16>, previous: &mut u64, current: u64) {
     }
 }
 
+fn frame_is_output_current(
+    frame_generation: u64,
+    previous_generation: u64,
+    disconnected: Option<u64>,
+) -> bool {
+    frame_generation == previous_generation && Some(frame_generation) != disconnected
+}
+
 fn sync_consumer_generation(
     generation: &AtomicU64,
     disconnected: &std::cell::Cell<Option<u64>>,
@@ -199,6 +207,7 @@ pub fn run_pw_source(
         std::rc::Rc::new(std::cell::Cell::new(u32::MAX));
 
     let consumer_generation = generation.clone();
+    let disconnected_generation = std::rc::Rc::new(std::cell::Cell::new(None));
     let mut startup_tx = startup_tx;
     let _listener = stream
         .add_local_listener_with_user_data(())
@@ -236,6 +245,7 @@ pub fn run_pw_source(
             // publish the current utterance through an atomic generation counter.
             let mut buf = Vec::new();
             let mut previous_generation = 0;
+            let disconnected_generation = disconnected_generation.clone();
             move |stream: &Stream, _| {
                 expire_tail_generation(&tail_expiration, &generation);
                 sync_generation(
@@ -246,7 +256,11 @@ pub fn run_pw_source(
 
                 while let Some(mut frame) = audio_rx.pop() {
                     sync_generation(&mut buf, &mut previous_generation, frame.generation);
-                    if frame.generation == previous_generation {
+                    if frame_is_output_current(
+                        frame.generation,
+                        previous_generation,
+                        disconnected_generation.get(),
+                    ) {
                         crate::adpcm::apply_gain_linear(&mut frame.samples, gain_linear);
                         buf.extend_from_slice(&frame.samples);
                     }
@@ -371,7 +385,6 @@ pub fn run_pw_source(
         // Last emitted consumer count (to avoid duplicate events).
         let last_count: std::rc::Rc<std::cell::Cell<u32>> =
             std::rc::Rc::new(std::cell::Cell::new(0));
-        let disconnected_generation = std::rc::Rc::new(std::cell::Cell::new(None));
         // Bound proxies (must stay alive): link proxies + node proxies with listeners.
         let proxies: std::rc::Rc<
             std::cell::RefCell<std::collections::HashMap<u32, Box<dyn std::any::Any>>>,
@@ -593,6 +606,14 @@ mod tests {
     fn only_current_session_frames_are_accepted() {
         assert!(frame_is_newer(7, 6));
         assert!(!frame_is_newer(6, 7));
+    }
+
+    #[test]
+    fn disconnected_generation_blocks_only_its_backlog() {
+        assert!(frame_is_output_current(1, 1, None));
+        assert!(!frame_is_output_current(1, 1, Some(1)));
+        assert!(frame_is_output_current(2, 2, Some(1)));
+        assert!(!frame_is_output_current(1, 2, None));
     }
 
     #[test]
