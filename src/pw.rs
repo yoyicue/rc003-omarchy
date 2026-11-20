@@ -79,6 +79,18 @@ fn is_active_consumer(passive: Option<bool>, monitor: Option<&bool>) -> bool {
     passive == Some(false) && monitor == Some(&false)
 }
 
+fn update_passive(state: &mut Option<bool>, props_changed: bool, value: Option<&str>) -> bool {
+    if !props_changed {
+        return false;
+    }
+    let passive = matches!(value, Some("true" | "1"));
+    if *state == Some(passive) {
+        return false;
+    }
+    *state = Some(passive);
+    true
+}
+
 fn is_audio_consumer(media_class: Option<&str>) -> bool {
     matches!(
         media_class,
@@ -452,7 +464,7 @@ pub fn run_pw_source(
                                 .register();
                             proxies
                                 .borrow_mut()
-                                .insert(node_id, Box::new((node, node_listener)));
+                                .insert(node_id, Box::new((node_listener, node)));
                         }
                         ObjectType::Link => {
                             let our_id = our_node_id.get();
@@ -493,18 +505,18 @@ pub fn run_pw_source(
                                     let our_links = our_links.clone();
                                     let recount = recount.clone();
                                     move |info| {
-                                        let passive =
-                                            info.props().and_then(|p| p.get("link.passive"))
-                                                == Some("true");
                                         let changed = {
                                             let mut links = our_links.borrow_mut();
-                                            match links.get_mut(&link_id) {
-                                                Some((_, state)) if *state != Some(passive) => {
-                                                    *state = Some(passive);
-                                                    true
-                                                }
-                                                _ => false,
-                                            }
+                                            links.get_mut(&link_id).is_some_and(|(_, state)| {
+                                                update_passive(
+                                                    state,
+                                                    info.change_mask().contains(
+                                                        pipewire::link::LinkChangeMask::PROPS,
+                                                    ),
+                                                    info.props()
+                                                        .and_then(|p| p.get("link.passive")),
+                                                )
+                                            })
                                         };
                                         if changed {
                                             recount();
@@ -514,7 +526,7 @@ pub fn run_pw_source(
                                 .register();
                             proxies
                                 .borrow_mut()
-                                .insert(link_id, Box::new((link, link_listener)));
+                                .insert(link_id, Box::new((link_listener, link)));
                             recount();
                         }
                         _ => {}
@@ -602,6 +614,19 @@ mod tests {
         }
         assert!(!is_audio_consumer(Some("Audio/Source")));
         assert!(!is_audio_consumer(None));
+    }
+
+    #[test]
+    fn link_state_updates_preserve_passive_classification() {
+        let mut state = None;
+        assert!(update_passive(&mut state, true, Some("true")));
+        assert_eq!(state, Some(true));
+        assert!(!update_passive(&mut state, false, None));
+        assert_eq!(state, Some(true));
+        assert!(!update_passive(&mut state, true, Some("1")));
+        assert_eq!(state, Some(true));
+        assert!(update_passive(&mut state, true, None));
+        assert_eq!(state, Some(false));
     }
 
     #[test]
