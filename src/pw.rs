@@ -57,7 +57,7 @@ fn sync_generation(pending: &mut Vec<i16>, previous: &mut u64, current: u64) {
 }
 
 fn sync_consumer_generation(generation: &AtomicU64, previous: u32, current: u32) {
-    if previous > 0 && current == 0 {
+    if (previous == 0) != (current == 0) {
         generation.fetch_add(1, Ordering::Relaxed);
     }
 }
@@ -67,9 +67,8 @@ fn advance_generation_if_current(generation: &AtomicU64, current: u64) {
 }
 
 fn expire_tail_generation(tail: &crate::audio::TailDeadline, generation: &AtomicU64) {
-    let current = generation.load(Ordering::Relaxed);
     if tail.expire_if_due() {
-        advance_generation_if_current(generation, current);
+        advance_generation_if_current(generation, tail.generation());
     }
 }
 
@@ -536,24 +535,26 @@ mod tests {
     }
 
     #[test]
-    fn every_last_consumer_disconnect_invalidates_audio() {
+    fn consumer_presence_transitions_invalidate_audio() {
         let generation = AtomicU64::new(0);
-        sync_consumer_generation(&generation, 0, 1);
-        assert_eq!(generation.load(Ordering::Relaxed), 0);
-        sync_consumer_generation(&generation, 1, 0);
-        assert_eq!(generation.load(Ordering::Relaxed), 1);
         sync_consumer_generation(&generation, 0, 1);
         assert_eq!(generation.load(Ordering::Relaxed), 1);
         sync_consumer_generation(&generation, 1, 0);
         assert_eq!(generation.load(Ordering::Relaxed), 2);
+        sync_consumer_generation(&generation, 0, 1);
+        assert_eq!(generation.load(Ordering::Relaxed), 3);
+        sync_consumer_generation(&generation, 1, 0);
+        assert_eq!(generation.load(Ordering::Relaxed), 4);
     }
 
     #[test]
     fn stale_expiry_does_not_advance_a_new_recording() {
         let generation = AtomicU64::new(1);
-        let expired_generation = generation.load(Ordering::Relaxed);
+        let tail = crate::audio::TailDeadline::new();
+        tail.arm_after(std::time::Duration::from_millis(1), 1);
         generation.fetch_add(1, Ordering::Relaxed);
-        advance_generation_if_current(&generation, expired_generation);
+        std::thread::sleep(std::time::Duration::from_millis(3));
+        expire_tail_generation(&tail, &generation);
         assert_eq!(generation.load(Ordering::Relaxed), 2);
     }
 
@@ -561,7 +562,7 @@ mod tests {
     fn output_expiry_invalidates_tail_without_ble() {
         let generation = AtomicU64::new(0);
         let tail = crate::audio::TailDeadline::new();
-        tail.arm_after(std::time::Duration::from_millis(1));
+        tail.arm_after(std::time::Duration::from_millis(1), 0);
         std::thread::sleep(std::time::Duration::from_millis(3));
         expire_tail_generation(&tail, &generation);
         assert_eq!(generation.load(Ordering::Relaxed), 1);

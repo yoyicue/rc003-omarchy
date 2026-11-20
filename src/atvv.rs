@@ -213,7 +213,7 @@ pub async fn run_session(
         ($state:ident, $last_seq:ident, $current_stream_id:ident) => {
             if stopped_generation != Some(stream_generation) {
                 if let Some(tail_expiration) = tail_expiration {
-                    tail_expiration.arm_after(AUDIO_TAIL_DRAIN_TIMEOUT);
+                    tail_expiration.arm_after(AUDIO_TAIL_DRAIN_TIMEOUT, stream_generation);
                 }
                 stopped_generation = Some(stream_generation);
             }

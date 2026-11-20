@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 pub struct TailDeadline {
     started: Instant,
     deadline_ms: Arc<AtomicU64>,
+    generation: Arc<AtomicU64>,
 }
 
 impl TailDeadline {
@@ -15,10 +16,12 @@ impl TailDeadline {
         Self {
             started: Instant::now(),
             deadline_ms: Arc::new(AtomicU64::new(0)),
+            generation: Arc::new(AtomicU64::new(0)),
         }
     }
 
-    pub fn arm_after(&self, duration: Duration) {
+    pub fn arm_after(&self, duration: Duration, generation: u64) {
+        self.generation.store(generation, Ordering::Relaxed);
         self.arm_elapsed(self.started.elapsed().saturating_add(duration));
     }
 
@@ -28,6 +31,10 @@ impl TailDeadline {
 
     pub fn is_armed(&self) -> bool {
         self.deadline_ms.load(Ordering::Relaxed) != 0
+    }
+
+    pub fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Relaxed)
     }
 
     #[cfg(test)]
