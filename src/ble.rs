@@ -33,6 +33,12 @@ fn advance_generation_on_audio_start(data: &[u8], generation: &AtomicU64, v10: b
     }
 }
 
+fn learn_protocol_version(data: &[u8], v10: &mut bool) {
+    if let Some(caps) = crate::protocol::parse_caps_resp(data) {
+        *v10 = matches!(caps.version, crate::protocol::types::ProtocolVersion::V1_0);
+    }
+}
+
 struct AudioNotificationStream {
     inner: Pin<Box<dyn Stream<Item = SessionNotification> + Send>>,
     task: tokio::task::JoinHandle<()>,
@@ -95,15 +101,13 @@ impl NotificationQueue {
 struct NotificationPaths {
     ctl: String,
     rx: String,
-    v10: Arc<AtomicBool>,
 }
 
 impl NotificationPaths {
-    fn new(chars: &AtvvChars, v10: Arc<AtomicBool>) -> Self {
+    fn new(chars: &AtvvChars) -> Self {
         Self {
             ctl: characteristic_path(&chars.ctl),
             rx: characteristic_path(&chars.rx),
-            v10,
         }
     }
 }
@@ -130,6 +134,7 @@ async fn forward_dbus_notifications(
     generation: Arc<AtomicU64>,
     queue: Arc<NotificationQueue>,
 ) -> Result<()> {
+    let mut v10 = false;
     loop {
         let message = tokio::select! {
             message = messages.next() => match message {
@@ -170,11 +175,8 @@ async fn forward_dbus_notifications(
             continue;
         };
         if path.as_str() == paths.ctl {
-            advance_generation_on_audio_start(
-                &data,
-                &generation,
-                paths.v10.load(Ordering::Relaxed),
-            );
+            learn_protocol_version(&data, &mut v10);
+            advance_generation_on_audio_start(&data, &generation, v10);
             queue
                 .push(SessionNotification::Control(ControlPacket {
                     data,
@@ -209,10 +211,9 @@ fn map_notify_error(error: zbus::Error) -> anyhow::Error {
 
 async fn ordered_notifications(
     chars: &AtvvChars,
-    v10: Arc<AtomicBool>,
     generation: Arc<AtomicU64>,
 ) -> Result<Pin<Box<dyn Stream<Item = SessionNotification> + Send>>> {
-    let paths = NotificationPaths::new(chars, v10);
+    let paths = NotificationPaths::new(chars);
     let connection = Connection::system().await?;
     let bluez = zbus::fdo::DBusProxy::new(&connection).await?;
     let owner_changes = bluez
@@ -325,7 +326,6 @@ pub struct BluerDevice<'a> {
     pub device: &'a Device,
     pub chars: &'a AtvvChars,
     pub generation: Arc<AtomicU64>,
-    v10: Arc<AtomicBool>,
 }
 
 impl<'a> BluerDevice<'a> {
@@ -334,15 +334,7 @@ impl<'a> BluerDevice<'a> {
             device,
             chars,
             generation,
-            v10: Arc::new(AtomicBool::new(false)),
         }
-    }
-
-    pub fn set_protocol_version(&self, version: crate::protocol::types::ProtocolVersion) {
-        self.v10.store(
-            matches!(version, crate::protocol::types::ProtocolVersion::V1_0),
-            Ordering::Relaxed,
-        );
     }
 }
 
@@ -367,9 +359,7 @@ impl BleDevice for BluerDevice<'_> {
     }
 
     fn notifications(&self) -> BleFut<'_, BleStream<SessionNotification>> {
-        Box::pin(async {
-            ordered_notifications(self.chars, self.v10.clone(), self.generation.clone()).await
-        })
+        Box::pin(async { ordered_notifications(self.chars, self.generation.clone()).await })
     }
 
     fn connection_events(&self) -> BleFut<'_, BleStream<DeviceConnectionEvent>> {
@@ -786,6 +776,24 @@ mod tests {
         queue.push(control_event(vec![0x04], 0)).await;
         queue.close().await;
         assert!(queue.next().await.is_none());
+    }
+
+    #[test]
+    fn caps_resp_updates_version_before_start() {
+        let mut v10 = false;
+        let generation = AtomicU64::new(0);
+        learn_protocol_version(&[0x0B, 0x01, 0x00, 0x01, 0x00, 0x00, 0x78], &mut v10);
+        assert!(v10);
+        advance_generation_on_audio_start(&[0x04, 0x03, 0x02, 0x00], &generation, v10);
+        advance_generation_on_audio_start(&[0x04], &generation, v10);
+        assert_eq!(generation.load(Ordering::Relaxed), 1);
+        learn_protocol_version(
+            &[0x0B, 0x00, 0x04, 0x00, 0x01, 0x00, 0x78, 0x00, 0x78],
+            &mut v10,
+        );
+        assert!(!v10);
+        advance_generation_on_audio_start(&[0x04], &generation, v10);
+        assert_eq!(generation.load(Ordering::Relaxed), 2);
     }
 
     #[test]
