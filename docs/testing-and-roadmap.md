@@ -9,7 +9,7 @@
 - M4：实现完成，13 键及 RightAlt 已通过真机验证。
 - M5：完成。服务已通过 `newgrp input -c` 安装并启用，启动权限和遥控器断线后的自动恢复均已通过验收。
 
-此前 Redmi 基线：140 个单元测试、显式 uinput 集成测试、Clippy（warnings denied）和 release build 全部通过。第九、十轮分别有 123、124 项可移植测试通过；第十一至十三轮的 Redmi 单元测试数分别为 148、149、149，详见第 18、19、20 节。第十四至十六轮分别有 126 项可移植测试通过；第十七至十九轮分别有 153、156、157 个单元测试在 Redmi 通过，详见第 24、25、26 节。
+此前 Redmi 基线：140 个单元测试、显式 uinput 集成测试、Clippy（warnings denied）和 release build 全部通过。第九、十轮分别有 123、124 项可移植测试通过；第十一至十三轮的 Redmi 单元测试数分别为 148、149、149，详见第 18、19、20 节。第十四至十六轮分别有 126 项可移植测试通过；第十七至二十一轮分别有 153、156、157、158 个单元测试在 Redmi 通过，详见第 24、25、26、27、28 节。
 
 
 ## 1. 验证原则
@@ -312,3 +312,11 @@ Redmi 验证：157 个单元测试及显式 uinput 集成测试通过，Clippy �
 - 反例矩阵包括首帧、尾帧、快速短按、关麦立即重录、相同内容不同代、69 包饱和、控制事件保留、v0.4、SYNC 和统一 EOF。
 
 Redmi 验证：157 个单元测试、Clippy 和 release build 通过，真实 StartNotify、能力协商和五项 `doctor` 通过。真实 HoldToTalk 听写形成新的 Superwhisper 识别并成功上屏；主动断开后自动重连并重新完成能力协商。连续短按与立即重录仍作为后续专项验收场景。
+
+## 28. 第二十一轮 review 回归覆盖
+
+- 每次订阅前查询 `org.bluez` 当前唯一总线名，同时用于 `MatchRule::sender` 和 StartNotify 目标，忽略同路径的其他发送者。
+- `StartNotify` 的 `org.bluez.Error.NotPermitted` 映射为 `bluer::ErrorKind::NotPermitted`，复用指定设备报错和自动发现暂时跳过逻辑。
+- 用“适配器＋设备地址”的 Linux 抽象 Unix socket 防止本程序多实例同时写设备；句柄覆盖握手、录音和重连，进程退出自动释放。
+
+Redmi 验证：158 个单元测试及显式 uinput 集成测试通过，Clippy 和 release build 通过，五项 `doctor` 通过。指定设备的第二实例以状态 1 被拒绝，原服务保持 active；自动发现模式在锁释放 5 秒后找回同一设备并完成协商。

@@ -169,14 +169,33 @@ async fn forward_dbus_notifications(
     Ok(())
 }
 
+fn map_notify_error(error: zbus::Error) -> anyhow::Error {
+    match error {
+        zbus::Error::MethodError(name, _, _) if name == "org.bluez.Error.NotPermitted" => {
+            bluer::Error {
+                kind: bluer::ErrorKind::NotPermitted,
+                message: "StartNotify not permitted".to_string(),
+            }
+            .into()
+        }
+        other => other.into(),
+    }
+}
+
 async fn ordered_notifications(
     chars: &AtvvChars,
     generation: Arc<AtomicU64>,
 ) -> Result<Pin<Box<dyn Stream<Item = SessionNotification> + Send>>> {
     let paths = NotificationPaths::new(chars);
     let connection = Connection::system().await?;
+    let bluez = zbus::fdo::DBusProxy::new(&connection).await?;
+    let owner = bluez
+        .get_name_owner("org.bluez".try_into()?)
+        .await?
+        .to_string();
     let rule = MatchRule::builder()
         .msg_type(zbus::message::Type::Signal)
+        .sender(owner.as_str())?
         .interface("org.freedesktop.DBus.Properties")?
         .member("PropertiesChanged")?
         .path_namespace("/org/bluez")?
@@ -185,13 +204,14 @@ async fn ordered_notifications(
     for path in [&paths.ctl, &paths.rx] {
         Proxy::new(
             &connection,
-            "org.bluez",
+            owner.as_str(),
             path.as_str(),
             "org.bluez.GattCharacteristic1",
         )
         .await?
         .call_method("StartNotify", &())
-        .await?;
+        .await
+        .map_err(map_notify_error)?;
     }
     let queue = Arc::new(NotificationQueue::default());
     let task_queue = queue.clone();

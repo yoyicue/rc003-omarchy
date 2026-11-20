@@ -18,6 +18,10 @@ use anyhow::Context;
 use clap::Parser;
 use crossbeam_queue::ArrayQueue;
 use std::collections::HashMap;
+use std::os::{
+    linux::net::SocketAddrExt,
+    unix::net::{SocketAddr, UnixDatagram},
+};
 use std::path::PathBuf;
 use std::sync::{
     atomic::{AtomicBool, AtomicU64},
@@ -336,6 +340,12 @@ fn is_device_locked_error(e: &anyhow::Error) -> bool {
         .is_some_and(|error| matches!(error.kind, bluer::ErrorKind::NotPermitted))
 }
 
+fn acquire_device_lock(adapter: &str, address: bluer::Address) -> std::io::Result<UnixDatagram> {
+    let name = format!("rc003-omarchy/{adapter}/{address}");
+    let address = SocketAddr::from_abstract_name(&name)?;
+    UnixDatagram::bind_addr(&address)
+}
+
 /// Timeout waiting for CAPS_RESP during negotiation.
 const NEGOTIATE_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -519,6 +529,28 @@ async fn main() -> anyhow::Result<()> {
                     return shutdown.result();
                 }
             }
+        };
+
+        let _device_lock = match acquire_device_lock(adapter.name(), device.address()) {
+            Ok(lock) => lock,
+            Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => {
+                if filter_addr.is_some() {
+                    anyhow::bail!(
+                        "Device {} is already in use by another rc003-omarchy instance.",
+                        ble::redact_address(device.address())
+                    );
+                }
+                tracing::warn!(
+                    "Device {} is already in use, retrying after the lock expires",
+                    ble::redact_address(device.address())
+                );
+                excluded_addrs.insert(
+                    device.address(),
+                    tokio::time::Instant::now() + DEVICE_LOCK_EXCLUSION,
+                );
+                continue 'discover;
+            }
+            Err(error) => return Err(error.into()),
         };
 
         tokio::select! {
@@ -925,6 +957,16 @@ mod tests {
             .await
             .expect("closed PipeWire channel did not wake the lifecycle");
         assert!(shutdown.pipewire_failure().is_some());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn second_instance_cannot_bind_same_device_lock() {
+        let adapter = format!("hci-test-{}", std::process::id());
+        let address: bluer::Address = "C0:5D:39:FA:2A:1B".parse().unwrap();
+        let _first = acquire_device_lock(&adapter, address).unwrap();
+        let error = acquire_device_lock(&adapter, address).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::AddrInUse);
     }
 
     #[test]
