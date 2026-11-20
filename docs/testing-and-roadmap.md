@@ -311,4 +311,4 @@ Redmi 验证：157 个单元测试及显式 uinput 集成测试通过，Clippy �
 - START 使用 `ControlPacket { data, generation }`，与后续音频共享编号，避免两次开始积压时读取到下一代编号。
 - 反例矩阵包括首帧、尾帧、快速短按、关麦立即重录、相同内容不同代、69 包饱和、控制事件保留、v0.4、SYNC 和统一 EOF。
 
-Redmi 验证：157 个单元测试、Clippy 和 release build 通过，真实 StartNotify、能力协商和五项 `doctor` 通过。连续短按与立即重录的识别及音频来源待本次确认。
+Redmi 验证：157 个单元测试、Clippy 和 release build 通过，真实 StartNotify、能力协商和五项 `doctor` 通过。真实 HoldToTalk 听写形成新的 Superwhisper 识别并成功上屏；主动断开后自动重连并重新完成能力协商。连续短按与立即重录仍作为后续专项验收场景。
