@@ -27,8 +27,8 @@ fn notification_payload(data: Vec<u8>) -> Option<Vec<u8>> {
     (!data.is_empty()).then_some(data)
 }
 
-fn advance_generation_on_audio_start(data: &[u8], generation: &AtomicU64) {
-    if !data.is_empty() && data[0] == 0x04 {
+fn advance_generation_on_audio_start(data: &[u8], generation: &AtomicU64, v10: bool) {
+    if !data.is_empty() && data[0] == 0x04 && (!v10 || data.len() >= 4) {
         crate::audio::advance_unblocked_generation(generation);
     }
 }
@@ -95,13 +95,15 @@ impl NotificationQueue {
 struct NotificationPaths {
     ctl: String,
     rx: String,
+    v10: Arc<AtomicBool>,
 }
 
 impl NotificationPaths {
-    fn new(chars: &AtvvChars) -> Self {
+    fn new(chars: &AtvvChars, v10: Arc<AtomicBool>) -> Self {
         Self {
             ctl: characteristic_path(&chars.ctl),
             rx: characteristic_path(&chars.rx),
+            v10,
         }
     }
 }
@@ -168,7 +170,11 @@ async fn forward_dbus_notifications(
             continue;
         };
         if path.as_str() == paths.ctl {
-            advance_generation_on_audio_start(&data, &generation);
+            advance_generation_on_audio_start(
+                &data,
+                &generation,
+                paths.v10.load(Ordering::Relaxed),
+            );
             queue
                 .push(SessionNotification::Control(ControlPacket {
                     data,
@@ -203,9 +209,10 @@ fn map_notify_error(error: zbus::Error) -> anyhow::Error {
 
 async fn ordered_notifications(
     chars: &AtvvChars,
+    v10: Arc<AtomicBool>,
     generation: Arc<AtomicU64>,
 ) -> Result<Pin<Box<dyn Stream<Item = SessionNotification> + Send>>> {
-    let paths = NotificationPaths::new(chars);
+    let paths = NotificationPaths::new(chars, v10);
     let connection = Connection::system().await?;
     let bluez = zbus::fdo::DBusProxy::new(&connection).await?;
     let owner_changes = bluez
@@ -318,6 +325,7 @@ pub struct BluerDevice<'a> {
     pub device: &'a Device,
     pub chars: &'a AtvvChars,
     pub generation: Arc<AtomicU64>,
+    v10: Arc<AtomicBool>,
 }
 
 impl<'a> BluerDevice<'a> {
@@ -326,7 +334,15 @@ impl<'a> BluerDevice<'a> {
             device,
             chars,
             generation,
+            v10: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    pub fn set_protocol_version(&self, version: crate::protocol::types::ProtocolVersion) {
+        self.v10.store(
+            matches!(version, crate::protocol::types::ProtocolVersion::V1_0),
+            Ordering::Relaxed,
+        );
     }
 }
 
@@ -351,7 +367,9 @@ impl BleDevice for BluerDevice<'_> {
     }
 
     fn notifications(&self) -> BleFut<'_, BleStream<SessionNotification>> {
-        Box::pin(async { ordered_notifications(self.chars, self.generation.clone()).await })
+        Box::pin(async {
+            ordered_notifications(self.chars, self.v10.clone(), self.generation.clone()).await
+        })
     }
 
     fn connection_events(&self) -> BleFut<'_, BleStream<DeviceConnectionEvent>> {
@@ -716,7 +734,7 @@ mod tests {
             )
             .await
         );
-        advance_generation_on_audio_start(&[0x04], &generation);
+        advance_generation_on_audio_start(&[0x04], &generation, false);
         queue.push(control_event(vec![0x04], 0)).await;
         for expected in [1, 2] {
             let Some(SessionNotification::Audio(packet)) = queue.next().await else {
@@ -773,14 +791,19 @@ mod tests {
     #[test]
     fn audio_start_advances_generation_before_audio() {
         let generation = AtomicU64::new(0);
-        advance_generation_on_audio_start(&[0x04, 0x03, 0x02, 0x00], &generation);
+        advance_generation_on_audio_start(&[0x04, 0x03, 0x02, 0x00], &generation, true);
         assert_eq!(generation.load(Ordering::Relaxed), 1);
-        advance_generation_on_audio_start(&[0x00, 0x00], &generation);
+        advance_generation_on_audio_start(&[0x00, 0x00], &generation, true);
         assert_eq!(generation.load(Ordering::Relaxed), 1);
-        advance_generation_on_audio_start(&[0x04], &generation);
+        advance_generation_on_audio_start(&[0x04], &generation, false);
         assert_eq!(generation.load(Ordering::Relaxed), 2);
         generation.store(crate::audio::GENERATION_BLOCKED | 2, Ordering::Relaxed);
-        advance_generation_on_audio_start(&[0x04], &generation);
+        advance_generation_on_audio_start(&[0x04], &generation, true);
+        assert_eq!(
+            generation.load(Ordering::Relaxed),
+            crate::audio::GENERATION_BLOCKED | 2
+        );
+        advance_generation_on_audio_start(&[0x04], &generation, false);
         assert_eq!(generation.load(Ordering::Relaxed), 3);
     }
 

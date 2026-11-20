@@ -710,6 +710,7 @@ async fn main() -> anyhow::Result<()> {
                 }
             };
             excluded_addrs.remove(&device.address());
+            ble_device.set_protocol_version(caps.version);
             let _ = state_tx.send(atvv::State::Connected);
             let (mut session_protocol, codec) = match protocol::create_protocol(&caps) {
                 Ok((mut p, c)) => {
