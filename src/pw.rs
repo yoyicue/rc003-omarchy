@@ -79,6 +79,13 @@ fn is_real_consumer(monitor: Option<&bool>) -> bool {
     monitor == Some(&false)
 }
 
+fn is_audio_consumer(media_class: Option<&str>) -> bool {
+    matches!(
+        media_class,
+        Some("Stream/Input/Audio" | "Audio/Sink" | "Audio/Duplex")
+    )
+}
+
 fn advance_generation_if_current(generation: &AtomicU64, current: u64) {
     let _ = generation.compare_exchange(current, current + 1, Ordering::Relaxed, Ordering::Relaxed);
 }
@@ -397,11 +404,10 @@ pub fn run_pw_source(
                 move |global| {
                     match global.type_ {
                         ObjectType::Node => {
-                            // Bind Stream/Input/Audio nodes to get their full info.
-                            let is_audio_input =
-                                global.props.as_ref().and_then(|p| p.get("media.class"))
-                                    == Some("Stream/Input/Audio");
-                            if !is_audio_input {
+                            // Bind potential consumers to get their full info.
+                            let media_class =
+                                global.props.as_ref().and_then(|p| p.get("media.class"));
+                            if !is_audio_consumer(media_class) {
                                 return;
                             }
                             let node_id = global.id;
@@ -555,6 +561,15 @@ mod tests {
         assert_eq!(pending, vec![20, 21]);
         sync_generation(&mut pending, &mut generation, 1);
         assert_eq!(pending, vec![20, 21]);
+    }
+
+    #[test]
+    fn recording_streams_sinks_and_duplexes_are_consumer_candidates() {
+        for class in ["Stream/Input/Audio", "Audio/Sink", "Audio/Duplex"] {
+            assert!(is_audio_consumer(Some(class)));
+        }
+        assert!(!is_audio_consumer(Some("Audio/Source")));
+        assert!(!is_audio_consumer(None));
     }
 
     #[test]
