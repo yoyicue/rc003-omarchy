@@ -33,9 +33,14 @@ fn advance_generation_on_audio_start(data: &[u8], generation: &AtomicU64, v10: b
     }
 }
 
-fn learn_protocol_version(data: &[u8], v10: &mut bool) {
-    if let Some(caps) = crate::protocol::parse_caps_resp(data) {
-        *v10 = matches!(caps.version, crate::protocol::types::ProtocolVersion::V1_0);
+fn learn_protocol_version(data: &[u8], v10: &mut Option<bool>) {
+    if v10.is_none() {
+        if let Some(caps) = crate::protocol::parse_caps_resp(data) {
+            *v10 = Some(matches!(
+                caps.version,
+                crate::protocol::types::ProtocolVersion::V1_0
+            ));
+        }
     }
 }
 
@@ -134,7 +139,7 @@ async fn forward_dbus_notifications(
     generation: Arc<AtomicU64>,
     queue: Arc<NotificationQueue>,
 ) -> Result<()> {
-    let mut v10 = false;
+    let mut v10 = None;
     loop {
         let message = tokio::select! {
             message = messages.next() => match message {
@@ -176,7 +181,7 @@ async fn forward_dbus_notifications(
         };
         if path.as_str() == paths.ctl {
             learn_protocol_version(&data, &mut v10);
-            advance_generation_on_audio_start(&data, &generation, v10);
+            advance_generation_on_audio_start(&data, &generation, v10.unwrap_or(false));
             queue
                 .push(SessionNotification::Control(ControlPacket {
                     data,
@@ -779,20 +784,23 @@ mod tests {
     }
 
     #[test]
-    fn caps_resp_updates_version_before_start() {
-        let mut v10 = false;
+    fn first_caps_resp_pins_protocol_version() {
+        let v10_caps = [0x0B, 0x01, 0x00, 0x01, 0x00, 0x00, 0x78];
+        let v04_caps = [0x0B, 0x00, 0x04, 0x00, 0x01, 0x00, 0x78, 0x00, 0x78];
         let generation = AtomicU64::new(0);
-        learn_protocol_version(&[0x0B, 0x01, 0x00, 0x01, 0x00, 0x00, 0x78], &mut v10);
-        assert!(v10);
-        advance_generation_on_audio_start(&[0x04, 0x03, 0x02, 0x00], &generation, v10);
-        advance_generation_on_audio_start(&[0x04], &generation, v10);
+        let mut v10 = None;
+        learn_protocol_version(&v10_caps, &mut v10);
+        learn_protocol_version(&v04_caps, &mut v10);
+        assert_eq!(v10, Some(true));
+        advance_generation_on_audio_start(&[0x04, 0x03, 0x02, 0x00], &generation, v10.unwrap());
+        advance_generation_on_audio_start(&[0x04], &generation, v10.unwrap());
         assert_eq!(generation.load(Ordering::Relaxed), 1);
-        learn_protocol_version(
-            &[0x0B, 0x00, 0x04, 0x00, 0x01, 0x00, 0x78, 0x00, 0x78],
-            &mut v10,
-        );
-        assert!(!v10);
-        advance_generation_on_audio_start(&[0x04], &generation, v10);
+
+        let mut v10 = None;
+        learn_protocol_version(&v04_caps, &mut v10);
+        learn_protocol_version(&v10_caps, &mut v10);
+        assert_eq!(v10, Some(false));
+        advance_generation_on_audio_start(&[0x04], &generation, v10.unwrap());
         assert_eq!(generation.load(Ordering::Relaxed), 2);
     }
 
