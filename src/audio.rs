@@ -1,63 +1,61 @@
-use std::sync::{
-    atomic::{AtomicU64, Ordering},
-    Arc,
-};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+#[derive(Clone, Copy, Debug, Default)]
+struct TailState {
+    deadline_ms: u64,
+    generation: u64,
+}
 
 #[derive(Clone, Debug)]
 pub struct TailDeadline {
     started: Instant,
-    deadline_ms: Arc<AtomicU64>,
-    generation: Arc<AtomicU64>,
+    state: Arc<std::sync::Mutex<TailState>>,
 }
 
 impl TailDeadline {
     pub fn new() -> Self {
         Self {
             started: Instant::now(),
-            deadline_ms: Arc::new(AtomicU64::new(0)),
-            generation: Arc::new(AtomicU64::new(0)),
+            state: Arc::new(std::sync::Mutex::new(TailState::default())),
         }
     }
 
     pub fn arm_after(&self, duration: Duration, generation: u64) {
-        self.generation.store(generation, Ordering::Relaxed);
-        self.arm_elapsed(self.started.elapsed().saturating_add(duration));
+        self.arm_elapsed(self.started.elapsed().saturating_add(duration), generation);
     }
 
     pub fn clear(&self) {
-        self.deadline_ms.store(0, Ordering::Relaxed);
+        self.state.lock().unwrap().deadline_ms = 0;
     }
 
     pub fn is_armed(&self) -> bool {
-        self.deadline_ms.load(Ordering::Relaxed) != 0
-    }
-
-    pub fn generation(&self) -> u64 {
-        self.generation.load(Ordering::Relaxed)
+        self.state.lock().unwrap().deadline_ms != 0
     }
 
     #[cfg(test)]
     pub fn deadline_ms(&self) -> u64 {
-        self.deadline_ms.load(Ordering::Relaxed)
+        self.state.lock().unwrap().deadline_ms
     }
 
-    pub fn expire_if_due(&self) -> bool {
+    pub fn expire_if_due(&self) -> Option<u64> {
         self.expire_at(self.started.elapsed())
     }
 
-    fn arm_elapsed(&self, elapsed: Duration) {
-        self.deadline_ms.store(millis(elapsed), Ordering::Relaxed);
+    fn arm_elapsed(&self, elapsed: Duration, generation: u64) {
+        *self.state.lock().unwrap() = TailState {
+            deadline_ms: millis(elapsed),
+            generation,
+        };
     }
 
-    fn expire_at(&self, elapsed: Duration) -> bool {
-        let deadline = self.deadline_ms.load(Ordering::Relaxed);
-        deadline != 0
-            && millis(elapsed) >= deadline
-            && self
-                .deadline_ms
-                .compare_exchange(deadline, 0, Ordering::Relaxed, Ordering::Relaxed)
-                .is_ok()
+    fn expire_at(&self, elapsed: Duration) -> Option<u64> {
+        let mut state = self.state.try_lock().ok()?;
+        if state.deadline_ms != 0 && millis(elapsed) >= state.deadline_ms {
+            state.deadline_ms = 0;
+            return Some(state.generation);
+        }
+        None
     }
 }
 
@@ -72,19 +70,19 @@ mod tests {
     #[test]
     fn deadline_expires_only_once_at_the_monotonic_boundary() {
         let deadline = TailDeadline::new();
-        deadline.arm_elapsed(Duration::from_secs(1));
+        deadline.arm_elapsed(Duration::from_secs(1), 7);
         assert!(deadline.is_armed());
-        assert!(!deadline.expire_at(Duration::from_millis(999)));
-        assert!(deadline.expire_at(Duration::from_secs(1)));
+        assert_eq!(deadline.expire_at(Duration::from_millis(999)), None);
+        assert_eq!(deadline.expire_at(Duration::from_secs(1)), Some(7));
         assert!(!deadline.is_armed());
-        assert!(!deadline.expire_at(Duration::from_secs(60)));
+        assert_eq!(deadline.expire_at(Duration::from_secs(60)), None);
     }
 
     #[test]
     fn clearing_a_deadline_prevents_expiry() {
         let deadline = TailDeadline::new();
-        deadline.arm_elapsed(Duration::from_secs(1));
+        deadline.arm_elapsed(Duration::from_secs(1), 0);
         deadline.clear();
-        assert!(!deadline.expire_at(Duration::from_secs(60)));
+        assert_eq!(deadline.expire_at(Duration::from_secs(60)), None);
     }
 }

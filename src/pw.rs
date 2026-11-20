@@ -56,9 +56,22 @@ fn sync_generation(pending: &mut Vec<i16>, previous: &mut u64, current: u64) {
     }
 }
 
-fn sync_consumer_generation(generation: &AtomicU64, previous: u32, current: u32) {
-    if (previous == 0) != (current == 0) {
-        generation.fetch_add(1, Ordering::Relaxed);
+fn sync_consumer_generation(
+    generation: &AtomicU64,
+    disconnected: &std::cell::Cell<Option<u64>>,
+    previous: u32,
+    current: u32,
+) {
+    match (previous == 0, current == 0) {
+        (false, true) => {
+            disconnected.set(Some(generation.fetch_add(1, Ordering::Relaxed) + 1));
+        }
+        (true, false) => {
+            if let Some(expired) = disconnected.take() {
+                advance_generation_if_current(generation, expired);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -67,8 +80,8 @@ fn advance_generation_if_current(generation: &AtomicU64, current: u64) {
 }
 
 fn expire_tail_generation(tail: &crate::audio::TailDeadline, generation: &AtomicU64) {
-    if tail.expire_if_due() {
-        advance_generation_if_current(generation, tail.generation());
+    if let Some(expired) = tail.expire_if_due() {
+        advance_generation_if_current(generation, expired);
     }
 }
 
@@ -331,6 +344,7 @@ pub fn run_pw_source(
         // Last emitted consumer count (to avoid duplicate events).
         let last_count: std::rc::Rc<std::cell::Cell<u32>> =
             std::rc::Rc::new(std::cell::Cell::new(0));
+        let disconnected_generation = std::rc::Rc::new(std::cell::Cell::new(None));
         // Bound proxies (must stay alive): link proxies + node proxies with listeners.
         let proxies: std::rc::Rc<
             std::cell::RefCell<std::collections::HashMap<u32, Box<dyn std::any::Any>>>,
@@ -341,6 +355,7 @@ pub fn run_pw_source(
             let our_links = our_links.clone();
             let node_is_monitor = node_is_monitor.clone();
             let last_count = last_count.clone();
+            let disconnected_generation = disconnected_generation.clone();
             let consumer_tx = consumer_tx.clone();
             move || {
                 let links = our_links.borrow();
@@ -351,7 +366,12 @@ pub fn run_pw_source(
                     .count() as u32;
                 let previous = last_count.get();
                 if count != previous {
-                    sync_consumer_generation(&consumer_generation, previous, count);
+                    sync_consumer_generation(
+                        &consumer_generation,
+                        &disconnected_generation,
+                        previous,
+                        count,
+                    );
                     last_count.set(count);
                     tracing::debug!("PipeWire consumer count: {count}");
                     if let Err(e) = consumer_tx.send(crate::consumer::ConsumerEvent::Changed(count))
@@ -537,13 +557,19 @@ mod tests {
     #[test]
     fn consumer_presence_transitions_invalidate_audio() {
         let generation = AtomicU64::new(0);
-        sync_consumer_generation(&generation, 0, 1);
+        let disconnected = std::cell::Cell::new(None);
+        sync_consumer_generation(&generation, &disconnected, 0, 1);
+        assert_eq!(generation.load(Ordering::Relaxed), 0);
+        sync_consumer_generation(&generation, &disconnected, 1, 0);
         assert_eq!(generation.load(Ordering::Relaxed), 1);
-        sync_consumer_generation(&generation, 1, 0);
+        sync_consumer_generation(&generation, &disconnected, 0, 1);
         assert_eq!(generation.load(Ordering::Relaxed), 2);
-        sync_consumer_generation(&generation, 0, 1);
+        sync_consumer_generation(&generation, &disconnected, 1, 0);
         assert_eq!(generation.load(Ordering::Relaxed), 3);
-        sync_consumer_generation(&generation, 1, 0);
+        generation.fetch_add(1, Ordering::Relaxed);
+        sync_consumer_generation(&generation, &disconnected, 0, 1);
+        assert_eq!(generation.load(Ordering::Relaxed), 4);
+        sync_consumer_generation(&generation, &disconnected, 1, 2);
         assert_eq!(generation.load(Ordering::Relaxed), 4);
     }
 
