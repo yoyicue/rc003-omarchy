@@ -85,7 +85,9 @@ impl NotificationQueue {
         }
     }
 
-    fn close(&self) {
+    async fn close(&self) {
+        let mut events = self.events.lock().await;
+        events.clear();
         self.closed.store(true, Ordering::Relaxed);
     }
 }
@@ -207,7 +209,7 @@ async fn ordered_notifications(
     let connection = Connection::system().await?;
     let bluez = zbus::fdo::DBusProxy::new(&connection).await?;
     let owner_changes = bluez
-        .receive_name_owner_changed_with_args(&[(0, "org.bluez"), (2, "")])
+        .receive_name_owner_changed_with_args(&[(0, "org.bluez")])
         .await?;
     let owner = bluez
         .get_name_owner("org.bluez".try_into()?)
@@ -246,7 +248,7 @@ async fn ordered_notifications(
             task_queue.clone(),
         )
         .await;
-        task_queue.close();
+        task_queue.close().await;
     });
     Ok(audio_stream(task, queue))
 }
@@ -763,7 +765,8 @@ mod tests {
     #[tokio::test]
     async fn closed_notification_queue_returns_none() {
         let queue = NotificationQueue::default();
-        queue.close();
+        queue.push(control_event(vec![0x04], 0)).await;
+        queue.close().await;
         assert!(queue.next().await.is_none());
     }
 
