@@ -121,11 +121,28 @@ async fn forward_dbus_notifications(
     connection: Connection,
     paths: NotificationPaths,
     mut messages: MessageStream,
+    mut owner_changes: zbus::fdo::NameOwnerChangedStream,
+    owner: String,
     generation: Arc<AtomicU64>,
     queue: Arc<NotificationQueue>,
 ) -> Result<()> {
-    while let Some(message) = messages.next().await {
-        let message = message?;
+    loop {
+        let message = tokio::select! {
+            message = messages.next() => match message {
+                Some(message) => message?,
+                None => break,
+            },
+            change = owner_changes.next() => match change {
+                Some(change) => {
+                    let args = change.args()?;
+                    if args.old_owner().as_ref().is_some_and(|old| old.as_str() == owner) {
+                        break;
+                    }
+                    continue;
+                }
+                None => break,
+            },
+        };
         let header = message.header();
         let Some(path) = header.path() else {
             continue;
@@ -189,6 +206,9 @@ async fn ordered_notifications(
     let paths = NotificationPaths::new(chars);
     let connection = Connection::system().await?;
     let bluez = zbus::fdo::DBusProxy::new(&connection).await?;
+    let owner_changes = bluez
+        .receive_name_owner_changed_with_args(&[(0, "org.bluez"), (2, "")])
+        .await?;
     let owner = bluez
         .get_name_owner("org.bluez".try_into()?)
         .await?
@@ -216,9 +236,16 @@ async fn ordered_notifications(
     let queue = Arc::new(NotificationQueue::default());
     let task_queue = queue.clone();
     let task = tokio::spawn(async move {
-        let _ =
-            forward_dbus_notifications(connection, paths, messages, generation, task_queue.clone())
-                .await;
+        let _ = forward_dbus_notifications(
+            connection,
+            paths,
+            messages,
+            owner_changes,
+            owner,
+            generation,
+            task_queue.clone(),
+        )
+        .await;
         task_queue.close();
     });
     Ok(audio_stream(task, queue))

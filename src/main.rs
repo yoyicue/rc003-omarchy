@@ -455,18 +455,6 @@ async fn main() -> anyhow::Result<()> {
 
     let mut shutdown = ShutdownSignal::new()?;
 
-    let _input_handle = if cli.no_input {
-        None
-    } else {
-        Some(input::InputManagerHandle::start_with_release_grab(
-            config.input.release_grab_on_exit,
-            Duration::from_millis(config.audio.release_drain_ms),
-            input::voice_key_code(&config.input.voice_key)?,
-            config.mapping.enabled,
-            cli.device.clone(),
-        )?)
-    };
-
     let retry_delay = Duration::from_millis(config.device.reconnect_initial_ms);
     let discovery_retry_delay = retry_delay;
     let reconnect_max_delay = Duration::from_millis(config.device.reconnect_max_ms);
@@ -551,6 +539,18 @@ async fn main() -> anyhow::Result<()> {
                 continue 'discover;
             }
             Err(error) => return Err(error.into()),
+        };
+
+        let _input_handle = if cli.no_input {
+            None
+        } else {
+            Some(input::InputManagerHandle::start_with_release_grab(
+                config.input.release_grab_on_exit,
+                Duration::from_millis(config.audio.release_drain_ms),
+                input::voice_key_code(&config.input.voice_key)?,
+                config.mapping.enabled,
+                Some(device.address().to_string()),
+            )?)
         };
 
         tokio::select! {
