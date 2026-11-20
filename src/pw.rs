@@ -79,11 +79,15 @@ fn is_active_consumer(passive: Option<bool>, monitor: Option<&bool>) -> bool {
     passive == Some(false) && monitor == Some(&false)
 }
 
+fn pipewire_bool(value: Option<&str>) -> bool {
+    matches!(value, Some("true" | "1"))
+}
+
 fn update_passive(state: &mut Option<bool>, props_changed: bool, value: Option<&str>) -> bool {
     if !props_changed {
         return false;
     }
-    let passive = matches!(value, Some("true" | "1"));
+    let passive = pipewire_bool(value);
     if *state == Some(passive) {
         return false;
     }
@@ -435,9 +439,9 @@ pub fn run_pw_source(
                                     let node_is_monitor = node_is_monitor.clone();
                                     let recount = recount.clone();
                                     move |info| {
-                                        let is_monitor =
-                                            info.props().and_then(|p| p.get("stream.monitor"))
-                                                == Some("true");
+                                        let is_monitor = pipewire_bool(
+                                            info.props().and_then(|p| p.get("stream.monitor")),
+                                        );
                                         let mut map = node_is_monitor.borrow_mut();
                                         let was_monitor =
                                             map.get(&node_id).copied().unwrap_or(false);
