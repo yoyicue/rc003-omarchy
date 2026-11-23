@@ -330,3 +330,14 @@ Redmi 验证：158 个单元测试及显式 uinput 集成测试通过，Clippy �
 - D-Bus 接口与对象路径统一为 `org.rc003omarchy.Daemon` / `/org/rc003omarchy/Daemon`；修正 systemd 示例路径至 `%h/.local/bin/rc003-omarchy`；补充 `THIRD_PARTY_NOTICES.md` 与 `.github/workflows/ci.yml`。
 
 Redmi 实机验证：176 个单元测试通过、显式 `uinput_end_to_end_voice_mapping` 集成测试通过（实测 udev `IN_ATTRIB` 233ms 即刻唤醒接管、同批 down/up 逐事件发出）、Clippy（默认与 `--features dbus`，`-D warnings`）及 release build 通过，六项 `doctor` 检查（`bluetooth`、`uinput`、`input`、`pipewire`、`superwhisper`、`shortcut`）运行正常。
+
+## 30. 第二十三轮：唤醒瞬时接管、锁语义收口与边界修复
+
+- 固定设备模式改为在启动常驻资源之前即获取每设备抽象 Unix socket 锁，重复实例在创建 PipeWire/uinput/D-Bus 资源前快速拒绝；已持锁后若 `StartNotify` 遇 BlueZ `NotPermitted`，固定设备模式降级为告警并退避重试（避免链路加密/重连竞态导致守护进程退出），自动发现模式保持临时排除并重找设备。
+- `InputManagerHandle` 提升到 `'discover` 循环之前与 PipeWire 音源一同常驻，支持通过控制管道热更新目标蓝牙地址（`TargetAddress`）：固定设备模式开机即监听并瞬时接管唤醒后的 RC003 节点，自动发现模式以 `TargetAddress::None` 常驻虚拟设备，拿到设备锁后再动态绑定目标并在释放时清理旧设备与挂起按键。
+- D-Bus 服务（`--features dbus`）同步提升至外层常驻，`DaemonInfo.device_address` 改由 `watch::Receiver<String>` 动态反映当前目标设备，断连或切回自动发现时不反复注销重绑总线名；进入已连接状态前排空断连期间积压的外部控制命令。
+- BLE 音频通知队列满载淘汰最旧音频包时在下一包标记 `discontinuity`，会话与 v1.0 解码器据此清空残留半帧（`headered` 模式下若后续包未帧对齐则等待下一次 `AUDIO_SYNC`），防止 64 包溢出后永久帧偏移。
+- PipeWire 消费者监控在 `Stream::state_changed` 报告自身 `node_id` 之前到达的 `Link` 全局对象先暂存并绑定 `info` 监听器，拿到 `node_id` 后立即提升匹配链路并释放无关代理，消除启动竞态丢链接。
+- 按键重复改为按映射后的目标键（`Up/Down/Left/Right/Backspace/VolumeUp/VolumeDown/PageUp/PageDown`）判定而非原始键码；`doctor` 与 `test-keys` 的 evdev 枚举同步按 `--device` / `config.device.address` 过滤；`udev/70-rc003-omarchy.rules` 第一条显式补充 `GROUP="input", MODE="0660"`。
+
+验证状态：代码格式化、Linux 全量单元测试（含上述新增回归测试）、Clippy（默认与 `--features dbus`，`-D warnings`）与 release 编译由 GitHub Actions CI 覆盖；当前 Redmi 处于离线/休眠状态，待设备唤醒后需在 Redmi 同步 `main`、重新安装 `~/.local/bin/rc003-omarchy`（`service install --apply --force`）并复验 `uinput` 集成测试、六项 `doctor` 与实体听写（若需启用更新后的 udev 规则，由用户按 README 手动执行 `sudo install`）。

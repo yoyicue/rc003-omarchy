@@ -140,6 +140,71 @@ fn stream_failure(old: &StreamState, new: &StreamState, shutting_down: bool) -> 
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PendingLink {
+    output_node: u32,
+    input_node: u32,
+    passive: Option<bool>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PromotedLink {
+    link_id: u32,
+    other_node: u32,
+    passive: Option<bool>,
+}
+
+#[derive(Debug, Default)]
+struct PendingLinks {
+    entries: std::collections::HashMap<u32, PendingLink>,
+}
+
+impl PendingLinks {
+    fn insert(&mut self, link_id: u32, output_node: u32, input_node: u32) {
+        self.entries.insert(
+            link_id,
+            PendingLink {
+                output_node,
+                input_node,
+                passive: None,
+            },
+        );
+    }
+
+    fn update_passive(&mut self, link_id: u32, props_changed: bool, value: Option<&str>) -> bool {
+        self.entries
+            .get_mut(&link_id)
+            .is_some_and(|link| update_passive(&mut link.passive, props_changed, value))
+    }
+
+    fn remove(&mut self, link_id: u32) -> bool {
+        self.entries.remove(&link_id).is_some()
+    }
+
+    fn drain_for_node(&mut self, our_id: u32) -> (Vec<PromotedLink>, Vec<u32>) {
+        let mut matched = Vec::new();
+        let mut unrelated = Vec::new();
+        for (link_id, link) in self.entries.drain() {
+            if link.output_node == our_id {
+                matched.push(PromotedLink {
+                    link_id,
+                    other_node: link.input_node,
+                    passive: link.passive,
+                });
+            } else if link.input_node == our_id {
+                matched.push(PromotedLink {
+                    link_id,
+                    other_node: link.output_node,
+                    passive: link.passive,
+                });
+            } else {
+                unrelated.push(link_id);
+            }
+        }
+        (matched, unrelated)
+    }
+}
+
 /// Run the PipeWire audio source on the current thread (blocking).
 ///
 /// Reads decoded PCM frames from `audio_rx` and pushes them to PipeWire as a
@@ -212,6 +277,9 @@ pub fn run_pw_source(
     // Track our PipeWire node ID once the stream reaches Paused/Streaming.
     let our_node_id: std::rc::Rc<std::cell::Cell<u32>> =
         std::rc::Rc::new(std::cell::Cell::new(u32::MAX));
+    #[allow(clippy::type_complexity)]
+    let on_node_id_ready: std::rc::Rc<std::cell::RefCell<Option<Box<dyn FnMut(u32)>>>> =
+        std::rc::Rc::new(std::cell::RefCell::new(None));
 
     let consumer_generation = generation.clone();
     let mut startup_tx = startup_tx;
@@ -219,15 +287,19 @@ pub fn run_pw_source(
         .add_local_listener_with_user_data(())
         .state_changed({
             let our_node_id = our_node_id.clone();
+            let on_node_id_ready = on_node_id_ready.clone();
             let stream_for_id = stream.clone();
             let mainloop = mainloop.clone();
             move |_, _, old, new| {
                 tracing::debug!("PipeWire stream state: {old:?} -> {new:?}");
                 if matches!(&new, StreamState::Paused | StreamState::Streaming) {
                     let id = stream_for_id.node_id();
-                    if id != u32::MAX {
+                    if id != u32::MAX && our_node_id.get() == u32::MAX {
                         our_node_id.set(id);
                         tracing::debug!("PipeWire node ID: {id}");
+                        if let Some(mut callback) = on_node_id_ready.borrow_mut().take() {
+                            callback(id);
+                        }
                     }
                     if let Some(startup_tx) = startup_tx.take() {
                         let _ = startup_tx.send(Ok(()));
@@ -396,6 +468,12 @@ pub fn run_pw_source(
         let proxies: std::rc::Rc<
             std::cell::RefCell<std::collections::HashMap<u32, Box<dyn std::any::Any>>>,
         > = std::rc::Rc::new(std::cell::RefCell::new(std::collections::HashMap::new()));
+        // Links discovered before Stream::state_changed reports our_node_id.
+        let pending_links: std::rc::Rc<std::cell::RefCell<PendingLinks>> =
+            std::rc::Rc::new(std::cell::RefCell::new(PendingLinks::default()));
+        let pending_proxies: std::rc::Rc<
+            std::cell::RefCell<std::collections::HashMap<u32, Box<dyn std::any::Any>>>,
+        > = std::rc::Rc::new(std::cell::RefCell::new(std::collections::HashMap::new()));
 
         // Count only classified, non-passive links to real consumers.
         let recount = {
@@ -425,13 +503,48 @@ pub fn run_pw_source(
             }
         };
 
+        *on_node_id_ready.borrow_mut() = Some(Box::new({
+            let pending_links = pending_links.clone();
+            let pending_proxies = pending_proxies.clone();
+            let our_links = our_links.clone();
+            let proxies = proxies.clone();
+            let recount = recount.clone();
+            move |our_id| {
+                let (matched, unrelated) = pending_links.borrow_mut().drain_for_node(our_id);
+                {
+                    let mut pend_proxies = pending_proxies.borrow_mut();
+                    for id in unrelated {
+                        pend_proxies.remove(&id);
+                    }
+                    let mut links = our_links.borrow_mut();
+                    let mut active_proxies = proxies.borrow_mut();
+                    for promoted in &matched {
+                        tracing::debug!(
+                            "Promoting buffered PipeWire link to our node (id={}, other_node={})",
+                            promoted.link_id,
+                            promoted.other_node
+                        );
+                        links.insert(promoted.link_id, (promoted.other_node, promoted.passive));
+                        if let Some(proxy) = pend_proxies.remove(&promoted.link_id) {
+                            active_proxies.insert(promoted.link_id, proxy);
+                        }
+                    }
+                }
+                if !matched.is_empty() {
+                    recount();
+                }
+            }
+        }));
+
         let listener = registry
             .add_listener_local()
             .global({
                 let our_node_id = our_node_id.clone();
                 let our_links = our_links.clone();
+                let pending_links = pending_links.clone();
                 let node_is_monitor = node_is_monitor.clone();
                 let proxies = proxies.clone();
+                let pending_proxies = pending_proxies.clone();
                 let registry = registry.clone();
                 let recount = recount.clone();
                 move |global| {
@@ -485,30 +598,79 @@ pub fn run_pw_source(
                                 .insert(node_id, Box::new((node_listener, node)));
                         }
                         ObjectType::Link => {
-                            let our_id = our_node_id.get();
-                            if our_id == u32::MAX {
-                                return;
-                            }
                             let Some(props) = &global.props else {
                                 return;
                             };
-                            let output_node = props
+                            let Some(output_node) = props
                                 .get("link.output.node")
-                                .and_then(|v| v.parse::<u32>().ok());
-                            let input_node = props
+                                .and_then(|v| v.parse::<u32>().ok())
+                            else {
+                                return;
+                            };
+                            let Some(input_node) = props
                                 .get("link.input.node")
-                                .and_then(|v| v.parse::<u32>().ok());
-                            if output_node != Some(our_id) && input_node != Some(our_id) {
+                                .and_then(|v| v.parse::<u32>().ok())
+                            else {
+                                return;
+                            };
+
+                            let our_id = our_node_id.get();
+                            let link_id = global.id;
+                            if our_id == u32::MAX {
+                                // Buffer until state_changed reports our node ID so early
+                                // WirePlumber auto-links are never lost.
+                                let Ok(link) = registry.bind::<pipewire::link::Link, _>(global)
+                                else {
+                                    return;
+                                };
+                                pending_links
+                                    .borrow_mut()
+                                    .insert(link_id, output_node, input_node);
+                                let link_listener = link
+                                    .add_listener_local()
+                                    .info({
+                                        let our_links = our_links.clone();
+                                        let pending_links = pending_links.clone();
+                                        let recount = recount.clone();
+                                        move |info| {
+                                            let props_changed = info
+                                                .change_mask()
+                                                .contains(pipewire::link::LinkChangeMask::PROPS);
+                                            let passive =
+                                                info.props().and_then(|p| p.get("link.passive"));
+                                            let changed_active = {
+                                                let mut links = our_links.borrow_mut();
+                                                links.get_mut(&link_id).is_some_and(|(_, state)| {
+                                                    update_passive(state, props_changed, passive)
+                                                })
+                                            };
+                                            if changed_active {
+                                                recount();
+                                            } else {
+                                                pending_links.borrow_mut().update_passive(
+                                                    link_id,
+                                                    props_changed,
+                                                    passive,
+                                                );
+                                            }
+                                        }
+                                    })
+                                    .register();
+                                pending_proxies
+                                    .borrow_mut()
+                                    .insert(link_id, Box::new((link_listener, link)));
                                 return;
                             }
-                            let other_node = if output_node == Some(our_id) {
+
+                            if output_node != our_id && input_node != our_id {
+                                return;
+                            }
+                            let other_id = if output_node == our_id {
                                 input_node
                             } else {
                                 output_node
                             };
-                            let Some(other_id) = other_node else { return };
 
-                            let link_id = global.id;
                             tracing::debug!(
                                 "PipeWire link to our node (id={link_id}, other_node={other_id})"
                             );
@@ -553,11 +715,15 @@ pub fn run_pw_source(
             })
             .global_remove({
                 let our_links = our_links.clone();
+                let pending_links = pending_links.clone();
                 let node_is_monitor = node_is_monitor.clone();
                 let proxies = proxies.clone();
+                let pending_proxies = pending_proxies.clone();
                 let recount = recount.clone();
                 move |id| {
                     proxies.borrow_mut().remove(&id);
+                    pending_proxies.borrow_mut().remove(&id);
+                    pending_links.borrow_mut().remove(id);
                     let had_link = our_links.borrow_mut().remove(&id).is_some();
                     let had_node = node_is_monitor.borrow_mut().remove(&id).is_some();
                     if had_link || had_node {
@@ -567,7 +733,11 @@ pub fn run_pw_source(
             })
             .register();
 
-        (Some(registry), Some(listener), Some(proxies))
+        (
+            Some(registry),
+            Some(listener),
+            Some((proxies, pending_proxies)),
+        )
     } else {
         (None, None, None)
     };
@@ -747,5 +917,37 @@ mod tests {
         assert!(stream_failure(&StreamState::Paused, &StreamState::Unconnected, false).is_some());
         assert!(stream_failure(&StreamState::Paused, &StreamState::Unconnected, true).is_none());
         assert!(stream_failure(&StreamState::Connecting, &StreamState::Paused, false).is_none());
+    }
+
+    #[test]
+    fn pending_links_promote_matches_and_drop_unrelated() {
+        let mut pending = PendingLinks::default();
+        pending.insert(10, 42, 100);
+        pending.insert(11, 200, 42);
+        pending.insert(12, 300, 400);
+        pending.insert(13, 42, 500);
+        assert!(pending.update_passive(10, true, None));
+        assert!(pending.update_passive(11, true, Some("true")));
+        assert!(pending.remove(13));
+
+        let (mut matched, unrelated) = pending.drain_for_node(42);
+        matched.sort_by_key(|link| link.link_id);
+        assert_eq!(
+            matched,
+            vec![
+                PromotedLink {
+                    link_id: 10,
+                    other_node: 100,
+                    passive: Some(false),
+                },
+                PromotedLink {
+                    link_id: 11,
+                    other_node: 200,
+                    passive: Some(true),
+                },
+            ]
+        );
+        assert_eq!(unrelated, vec![12]);
+        assert!(pending.entries.is_empty());
     }
 }

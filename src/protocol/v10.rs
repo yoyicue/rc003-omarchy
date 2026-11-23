@@ -48,6 +48,7 @@ pub struct ProtocolV10 {
     pub(crate) frame_seq: u16,
     audio_buffer: Vec<u8>,
     header_mode: bool,
+    awaiting_sync: bool,
 }
 
 impl Default for ProtocolV10 {
@@ -60,6 +61,7 @@ impl Default for ProtocolV10 {
             frame_seq: 0,
             audio_buffer: Vec::new(),
             header_mode: false,
+            awaiting_sync: false,
         }
     }
 }
@@ -160,6 +162,7 @@ impl Protocol for ProtocolV10 {
         self.interaction_model = caps.interaction_model;
         self.audio_frame_size = caps.audio_frame_size;
         self.audio_buffer.clear();
+        self.awaiting_sync = false;
         Ok(codec)
     }
 
@@ -167,6 +170,9 @@ impl Protocol for ProtocolV10 {
         let Some(codec) = self.selected_codec else {
             return Vec::new();
         };
+        if self.awaiting_sync {
+            return Vec::new();
+        }
         self.audio_buffer.extend_from_slice(data);
 
         let plain_size = self.audio_frame_size.0 as usize;
@@ -205,20 +211,34 @@ impl Protocol for ProtocolV10 {
     fn set_frame_layout(&mut self, layout: AudioFrameLayout) {
         self.header_mode = layout == AudioFrameLayout::Headered;
         self.audio_buffer.clear();
+        self.awaiting_sync = false;
     }
 
     fn has_partial_audio(&self) -> bool {
         !self.audio_buffer.is_empty()
     }
 
+    fn on_audio_discontinuity(&mut self, next_packet_len: usize) {
+        self.audio_buffer.clear();
+        let plain_size = self.audio_frame_size.0 as usize;
+        if self.header_mode && plain_size > 0 {
+            let wire_size = plain_size + 6;
+            if next_packet_len == 0 || !next_packet_len.is_multiple_of(wire_size) {
+                self.awaiting_sync = true;
+            }
+        }
+    }
+
     fn on_audio_start(&mut self) {
         self.audio_buffer.clear();
+        self.awaiting_sync = false;
         self.frame_seq = 0;
         self.decoder.reset(0, 0);
     }
 
     fn on_audio_sync(&mut self, sync: &AudioSyncData) {
         self.audio_buffer.clear();
+        self.awaiting_sync = false;
         match sync {
             AudioSyncData::Full {
                 codec,
@@ -661,5 +681,42 @@ mod tests {
             CtlEvent::Unknown(data) => assert_eq!(data, vec![0xFF, 0x01, 0x02]),
             other => panic!("expected Unknown for unknown opcode, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn test_discontinuity_clears_partial_raw_and_waits_for_sync_on_fragmented_headered() {
+        // Raw mode: clears orphan half-frame and resumes decoding cleanly.
+        let mut raw = ProtocolV10::new();
+        raw.selected_codec = Some(Codec::Adpcm16kHz);
+        raw.audio_frame_size = AudioFrameSize(120);
+        assert!(raw.decode_audio(&[0xAAu8; 60]).is_empty());
+        assert!(raw.has_partial_audio());
+        raw.on_audio_discontinuity(120);
+        assert!(!raw.has_partial_audio());
+        assert_eq!(raw.decode_audio(&[0u8; 120]).len(), 1);
+
+        // Headered mode with fragmented packet after drop: waits for AUDIO_SYNC.
+        let mut hdr = ProtocolV10::new();
+        hdr.selected_codec = Some(Codec::Adpcm16kHz);
+        hdr.audio_frame_size = AudioFrameSize(120);
+        hdr.set_frame_layout(AudioFrameLayout::Headered);
+        assert!(hdr.decode_audio(&[0u8; 60]).is_empty());
+        hdr.on_audio_discontinuity(66);
+        assert!(!hdr.has_partial_audio());
+        assert!(hdr.decode_audio(&[0u8; 66]).is_empty());
+        assert!(hdr.decode_audio(&[0u8; 126]).is_empty());
+        hdr.on_audio_sync(&AudioSyncData::Full {
+            codec: Codec::Adpcm16kHz,
+            seq: 5,
+            predictor: 0,
+            step_index: 0,
+        });
+        let frames = hdr.decode_audio(&[0u8; 126]);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].seq, 5);
+
+        // Headered mode with full aligned frame after drop: keeps decoding immediately.
+        hdr.on_audio_discontinuity(126);
+        assert_eq!(hdr.decode_audio(&[0u8; 126]).len(), 1);
     }
 }

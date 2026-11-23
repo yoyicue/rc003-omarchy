@@ -399,6 +399,23 @@ async fn negotiate(
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NotifyLockAction {
+    /// Auto-discovery mode: temporarily exclude this device and look for another.
+    SkipAndRediscover,
+    /// Fixed-device mode (this process already holds the device lock):
+    /// treat `StartNotify` `NotPermitted` as retryable rather than crashing.
+    Retry,
+}
+
+fn notify_not_permitted_action(fixed_device: bool) -> NotifyLockAction {
+    if fixed_device {
+        NotifyLockAction::Retry
+    } else {
+        NotifyLockAction::SkipAndRediscover
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let mut cli = Cli::parse();
@@ -411,8 +428,14 @@ async fn main() -> anyhow::Result<()> {
                 println!("Focus a test input field, then hold and release the RC003 voice key.");
             }
             other => {
-                return commands::run(other, cli.config.as_deref(), &config, cli.name.as_deref())
-                    .await;
+                return commands::run(
+                    other,
+                    cli.config.as_deref(),
+                    &config,
+                    cli.name.as_deref(),
+                    cli.device.as_deref(),
+                )
+                .await;
             }
         }
     }
@@ -497,6 +520,24 @@ async fn main() -> anyhow::Result<()> {
         .expect("node description was configured");
     let gain = cli.gain.unwrap_or(config.audio.gain_db);
 
+    // In fixed-device mode, acquire the per-device lock before starting resident
+    // PipeWire, uinput, and D-Bus resources so a duplicate instance fails fast
+    // without touching audio/input devices.
+    let _fixed_device_lock = if let Some(addr) = filter_addr {
+        match acquire_device_lock(adapter.name(), addr) {
+            Ok(lock) => Some(lock),
+            Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => {
+                anyhow::bail!(
+                    "Device {} is already in use by another rc003-omarchy instance.",
+                    ble::redact_address(addr)
+                );
+            }
+            Err(error) => return Err(error.into()),
+        }
+    } else {
+        None
+    };
+
     // Keep the virtual PipeWire source resident for the entire daemon lifetime,
     // including while the remote is asleep at boot or across BLE re-discovery.
     let pcm_tx = std::sync::Arc::new(ArrayQueue::new(32));
@@ -515,6 +556,64 @@ async fn main() -> anyhow::Result<()> {
         .take()
         .expect("PipeWire failure receiver is registered once");
     shutdown.watch_pipewire(failure_rx);
+
+    // Keep the RC003 input manager and uinput virtual device resident for the
+    // entire daemon lifetime. Fixed-device mode grabs immediately on wake even
+    // before BLE GATT discovery completes; auto-discovery starts with TargetAddress::None
+    // and updates dynamically once a device lock is acquired.
+    let input_handle = if cli.no_input {
+        None
+    } else {
+        let initial_target = filter_addr
+            .map(|addr| input::TargetAddress::Exact(addr.to_string()))
+            .unwrap_or(input::TargetAddress::None);
+        Some(input::InputManagerHandle::start_with_options(
+            input::InputOptions {
+                release_grab_on_exit: config.input.release_grab_on_exit,
+                release_drain: Duration::from_millis(config.audio.release_drain_ms),
+                voice_code,
+                mapping_enabled: config.mapping.enabled,
+                target_address: initial_target,
+                key_overrides,
+            },
+        )?)
+    };
+
+    // Created unconditionally: the session loop sends state updates regardless of D-Bus,
+    // and the cost of an unused watch channel is negligible.
+    let (state_tx, _state_rx) = tokio::sync::watch::channel(atvv::State::Disconnected);
+    #[cfg(feature = "dbus")]
+    let (dbus_addr_tx, dbus_addr_rx) =
+        tokio::sync::watch::channel(filter_addr.map(|addr| addr.to_string()).unwrap_or_default());
+
+    // Set up D-Bus control interface once for the entire daemon lifetime (if feature and CLI allow).
+    #[cfg(feature = "dbus")]
+    let (mut dbus_cmd_rx, _dbus_conn) = if !cli.no_dbus {
+        let info = dbus::DaemonInfo {
+            device_address_rx: dbus_addr_rx,
+            node_name: node_name.clone(),
+        };
+        match dbus::serve(_state_rx, info, &dbus_name).await {
+            Ok((cmd_rx, conn)) => (Some(cmd_rx), Some(conn)),
+            Err(e) => {
+                let msg = e.to_string();
+                if msg.contains("already taken")
+                    || msg.contains("NameAlreadyOwned")
+                    || msg.contains("exists")
+                {
+                    anyhow::bail!(
+                        "D-Bus name '{dbus_name}' is already in use. \
+                         Another rc003-omarchy instance may be running with the same name. \
+                         Use --name <suffix> to differentiate instances, or --no-dbus to disable."
+                    );
+                }
+                tracing::warn!("Failed to register D-Bus interface: {e}");
+                (None, None)
+            }
+        }
+    } else {
+        (None, None)
+    };
 
     // Locked devices are skipped briefly, then retried in case the other owner exited.
     let mut excluded_addrs: HashMap<bluer::Address, tokio::time::Instant> = HashMap::new();
@@ -557,41 +656,33 @@ async fn main() -> anyhow::Result<()> {
             }
         };
 
-        let _device_lock = match acquire_device_lock(adapter.name(), device.address()) {
-            Ok(lock) => lock,
-            Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => {
-                if filter_addr.is_some() {
-                    anyhow::bail!(
-                        "Device {} is already in use by another rc003-omarchy instance.",
+        let _dynamic_device_lock = if filter_addr.is_none() {
+            match acquire_device_lock(adapter.name(), device.address()) {
+                Ok(lock) => {
+                    if let Some(ref handle) = input_handle {
+                        handle.set_target_address(input::TargetAddress::Exact(
+                            device.address().to_string(),
+                        ));
+                    }
+                    #[cfg(feature = "dbus")]
+                    let _ = dbus_addr_tx.send(device.address().to_string());
+                    Some(lock)
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => {
+                    tracing::warn!(
+                        "Device {} is already in use, retrying after the lock expires",
                         ble::redact_address(device.address())
                     );
+                    excluded_addrs.insert(
+                        device.address(),
+                        tokio::time::Instant::now() + DEVICE_LOCK_EXCLUSION,
+                    );
+                    continue 'discover;
                 }
-                tracing::warn!(
-                    "Device {} is already in use, retrying after the lock expires",
-                    ble::redact_address(device.address())
-                );
-                excluded_addrs.insert(
-                    device.address(),
-                    tokio::time::Instant::now() + DEVICE_LOCK_EXCLUSION,
-                );
-                continue 'discover;
+                Err(error) => return Err(error.into()),
             }
-            Err(error) => return Err(error.into()),
-        };
-
-        let _input_handle = if cli.no_input {
-            None
         } else {
-            Some(input::InputManagerHandle::start_with_options(
-                input::InputOptions {
-                    release_grab_on_exit: config.input.release_grab_on_exit,
-                    release_drain: Duration::from_millis(config.audio.release_drain_ms),
-                    voice_code,
-                    mapping_enabled: config.mapping.enabled,
-                    address: Some(device.address().to_string()),
-                    key_overrides: key_overrides.clone(),
-                },
-            )?)
+            None
         };
 
         tokio::select! {
@@ -643,40 +734,6 @@ async fn main() -> anyhow::Result<()> {
             _ = shutdown.wait() => break 'discover,
         };
 
-        // Created unconditionally: the session loop sends state updates regardless of D-Bus,
-        // and the cost of an unused watch channel is negligible.
-        let (state_tx, _state_rx) = tokio::sync::watch::channel(atvv::State::Disconnected);
-
-        // Set up D-Bus control interface (if feature and CLI allow).
-        #[cfg(feature = "dbus")]
-        let (mut dbus_cmd_rx, _dbus_conn) = if !cli.no_dbus {
-            let device_addr = device.address().to_string();
-            let info = dbus::DaemonInfo {
-                device_address: device_addr,
-                node_name: node_name.clone(),
-            };
-            match dbus::serve(_state_rx, info, &dbus_name).await {
-                Ok((cmd_rx, conn)) => (Some(cmd_rx), Some(conn)),
-                Err(e) => {
-                    let msg = e.to_string();
-                    if msg.contains("already taken")
-                        || msg.contains("NameAlreadyOwned")
-                        || msg.contains("exists")
-                    {
-                        anyhow::bail!(
-                            "D-Bus name '{dbus_name}' is already in use. \
-                             Another rc003-omarchy instance may be running with the same name. \
-                             Use --name <suffix> to differentiate instances, or --no-dbus to disable."
-                        );
-                    }
-                    tracing::warn!("Failed to register D-Bus interface: {e}");
-                    (None, None)
-                }
-            }
-        } else {
-            (None, None)
-        };
-
         // Inner loop: session → reconnect (same device).
         loop {
             let ble_device = ble::BluerDevice::new(&device, &chars, pw_handle.generation.clone());
@@ -687,24 +744,34 @@ async fn main() -> anyhow::Result<()> {
                     Ok(r) => r,
                     Err(e) => {
                         if is_device_locked_error(&e) {
-                            if filter_addr.is_some() {
-                                anyhow::bail!(
-                                    "Device {} is already in use by another rc003-omarchy instance.",
-                                    ble::redact_address(device.address())
-                                );
-                            } else {
-                                tracing::warn!(
-                                    "Device {} is locked by another instance, looking for another device...",
-                                    ble::redact_address(device.address())
-                                );
-                                excluded_addrs.insert(
-                                    device.address(),
-                                    tokio::time::Instant::now() + DEVICE_LOCK_EXCLUSION,
-                                );
-                                continue 'discover;
+                            match notify_not_permitted_action(filter_addr.is_some()) {
+                                NotifyLockAction::SkipAndRediscover => {
+                                    tracing::warn!(
+                                        "Device {} is locked by another client, looking for another device...",
+                                        ble::redact_address(device.address())
+                                    );
+                                    if let Some(ref handle) = input_handle {
+                                        handle.set_target_address(input::TargetAddress::None);
+                                    }
+                                    #[cfg(feature = "dbus")]
+                                    let _ = dbus_addr_tx.send(String::new());
+                                    let _ = state_tx.send(atvv::State::Disconnected);
+                                    excluded_addrs.insert(
+                                        device.address(),
+                                        tokio::time::Instant::now() + DEVICE_LOCK_EXCLUSION,
+                                    );
+                                    continue 'discover;
+                                }
+                                NotifyLockAction::Retry => {
+                                    tracing::warn!(
+                                        "StartNotify returned NotPermitted for {} (Bluetooth link may still be initializing or busy): {e}; retrying in {retry_delay:?}...",
+                                        ble::redact_address(device.address())
+                                    );
+                                }
                             }
+                        } else {
+                            tracing::error!("Negotiation failed: {e}");
                         }
-                        tracing::error!("Negotiation failed: {e}");
                         tokio::select! {
                             _ = tokio::time::sleep(retry_delay) => {}
                             _ = shutdown.wait() => {
@@ -721,6 +788,10 @@ async fn main() -> anyhow::Result<()> {
                 }
             };
             excluded_addrs.remove(&device.address());
+            #[cfg(feature = "dbus")]
+            if let Some(rx) = dbus_cmd_rx.as_mut() {
+                while rx.try_recv().is_ok() {}
+            }
             let _ = state_tx.send(atvv::State::Connected);
             let (mut session_protocol, codec) = match protocol::create_protocol(&caps) {
                 Ok((mut p, c)) => {
@@ -819,23 +890,31 @@ async fn main() -> anyhow::Result<()> {
                     reconnect_delay = retry_delay;
                 }
                 Err(e) if is_device_locked_error(e) => {
-                    if filter_addr.is_some() {
-                        // Explicit --device: fatal, user asked for this specific device.
-                        anyhow::bail!(
-                            "Device {} is already in use by another rc003-omarchy instance.",
-                            ble::redact_address(device.address())
-                        );
-                    } else {
-                        // Auto mode: skip this device, try to find another.
-                        tracing::warn!(
-                            "Device {} is locked by another instance, looking for another device...",
-                            ble::redact_address(device.address())
-                        );
-                        excluded_addrs.insert(
-                            device.address(),
-                            tokio::time::Instant::now() + DEVICE_LOCK_EXCLUSION,
-                        );
-                        continue 'discover;
+                    match notify_not_permitted_action(filter_addr.is_some()) {
+                        NotifyLockAction::SkipAndRediscover => {
+                            // Auto mode: skip this device, try to find another.
+                            tracing::warn!(
+                                "Device {} is locked by another client, looking for another device...",
+                                ble::redact_address(device.address())
+                            );
+                            if let Some(ref handle) = input_handle {
+                                handle.set_target_address(input::TargetAddress::None);
+                            }
+                            #[cfg(feature = "dbus")]
+                            let _ = dbus_addr_tx.send(String::new());
+                            let _ = state_tx.send(atvv::State::Disconnected);
+                            excluded_addrs.insert(
+                                device.address(),
+                                tokio::time::Instant::now() + DEVICE_LOCK_EXCLUSION,
+                            );
+                            continue 'discover;
+                        }
+                        NotifyLockAction::Retry => {
+                            tracing::warn!(
+                                "Session failed with StartNotify NotPermitted for {} (Bluetooth link may still be initializing or busy): {e}; retrying...",
+                                ble::redact_address(device.address())
+                            );
+                        }
                     }
                 }
                 Err(e) => tracing::warn!("Session error: {e}"),
@@ -909,6 +988,7 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
+    drop(input_handle);
     shutdown.unwatch_pipewire();
     drop(pw_handle);
     shutdown.result()
@@ -1008,5 +1088,14 @@ mod tests {
         assert!(!is_device_locked_error(&anyhow::Error::msg(
             "exclusive acquire failed"
         )));
+    }
+
+    #[test]
+    fn start_notify_not_permitted_retries_fixed_device_and_skips_auto() {
+        assert_eq!(notify_not_permitted_action(true), NotifyLockAction::Retry);
+        assert_eq!(
+            notify_not_permitted_action(false),
+            NotifyLockAction::SkipAndRediscover
+        );
     }
 }

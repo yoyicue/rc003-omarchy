@@ -36,6 +36,9 @@ pub trait Protocol: Send {
         false
     }
 
+    /// Recover framing state after upstream BLE audio notifications were dropped.
+    fn on_audio_discontinuity(&mut self, _next_packet_len: usize) {}
+
     /// Select the v1.0 wire frame layout. v0.4 always includes its header.
     fn set_frame_layout(&mut self, _layout: AudioFrameLayout) {}
 

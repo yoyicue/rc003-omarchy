@@ -71,7 +71,7 @@ struct NotificationQueue {
 }
 
 impl NotificationQueue {
-    async fn push(&self, event: SessionNotification) {
+    async fn push(&self, mut event: SessionNotification) {
         let is_audio = matches!(event, SessionNotification::Audio(_));
         let mut events = self.events.lock().await;
         if is_audio && events.len() >= 64 {
@@ -80,6 +80,15 @@ impl NotificationQueue {
                 .position(|event| matches!(event, SessionNotification::Audio(_)))
             {
                 let _ = events.remove(index);
+                if let Some(SessionNotification::Audio(next_audio)) = events
+                    .iter_mut()
+                    .skip(index)
+                    .find(|e| matches!(e, SessionNotification::Audio(_)))
+                {
+                    next_audio.discontinuity = true;
+                } else if let SessionNotification::Audio(ref mut incoming) = event {
+                    incoming.discontinuity = true;
+                }
             }
         }
         events.push_back(event);
@@ -196,10 +205,10 @@ async fn forward_dbus_notifications(
                 .await;
         } else if path.as_str() == paths.rx {
             queue
-                .push(SessionNotification::Audio(AudioPacket {
+                .push(SessionNotification::Audio(AudioPacket::new(
                     data,
-                    generation: generation.load(Ordering::Relaxed),
-                }))
+                    generation.load(Ordering::Relaxed),
+                )))
                 .await;
         }
     }
@@ -585,10 +594,10 @@ mod tests {
             match try_recv() {
                 Ok(data) if !data.is_empty() => {
                     queue
-                        .push(SessionNotification::Audio(AudioPacket {
+                        .push(SessionNotification::Audio(AudioPacket::new(
                             data,
-                            generation: generation.load(Ordering::Relaxed),
-                        }))
+                            generation.load(Ordering::Relaxed),
+                        )))
                         .await;
                 }
                 Ok(_) => return false,
@@ -625,29 +634,25 @@ mod tests {
         let queue = NotificationQueue::default();
         for _ in 0..64 {
             queue
-                .push(SessionNotification::Audio(AudioPacket {
-                    data: vec![1],
-                    generation: 1,
-                }))
+                .push(SessionNotification::Audio(AudioPacket::new(vec![1], 1)))
                 .await;
         }
         queue
-            .push(SessionNotification::Audio(AudioPacket {
-                data: vec![2],
-                generation: 2,
-            }))
+            .push(SessionNotification::Audio(AudioPacket::new(vec![2], 2)))
             .await;
-        for _ in 0..63 {
+        for idx in 0..63 {
             let Some(SessionNotification::Audio(packet)) = queue.next().await else {
                 panic!("expected audio");
             };
             assert_eq!(packet.generation, 1);
+            assert_eq!(packet.discontinuity, idx == 0);
         }
         let Some(SessionNotification::Audio(packet)) = queue.next().await else {
             panic!("expected audio");
         };
         assert_eq!(packet.data, vec![2]);
         assert_eq!(packet.generation, 2);
+        assert!(!packet.discontinuity);
     }
 
     #[tokio::test]
@@ -655,18 +660,12 @@ mod tests {
         let queue = NotificationQueue::default();
         for _ in 0..64 {
             queue
-                .push(SessionNotification::Audio(AudioPacket {
-                    data: vec![0],
-                    generation: 0,
-                }))
+                .push(SessionNotification::Audio(AudioPacket::new(vec![0], 0)))
                 .await;
         }
         for _ in 0..5 {
             queue
-                .push(SessionNotification::Audio(AudioPacket {
-                    data: vec![1],
-                    generation: 1,
-                }))
+                .push(SessionNotification::Audio(AudioPacket::new(vec![1], 1)))
                 .await;
         }
         let mut old = 0;
@@ -689,18 +688,12 @@ mod tests {
         let queue = NotificationQueue::default();
         for _ in 0..64 {
             queue
-                .push(SessionNotification::Audio(AudioPacket {
-                    data: vec![0],
-                    generation: 0,
-                }))
+                .push(SessionNotification::Audio(AudioPacket::new(vec![0], 0)))
                 .await;
         }
         queue.push(control_event(vec![0x04], 0)).await;
         queue
-            .push(SessionNotification::Audio(AudioPacket {
-                data: vec![1],
-                generation: 1,
-            }))
+            .push(SessionNotification::Audio(AudioPacket::new(vec![1], 1)))
             .await;
         for _ in 0..63 {
             assert!(matches!(

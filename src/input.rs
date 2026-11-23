@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -13,6 +14,8 @@ pub const RC003_VENDOR_ID: u16 = 0x2717;
 pub const RC003_PRODUCT_ID: u16 = 0x32b8;
 const INPUT_SCAN_INTERVAL: Duration = Duration::from_secs(2);
 const UINPUT_EXIT_DRAIN: Duration = Duration::from_millis(10);
+const CMD_SHUTDOWN: u8 = b'S';
+const CMD_RELOAD_TARGET: u8 = b'R';
 
 const KEY_POWER: u16 = 116;
 const KEY_F5: u16 = 63;
@@ -21,6 +24,8 @@ const KEY_UP: u16 = 103;
 const KEY_DOWN: u16 = 108;
 const KEY_LEFT: u16 = 105;
 const KEY_RIGHT: u16 = 106;
+const KEY_PAGEUP: u16 = 104;
+const KEY_PAGEDOWN: u16 = 109;
 const KEY_ENTER: u16 = 28;
 const KEY_BACK: u16 = 158;
 const KEY_HOME: u16 = 102;
@@ -34,6 +39,21 @@ const KEY_F13: u16 = 183;
 const KEY_F14: u16 = 184;
 const KEY_F15: u16 = 185;
 const KEY_RIGHTALT: u16 = 100;
+
+fn is_repeatable_output_key(output: u16) -> bool {
+    matches!(
+        output,
+        KEY_UP
+            | KEY_DOWN
+            | KEY_LEFT
+            | KEY_RIGHT
+            | KEY_BACKSPACE
+            | KEY_VOLUME_UP
+            | KEY_VOLUME_DOWN
+            | KEY_PAGEUP
+            | KEY_PAGEDOWN
+    )
+}
 
 pub fn output_key(code: u16) -> Option<u16> {
     match code {
@@ -169,13 +189,35 @@ pub fn parse_mapping_overrides(
     Ok(overrides)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TargetAddress {
+    /// Accept any RC003 event node.
+    #[cfg(test)]
+    Any,
+    /// Do not grab any RC003 event node until a device lock is acquired.
+    None,
+    /// Only grab RC003 event nodes matching this Bluetooth MAC address.
+    Exact(String),
+}
+
+impl TargetAddress {
+    fn matches(&self, unique_name: &str) -> bool {
+        match self {
+            #[cfg(test)]
+            Self::Any => true,
+            Self::None => false,
+            Self::Exact(address) => address_matches(unique_name, address),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct InputOptions {
     pub release_grab_on_exit: bool,
     pub release_drain: Duration,
     pub voice_code: u16,
     pub mapping_enabled: bool,
-    pub address: Option<String>,
+    pub target_address: TargetAddress,
     pub key_overrides: HashMap<u16, Option<u16>>,
 }
 
@@ -285,16 +327,7 @@ impl InputMapper {
                 self.pressed.insert(output);
             }
             2 => {
-                if !matches!(
-                    code,
-                    KEY_UP
-                        | KEY_DOWN
-                        | KEY_LEFT
-                        | KEY_RIGHT
-                        | KEY_BACK
-                        | KEY_VOLUME_UP
-                        | KEY_VOLUME_DOWN
-                ) {
+                if !is_repeatable_output_key(output) {
                     return Vec::new();
                 }
             }
@@ -399,13 +432,18 @@ enum DeviceProcessError {
 
 struct ManagedDevice {
     device: Device,
+    unique_name: String,
     mapper: InputMapper,
     release_grab_on_exit: bool,
     grabbed: bool,
 }
 
 impl ManagedDevice {
-    fn open(path: &Path, options: &InputOptions) -> std::result::Result<Self, OpenNodeError> {
+    fn open(
+        path: &Path,
+        target: &TargetAddress,
+        options: &InputOptions,
+    ) -> std::result::Result<Self, OpenNodeError> {
         let mut device = Device::open(path)
             .with_context(|| format!("open {}", path.display()))
             .map_err(OpenNodeError::OpenFailed)?;
@@ -413,10 +451,9 @@ impl ManagedDevice {
         if id.vendor() != RC003_VENDOR_ID || id.product() != RC003_PRODUCT_ID {
             return Err(OpenNodeError::NotRc003);
         }
-        if let Some(address) = options.address.as_deref() {
-            if !address_matches(device.unique_name().unwrap_or_default(), address) {
-                return Err(OpenNodeError::NotSelectedRc003);
-            }
+        let unique_name = device.unique_name().unwrap_or_default().to_string();
+        if !target.matches(&unique_name) {
+            return Err(OpenNodeError::NotSelectedRc003);
         }
         device
             .set_nonblocking(true)
@@ -429,6 +466,7 @@ impl ManagedDevice {
 
         Ok(Self {
             device,
+            unique_name,
             mapper: InputMapper::with_options(
                 options.voice_code,
                 options.release_drain,
@@ -438,6 +476,10 @@ impl ManagedDevice {
             release_grab_on_exit: options.release_grab_on_exit,
             grabbed: true,
         })
+    }
+
+    fn matches_target(&self, target: &TargetAddress) -> bool {
+        target.matches(&self.unique_name)
     }
 
     fn as_raw_fd(&self) -> RawFd {
@@ -496,17 +538,23 @@ impl Drop for ManagedDevice {
     }
 }
 
-fn create_shutdown_pipe() -> Result<(OwnedFd, OwnedFd)> {
+fn create_control_pipe() -> Result<(OwnedFd, OwnedFd)> {
     let mut fds = [0 as libc::c_int; 2];
     // SAFETY: `fds` points to a valid 2-element array for `pipe2`.
     let rc = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_NONBLOCK | libc::O_CLOEXEC) };
     if rc != 0 {
-        return Err(std::io::Error::last_os_error()).context("create RC003 input shutdown pipe");
+        return Err(std::io::Error::last_os_error()).context("create RC003 input control pipe");
     }
     // SAFETY: `pipe2` succeeded and returned two newly owned file descriptors.
     let read_fd = unsafe { OwnedFd::from_raw_fd(fds[0]) };
     let write_fd = unsafe { OwnedFd::from_raw_fd(fds[1]) };
     Ok((read_fd, write_fd))
+}
+
+fn write_control_cmd(fd: RawFd, cmd: u8) {
+    let byte = [cmd];
+    // SAFETY: `fd` is a valid open non-blocking pipe write descriptor.
+    let _ = unsafe { libc::write(fd, byte.as_ptr().cast(), byte.len()) };
 }
 
 fn create_input_inotify() -> Option<OwnedFd> {
@@ -534,7 +582,46 @@ fn create_input_inotify() -> Option<OwnedFd> {
     Some(owned)
 }
 
-fn shutdown_signaled(fd: RawFd) -> bool {
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct ControlCommands {
+    shutdown: bool,
+    reload_target: bool,
+}
+
+fn read_control_commands(fd: RawFd, revents: libc::c_short) -> ControlCommands {
+    let mut cmds = ControlCommands::default();
+    if revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0 {
+        cmds.shutdown = true;
+    }
+    if revents & libc::POLLIN != 0 {
+        let mut buf = [0u8; 64];
+        loop {
+            // SAFETY: `fd` is open and `buf` is writable for `buf.len()` bytes.
+            let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
+            if n > 0 {
+                for &byte in &buf[..n as usize] {
+                    match byte {
+                        CMD_SHUTDOWN => cmds.shutdown = true,
+                        CMD_RELOAD_TARGET => cmds.reload_target = true,
+                        _ => {}
+                    }
+                }
+                continue;
+            }
+            if n == 0 {
+                cmds.shutdown = true;
+                break;
+            }
+            if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            break;
+        }
+    }
+    cmds
+}
+
+fn poll_control_commands(fd: RawFd) -> ControlCommands {
     let mut pfd = libc::pollfd {
         fd,
         events: libc::POLLIN,
@@ -542,7 +629,11 @@ fn shutdown_signaled(fd: RawFd) -> bool {
     };
     // SAFETY: `pfd` points to a valid `libc::pollfd`.
     let rc = unsafe { libc::poll(&mut pfd, 1, 0) };
-    rc > 0 && pfd.revents != 0
+    if rc > 0 && pfd.revents != 0 {
+        read_control_commands(fd, pfd.revents)
+    } else {
+        ControlCommands::default()
+    }
 }
 
 fn drain_fd(fd: RawFd) {
@@ -583,7 +674,8 @@ fn compute_poll_timeout_ms(
 }
 
 pub struct InputManagerHandle {
-    shutdown_tx: OwnedFd,
+    control_tx: Option<OwnedFd>,
+    target_address: Arc<Mutex<TargetAddress>>,
     join: Option<JoinHandle<()>>,
 }
 
@@ -595,35 +687,53 @@ impl InputManagerHandle {
             release_drain: Duration::ZERO,
             voice_code: KEY_F9,
             mapping_enabled: true,
-            address: None,
+            target_address: TargetAddress::Any,
             key_overrides: HashMap::new(),
         })
     }
 
     pub fn start_with_options(options: InputOptions) -> Result<Self> {
-        let (shutdown_rx, shutdown_tx) = create_shutdown_pipe()?;
+        let (control_rx, control_tx) = create_control_pipe()?;
+        let target_address = Arc::new(Mutex::new(options.target_address.clone()));
+        let thread_target = target_address.clone();
         let join = std::thread::Builder::new()
             .name("rc003-input".to_string())
-            .spawn(move || run_input_manager(shutdown_rx, options))
+            .spawn(move || run_input_manager(control_rx, thread_target, options))
             .context("start RC003 input thread")?;
         Ok(Self {
-            shutdown_tx,
+            control_tx: Some(control_tx),
+            target_address,
             join: Some(join),
         })
+    }
+
+    pub fn set_target_address(&self, target: TargetAddress) {
+        let changed = {
+            let mut guard = self
+                .target_address
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if *guard == target {
+                false
+            } else {
+                *guard = target;
+                true
+            }
+        };
+        if changed {
+            if let Some(ref tx) = self.control_tx {
+                write_control_cmd(tx.as_raw_fd(), CMD_RELOAD_TARGET);
+            }
+        }
     }
 }
 
 impl Drop for InputManagerHandle {
     fn drop(&mut self) {
-        let byte = [1u8; 1];
-        // SAFETY: `shutdown_tx` is a valid open pipe write descriptor.
-        let _ = unsafe {
-            libc::write(
-                self.shutdown_tx.as_raw_fd(),
-                byte.as_ptr().cast(),
-                byte.len(),
-            )
-        };
+        if let Some(tx) = self.control_tx.take() {
+            write_control_cmd(tx.as_raw_fd(), CMD_SHUTDOWN);
+            drop(tx);
+        }
         if let Some(join) = self.join.take() {
             if let Err(error) = join.join() {
                 tracing::error!(?error, "RC003 input thread panicked");
@@ -632,7 +742,11 @@ impl Drop for InputManagerHandle {
     }
 }
 
-fn run_input_manager(shutdown_rx: OwnedFd, options: InputOptions) {
+fn run_input_manager(
+    control_rx: OwnedFd,
+    target_address: Arc<Mutex<TargetAddress>>,
+    options: InputOptions,
+) {
     let mut virtual_device: Option<VirtualDevice> = None;
     let mut uinput_degraded = false;
     let mut next_uinput_retry = Instant::now();
@@ -640,12 +754,48 @@ fn run_input_manager(shutdown_rx: OwnedFd, options: InputOptions) {
     let mut devices: HashMap<PathBuf, ManagedDevice> = HashMap::new();
     let mut ignored_nodes: HashMap<PathBuf, (u64, u64)> = HashMap::new();
     let mut warned_nodes: HashMap<PathBuf, (u64, u64)> = HashMap::new();
+    let mut current_target = target_address
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+    let mut target_reload_pending = false;
     let mut rescan_needed = true;
     let mut next_rescan_retry: Option<Instant> = None;
 
     loop {
-        if shutdown_signaled(shutdown_rx.as_raw_fd()) {
+        let ctrl = poll_control_commands(control_rx.as_raw_fd());
+        if ctrl.shutdown {
             break;
+        }
+        target_reload_pending |= ctrl.reload_target;
+
+        if target_reload_pending {
+            target_reload_pending = false;
+            current_target = target_address
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone();
+            let stale_paths: Vec<PathBuf> = devices
+                .iter()
+                .filter(|(_, device)| !device.matches_target(&current_target))
+                .map(|(path, _)| path.clone())
+                .collect();
+            for path in stale_paths {
+                if let Some(mut device) = devices.remove(&path) {
+                    if let Some(vdev) = virtual_device.as_mut() {
+                        device.release_keys(vdev);
+                    }
+                    device.ungrab_if_configured();
+                    tracing::info!(
+                        path = %path.display(),
+                        "Released RC003 input node after target change"
+                    );
+                }
+            }
+            ignored_nodes.clear();
+            warned_nodes.clear();
+            next_rescan_retry = None;
+            rescan_needed = true;
         }
 
         let now = Instant::now();
@@ -681,11 +831,14 @@ fn run_input_manager(shutdown_rx: OwnedFd, options: InputOptions) {
             rescan_needed = false;
             let had_rc003_error = scan_devices(
                 &mut devices,
+                &current_target,
                 &options,
                 &mut ignored_nodes,
                 &mut warned_nodes,
             );
-            next_rescan_retry = if had_rc003_error || inotify_fd.is_none() {
+            next_rescan_retry = if had_rc003_error
+                || (inotify_fd.is_none() && !matches!(current_target, TargetAddress::None))
+            {
                 Some(Instant::now() + INPUT_SCAN_INTERVAL)
             } else {
                 None
@@ -706,7 +859,7 @@ fn run_input_manager(shutdown_rx: OwnedFd, options: InputOptions) {
 
         let mut pollfds = Vec::with_capacity(2 + devices.len());
         pollfds.push(libc::pollfd {
-            fd: shutdown_rx.as_raw_fd(),
+            fd: control_rx.as_raw_fd(),
             events: libc::POLLIN,
             revents: 0,
         });
@@ -740,7 +893,10 @@ fn run_input_manager(shutdown_rx: OwnedFd, options: InputOptions) {
         }
         if let Some(retry) = next_rescan_retry {
             deadlines.push(retry);
-        } else if inotify_fd.is_none() && virtual_device.is_some() {
+        } else if inotify_fd.is_none()
+            && virtual_device.is_some()
+            && !matches!(current_target, TargetAddress::None)
+        {
             deadlines.push(Instant::now() + INPUT_SCAN_INTERVAL);
         }
 
@@ -764,7 +920,13 @@ fn run_input_manager(shutdown_rx: OwnedFd, options: InputOptions) {
         }
 
         if pollfds[0].revents != 0 {
-            break;
+            let ctrl = read_control_commands(control_rx.as_raw_fd(), pollfds[0].revents);
+            if ctrl.shutdown {
+                break;
+            }
+            if ctrl.reload_target {
+                target_reload_pending = true;
+            }
         }
 
         if let Some(idx) = inotify_idx {
@@ -847,10 +1009,14 @@ fn run_input_manager(shutdown_rx: OwnedFd, options: InputOptions) {
 
 fn scan_devices(
     devices: &mut HashMap<PathBuf, ManagedDevice>,
+    target: &TargetAddress,
     options: &InputOptions,
     ignored_nodes: &mut HashMap<PathBuf, (u64, u64)>,
     warned_nodes: &mut HashMap<PathBuf, (u64, u64)>,
 ) -> bool {
+    if matches!(target, TargetAddress::None) {
+        return false;
+    }
     ignored_nodes.retain(|path, identity| node_identity(path) == Some(*identity));
     warned_nodes.retain(|path, identity| node_identity(path) == Some(*identity));
     let Ok(entries) = std::fs::read_dir("/dev/input") else {
@@ -870,7 +1036,7 @@ fn scan_devices(
         {
             continue;
         }
-        match ManagedDevice::open(&path, options) {
+        match ManagedDevice::open(&path, target, options) {
             Ok(device) => {
                 warned_nodes.remove(&path);
                 tracing::info!(path = %path.display(), "RC003 input ready");
@@ -949,7 +1115,7 @@ fn sysfs_is_rc003(path: &Path) -> Option<bool> {
     Some(vendor == RC003_VENDOR_ID && product == RC003_PRODUCT_ID)
 }
 
-pub fn check_rc003_access() -> Result<Vec<String>> {
+pub fn check_rc003_access(address: Option<&str>) -> Result<Vec<String>> {
     let mut paths = Vec::new();
     for entry in std::fs::read_dir("/dev/input")? {
         let path = entry?.path();
@@ -965,14 +1131,19 @@ pub fn check_rc003_access() -> Result<Vec<String>> {
         };
         let id = device.input_id();
         if id.vendor() == RC003_VENDOR_ID && id.product() == RC003_PRODUCT_ID {
+            if let Some(filter) = address {
+                if !address_matches(device.unique_name().unwrap_or_default(), filter) {
+                    continue;
+                }
+            }
             paths.push(path.display().to_string());
         }
     }
     Ok(paths)
 }
 
-pub fn probe_keys(duration: Duration) -> Result<()> {
-    let path = check_rc003_access()?
+pub fn probe_keys(duration: Duration, address: Option<&str>) -> Result<()> {
+    let path = check_rc003_access(address)?
         .into_iter()
         .next()
         .context("no accessible RC003 event node")?;
@@ -1164,6 +1335,36 @@ mod tests {
         assert_eq!(mapper.map(key_event(KEY_UP, 0))[0].value(), 0);
         assert_eq!(mapper.map(key_event(KEY_BACK, 1))[0].code(), KEY_BACKSPACE);
         assert!(mapper.map(key_event(KEY_MENU, 2)).is_empty());
+    }
+
+    #[test]
+    fn repeat_follows_mapped_target_key_not_source_key() {
+        let mut entries = BTreeMap::new();
+        entries.insert("up".to_string(), "PlayPause".to_string());
+        entries.insert("menu".to_string(), "PageDown".to_string());
+        let overrides = parse_mapping_overrides(&entries).unwrap();
+        let mut mapper = InputMapper::with_options(KEY_F9, Duration::ZERO, true, overrides);
+
+        assert_eq!(
+            mapper.map(key_event(KEY_UP, 1))[0].code(),
+            KeyCode::KEY_PLAYPAUSE.code()
+        );
+        assert!(mapper.map(key_event(KEY_UP, 2)).is_empty());
+
+        assert_eq!(mapper.map(key_event(KEY_MENU, 1))[0].code(), KEY_PAGEDOWN);
+        let repeat = mapper.map(key_event(KEY_MENU, 2));
+        assert_eq!(repeat.len(), 1);
+        assert_eq!(repeat[0].code(), KEY_PAGEDOWN);
+        assert_eq!(repeat[0].value(), 2);
+    }
+
+    #[test]
+    fn target_address_matches_none_any_and_exact() {
+        assert!(!TargetAddress::None.matches("c0:5d:39:fa:2a:1b"));
+        assert!(TargetAddress::Any.matches("c0:5d:39:fa:2a:1b"));
+        let exact = TargetAddress::Exact("C0:5D:39:FA:2A:1B".to_string());
+        assert!(exact.matches("c0:5d:39:fa:2a:1b"));
+        assert!(!exact.matches("aa:bb:cc:dd:ee:ff"));
     }
 
     #[test]

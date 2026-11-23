@@ -46,18 +46,23 @@ pub async fn run(
     config_path: Option<&Path>,
     config: &Config,
     node_name_override: Option<&str>,
+    device_override: Option<&str>,
 ) -> Result<()> {
+    let device_filter = device_override
+        .filter(|s| !s.is_empty())
+        .or_else(|| (!config.device.address.is_empty()).then_some(config.device.address.as_str()));
     match command {
         Command::Run | Command::TestAudio | Command::TestDictation => Ok(()),
         Command::Service { command } => crate::service::run(command, config_path),
         Command::Scan { adapter } => scan(adapter).await,
-        Command::Doctor { json } => doctor(json, config, node_name_override).await,
+        Command::Doctor { json } => doctor(json, config, node_name_override, device_filter).await,
         Command::TestKeys { seconds } => {
             if seconds == 0 {
                 anyhow::bail!("--seconds must be greater than zero");
             }
+            let device_filter = device_filter.map(ToString::to_string);
             tokio::task::spawn_blocking(move || {
-                crate::input::probe_keys(Duration::from_secs(seconds))
+                crate::input::probe_keys(Duration::from_secs(seconds), device_filter.as_deref())
             })
             .await
             .context("join key probe")?
@@ -417,19 +422,19 @@ fn check_superwhisper_shortcut(config: &Config) -> Check {
     }
 }
 
-async fn doctor(json: bool, config: &Config, node_name_override: Option<&str>) -> Result<()> {
+async fn doctor(
+    json: bool,
+    config: &Config,
+    node_name_override: Option<&str>,
+    device_filter: Option<&str>,
+) -> Result<()> {
     let node_name = node_name_override.unwrap_or(&config.audio.node_name);
-    let configured_addr = if config.device.address.is_empty() {
-        None
-    } else {
-        Some(
-            config
-                .device
-                .address
-                .parse::<bluer::Address>()
-                .context("parse configured device.address")?,
-        )
-    };
+    let configured_addr = device_filter
+        .map(|addr| {
+            addr.parse::<bluer::Address>()
+                .context("parse configured device.address")
+        })
+        .transpose()?;
 
     let mut checks = Vec::new();
     checks.push(check_bluetooth(configured_addr).await);
@@ -443,7 +448,7 @@ async fn doctor(json: bool, config: &Config, node_name_override: Option<&str>) -
         Err(error) => checks.push(Check::new("uinput", "fail", error.to_string())),
     }
 
-    match crate::input::check_rc003_access() {
+    match crate::input::check_rc003_access(device_filter) {
         Ok(paths) if !paths.is_empty() => {
             checks.push(Check::new("input", "pass", paths.join(", ")))
         }

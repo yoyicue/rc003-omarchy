@@ -1,2 +1,2 @@
-ACTION=="add|change", SUBSYSTEM=="input", ATTRS{id/vendor}=="2717", ATTRS{id/product}=="32b8", TAG+="uaccess"
+ACTION=="add|change", SUBSYSTEM=="input", ATTRS{id/vendor}=="2717", ATTRS{id/product}=="32b8", GROUP="input", MODE="0660", TAG+="uaccess"
 ACTION=="add|change", SUBSYSTEM=="misc", KERNEL=="uinput", GROUP="input", MODE="0660", TAG+="uaccess", OPTIONS+="static_node=uinput"

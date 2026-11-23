@@ -16,10 +16,10 @@ const DBUS_OBJECT_PATH: &str = "/org/rc003omarchy/Daemon";
 /// Capacity for the external command channel (D-Bus → session).
 const COMMAND_CHANNEL_CAPACITY: usize = 16;
 
-/// Static info about the daemon, set at startup.
+/// Shared runtime info exposed by the daemon over D-Bus.
 #[derive(Debug, Clone)]
 pub struct DaemonInfo {
-    pub(crate) device_address: String,
+    pub(crate) device_address_rx: watch::Receiver<String>,
     pub(crate) node_name: String,
 }
 
@@ -77,10 +77,10 @@ impl DaemonInterface {
         self.state_rx.borrow().to_string()
     }
 
-    /// Bluetooth address of the connected remote.
+    /// Bluetooth address of the connected remote (empty while disconnected).
     #[zbus(property)]
-    async fn device_address(&self) -> &str {
-        &self.info.device_address
+    async fn device_address(&self) -> String {
+        self.info.device_address_rx.borrow().clone()
     }
 
     /// PipeWire node name.

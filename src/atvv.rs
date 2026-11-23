@@ -75,6 +75,17 @@ pub type BleStream<T> = Pin<Box<dyn Stream<Item = T> + Send>>;
 pub struct AudioPacket {
     pub data: Vec<u8>,
     pub generation: u64,
+    pub discontinuity: bool,
+}
+
+impl AudioPacket {
+    pub fn new(data: Vec<u8>, generation: u64) -> Self {
+        Self {
+            data,
+            generation,
+            discontinuity: false,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -361,6 +372,14 @@ pub async fn run_session(
                     if packet_number < stream_number {
                         continue;
                     }
+                    if packet.discontinuity {
+                        tracing::warn!(
+                            packet_len = packet.data.len(),
+                            "BLE audio notification queue overflowed; resyncing partial frame buffer"
+                        );
+                        drop_next_frame = false;
+                        protocol.on_audio_discontinuity(packet.data.len());
+                    }
                     for mut frame in protocol.decode_audio(&packet.data) {
                         // Reset frame timer on every audio frame
                         if frame_timeout_enabled {
@@ -635,7 +654,7 @@ mod tests {
     }
 
     fn audio_packet(data: Vec<u8>, generation: u64) -> AudioPacket {
-        AudioPacket { data, generation }
+        AudioPacket::new(data, generation)
     }
 
     /// Helper: make a fake 134-byte audio frame with a given sequence ID.
@@ -1916,6 +1935,94 @@ mod tests {
         );
 
         // Clean up
+        ctrl.event_tx
+            .send(DeviceConnectionEvent::Disconnected)
+            .unwrap();
+        let result = session.await.unwrap();
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_audio_discontinuity_resyncs_partial_frame_in_session() {
+        use crate::protocol::v10::ProtocolV10;
+
+        tokio::time::pause();
+
+        let (device, ctrl) = mock_device();
+        let (audio_tx, mut audio_rx) = tokio_mpsc::channel(64);
+        let (state_tx, mut state_rx) = tokio::sync::watch::channel(State::Connected);
+
+        let timeouts = SessionTimeouts {
+            frame_timeout: Duration::ZERO,
+            keepalive: Duration::ZERO,
+        };
+
+        let caps = Capabilities {
+            version: ProtocolVersion::V1_0,
+            codecs: Codecs::ADPCM_16KHZ,
+            interaction_model: InteractionModel::HoldToTalk,
+            audio_frame_size: AudioFrameSize(120),
+        };
+        let mut protocol = ProtocolV10::new();
+        protocol.on_caps_resp(&caps).unwrap();
+
+        let notifications = device.notifications().await.unwrap();
+        let events = device.connection_events().await.unwrap();
+        let streams = BleStreams {
+            notifications,
+            events,
+        };
+
+        let session = tokio::spawn(async move {
+            run_session(
+                &device,
+                &mut protocol,
+                streams,
+                SessionConfig {
+                    audio_tx,
+                    timeouts: &timeouts,
+                    command_rx: None,
+                    state_tx: Some(&state_tx),
+                    consumer_rx: None,
+                    generation: None,
+                    tail_expiration: None,
+                    streaming: None,
+                    mic_on_demand: false,
+                },
+            )
+            .await
+        });
+
+        ctrl.ctl_tx
+            .send(vec![CTL_AUDIO_START, 0x03, 0x02, 0x00])
+            .unwrap();
+        tokio::time::advance(Duration::from_millis(1)).await;
+        assert!(wait_for_state(&mut state_rx, State::Streaming, Duration::from_millis(10)).await);
+
+        // Buffer a 60-byte half-frame, then deliver a 120-byte packet marked discontinuous.
+        // Without discontinuity resync, the buffered 60 bytes would shift all subsequent frames.
+        ctrl.rx_tx.send(audio_packet(vec![0x11; 60], 0)).unwrap();
+        tokio::time::advance(Duration::from_millis(1)).await;
+        assert!(audio_rx.try_recv().is_err());
+
+        ctrl.rx_tx
+            .send(AudioPacket {
+                data: vec![0x00; 120],
+                generation: 0,
+                discontinuity: true,
+            })
+            .unwrap();
+        tokio::time::advance(Duration::from_millis(1)).await;
+
+        let frame = audio_rx
+            .try_recv()
+            .expect("discontinuity should discard stale partial buffer and decode aligned frame");
+        assert_eq!(frame.samples.len(), 240);
+        assert!(
+            frame.samples.iter().all(|&s| s == 0),
+            "decoded frame should come solely from the post-discontinuity zero packet"
+        );
+
         ctrl.event_tx
             .send(DeviceConnectionEvent::Disconnected)
             .unwrap();
