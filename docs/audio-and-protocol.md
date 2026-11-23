@@ -133,4 +133,4 @@ ATVVoice 已下载到 `~/Work/tries/atvvoice`，其 `src/pw.rs` 是本项目原�
 
 控制与音频通过 BlueZ `org.freedesktop.DBus.Properties.PropertiesChanged` 的单一 D-Bus `MessageStream` 接收，按 BlueZ 发出顺序进入同一个 `SessionNotification` 队列。`AUDIO_START` 与音频在入队时携带同一个 `ControlPacket` generation，会话直接使用事件中的编号，不读取滞后的全局计数器。队列满时只淘汰最旧音频，不丢控制事件；协调器关闭时返回 EOF 并释放订阅。
 
-`rc003-omarchy` 的 PipeWire 源在进程生命周期内常驻。BLE 重连只结束当前 ATVV 会话并替换 PCM 生产者，不销毁或重新创建虚拟源。两种模式都始终监听 PipeWire 消费者；每次真实 `1→0` 都在输出侧直接推进 generation，即使 watch 随后合并了 `1→0→1`，旧 PCM 也已失效。ATVV 在一段录音第一次停止时立即设置共享尾音截止时间，迟到的停止确认不会重新延长；输出回调使用单调时钟独立检查，一秒期限不受 BLE 写入阻塞影响。过期时仅当 generation 仍属于该录音才通过 compare-exchange 推进，避免误删下一段开头。连接退出或会话取消同样使旧 PCM 失效。主动销毁旧音源前注销故障 watch，正常关闭不报错，真实故障仍返回非零状态。
+`rc003-omarchy` 的 PipeWire 源在进程启动后、进入 BLE 发现循环之前即创建并常驻整个进程生命周期。即使开机时 RC003 仍在休眠或触发设备重新发现，虚拟源也始终存在；BLE 重连只结束当前 ATVV 会话并替换 PCM 生产者，不销毁或重新创建虚拟源。两种模式都始终监听 PipeWire 消费者；每次真实 `1→0` 都在输出侧直接推进 generation，即使 watch 随后合并了 `1→0→1`，旧 PCM 也已失效。ATVV 在一段录音第一次停止时立即设置共享尾音截止时间，迟到的停止确认不会重新延长；输出回调使用单调时钟独立检查，一秒期限不受 BLE 写入阻塞影响。过期时仅当 generation 仍属于该录音才通过 compare-exchange 推进，避免误删下一段开头。连接退出或会话取消同样使旧 PCM 失效。主动销毁旧音源前注销故障 watch，正常关闭不报错，真实故障仍返回非零状态。

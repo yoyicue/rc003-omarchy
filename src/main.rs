@@ -59,12 +59,12 @@ struct Cli {
     gain: Option<f32>,
 
     /// Close mic after N seconds without audio frames (device asleep). 0 = disabled.
-    #[arg(global = true, long, default_value = "5")]
-    frame_timeout: u64,
+    #[arg(global = true, long)]
+    frame_timeout: Option<u64>,
 
     /// Re-send MIC_OPEN every N seconds to prevent remote's audio transfer timeout. 0 = disabled.
-    #[arg(global = true, long, default_value = "10")]
-    keep_alive: u64,
+    #[arg(global = true, long)]
+    keep_alive: Option<u64>,
 
     /// PipeWire node name (also used for the optional D-Bus name).
     #[arg(global = true, short, long)]
@@ -410,7 +410,10 @@ async fn main() -> anyhow::Result<()> {
             commands::Command::TestDictation => {
                 println!("Focus a test input field, then hold and release the RC003 voice key.");
             }
-            other => return commands::run(other, cli.config.as_deref()).await,
+            other => {
+                return commands::run(other, cli.config.as_deref(), &config, cli.name.as_deref())
+                    .await;
+            }
         }
     }
 
@@ -424,6 +427,10 @@ async fn main() -> anyhow::Result<()> {
         cli.description = Some(config.audio.description.clone());
     }
     cli.no_input |= !config.input.enabled;
+
+    let frame_timeout_secs = cli.frame_timeout.unwrap_or(config.audio.frame_timeout_secs);
+    let keep_alive_secs = cli.keep_alive.unwrap_or(config.audio.keep_alive_secs);
+    let mic_on_demand = cli.mic_on_demand || config.audio.mic_on_demand;
 
     // Init tracing based on verbosity
     let filter = match cli.verbose {
@@ -449,9 +456,12 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    if cli.mic_on_demand && cli.frame_timeout == 0 {
+    if mic_on_demand && frame_timeout_secs == 0 {
         tracing::warn!("--mic-on-demand without --frame-timeout: mic may get stuck in Opening state if remote is asleep");
     }
+
+    let key_overrides = input::parse_mapping_overrides(&config.mapping.keys)?;
+    let voice_code = input::voice_key_code(&config.input.voice_key)?;
 
     let mut shutdown = ShutdownSignal::new()?;
 
@@ -474,9 +484,37 @@ async fn main() -> anyhow::Result<()> {
         .transpose()?;
 
     let timeouts = atvv::SessionTimeouts {
-        frame_timeout: std::time::Duration::from_secs(cli.frame_timeout),
-        keepalive: std::time::Duration::from_secs(cli.keep_alive),
+        frame_timeout: Duration::from_secs(frame_timeout_secs),
+        keepalive: Duration::from_secs(keep_alive_secs),
     };
+
+    let node_name = cli.name.clone().expect("node name was configured");
+    #[cfg(feature = "dbus")]
+    let dbus_name = format!("org.rc003omarchy.{}", sanitize_name(&node_name));
+    let node_description = cli
+        .description
+        .clone()
+        .expect("node description was configured");
+    let gain = cli.gain.unwrap_or(config.audio.gain_db);
+
+    // Keep the virtual PipeWire source resident for the entire daemon lifetime,
+    // including while the remote is asleep at boot or across BLE re-discovery.
+    let pcm_tx = std::sync::Arc::new(ArrayQueue::new(32));
+    let pcm_rx = pcm_tx.clone();
+    let (consumer_tx, mut consumer_rx) =
+        tokio::sync::watch::channel(consumer::ConsumerEvent::Changed(0));
+    let mut pw_handle = PipeWireHandle::new(
+        pcm_rx,
+        gain,
+        node_name.clone(),
+        node_description.clone(),
+        Some(consumer_tx),
+    )?;
+    let failure_rx = pw_handle
+        .failure_rx
+        .take()
+        .expect("PipeWire failure receiver is registered once");
+    shutdown.watch_pipewire(failure_rx);
 
     // Locked devices are skipped briefly, then retried in case the other owner exited.
     let mut excluded_addrs: HashMap<bluer::Address, tokio::time::Instant> = HashMap::new();
@@ -507,14 +545,14 @@ async fn main() -> anyhow::Result<()> {
                             tracing::info!("No ATVV device found ({e}), retrying in {discovery_retry_delay:?}...");
                             tokio::select! {
                                 _ = tokio::time::sleep(discovery_retry_delay) => {}
-                                _ = shutdown.wait() => return shutdown.result(),
+                                _ = shutdown.wait() => break 'discover,
                             }
                         }
                     }
                 }
                 _ = shutdown.wait() => {
                     tracing::info!("Shutting down");
-                    return shutdown.result();
+                    break 'discover;
                 }
             }
         };
@@ -544,12 +582,15 @@ async fn main() -> anyhow::Result<()> {
         let _input_handle = if cli.no_input {
             None
         } else {
-            Some(input::InputManagerHandle::start_with_release_grab(
-                config.input.release_grab_on_exit,
-                Duration::from_millis(config.audio.release_drain_ms),
-                input::voice_key_code(&config.input.voice_key)?,
-                config.mapping.enabled,
-                Some(device.address().to_string()),
+            Some(input::InputManagerHandle::start_with_options(
+                input::InputOptions {
+                    release_grab_on_exit: config.input.release_grab_on_exit,
+                    release_drain: Duration::from_millis(config.audio.release_drain_ms),
+                    voice_code,
+                    mapping_enabled: config.mapping.enabled,
+                    address: Some(device.address().to_string()),
+                    key_overrides: key_overrides.clone(),
+                },
             )?)
         };
 
@@ -557,7 +598,7 @@ async fn main() -> anyhow::Result<()> {
             _ = ensure_connected(&device, retry_delay) => {}
             _ = shutdown.wait() => {
                 tracing::info!("Shutting down");
-                return shutdown.result();
+                break 'discover;
             }
         }
 
@@ -576,14 +617,14 @@ async fn main() -> anyhow::Result<()> {
                             );
                             tokio::select! {
                                 _ = tokio::time::sleep(retry_delay) => {}
-                                _ = shutdown.wait() => return shutdown.result(),
+                                _ = shutdown.wait() => break 'discover,
                             }
                         }
                     }
                 }
                 _ = shutdown.wait() => {
                     tracing::info!("Shutting down");
-                    return shutdown.result();
+                    break 'discover;
                 }
             }
         };
@@ -599,18 +640,8 @@ async fn main() -> anyhow::Result<()> {
                     None
                 }
             },
-            _ = shutdown.wait() => return shutdown.result(),
+            _ = shutdown.wait() => break 'discover,
         };
-
-        let node_name = cli.name.clone().expect("node name was configured");
-        #[allow(unused_variables)]
-        let dbus_name = format!("org.rc003omarchy.{}", sanitize_name(&node_name));
-        let node_description = cli
-            .description
-            .clone()
-            .expect("node description was configured");
-
-        let gain = cli.gain.unwrap_or(config.audio.gain_db);
 
         // Created unconditionally: the session loop sends state updates regardless of D-Bus,
         // and the cost of an unused watch channel is negligible.
@@ -619,7 +650,6 @@ async fn main() -> anyhow::Result<()> {
         // Set up D-Bus control interface (if feature and CLI allow).
         #[cfg(feature = "dbus")]
         let (mut dbus_cmd_rx, _dbus_conn) = if !cli.no_dbus {
-            #[cfg(feature = "dbus")]
             let device_addr = device.address().to_string();
             let info = dbus::DaemonInfo {
                 device_address: device_addr,
@@ -647,26 +677,9 @@ async fn main() -> anyhow::Result<()> {
             (None, None)
         };
 
-        let pcm_tx = std::sync::Arc::new(ArrayQueue::new(32));
-        let pcm_rx = pcm_tx.clone();
-        let (consumer_tx, mut consumer_rx) =
-            tokio::sync::watch::channel(consumer::ConsumerEvent::Changed(0));
-        let mut _pw_handle = PipeWireHandle::new(
-            pcm_rx.clone(),
-            gain,
-            node_name.clone(),
-            node_description.clone(),
-            Some(consumer_tx),
-        )?;
-        let failure_rx = _pw_handle
-            .failure_rx
-            .take()
-            .expect("PipeWire failure receiver is registered once");
-        shutdown.watch_pipewire(failure_rx);
-
         // Inner loop: session → reconnect (same device).
         loop {
-            let ble_device = ble::BluerDevice::new(&device, &chars, _pw_handle.generation.clone());
+            let ble_device = ble::BluerDevice::new(&device, &chars, pw_handle.generation.clone());
 
             // Negotiate protocol version
             let (caps, streams) = tokio::select! {
@@ -688,8 +701,6 @@ async fn main() -> anyhow::Result<()> {
                                     device.address(),
                                     tokio::time::Instant::now() + DEVICE_LOCK_EXCLUSION,
                                 );
-                                shutdown.unwatch_pipewire();
-                                drop(_pw_handle);
                                 continue 'discover;
                             }
                         }
@@ -776,15 +787,15 @@ async fn main() -> anyhow::Result<()> {
                             { None }
                         },
                         state_tx: Some(&state_tx),
-                        consumer_rx: if cli.mic_on_demand {
+                        consumer_rx: if mic_on_demand {
                             Some(&mut consumer_rx)
                         } else {
                             None
                         },
-                        generation: Some(&_pw_handle.generation),
-                        tail_expiration: Some(&_pw_handle.tail_expiration),
-                        streaming: Some(&_pw_handle.streaming),
-                        mic_on_demand: cli.mic_on_demand,
+                        generation: Some(&pw_handle.generation),
+                        tail_expiration: Some(&pw_handle.tail_expiration),
+                        streaming: Some(&pw_handle.streaming),
+                        mic_on_demand,
                     },
                 ) => result,
                 _ = shutdown.wait() => {
@@ -824,8 +835,6 @@ async fn main() -> anyhow::Result<()> {
                             device.address(),
                             tokio::time::Instant::now() + DEVICE_LOCK_EXCLUSION,
                         );
-                        shutdown.unwatch_pipewire();
-                        drop(_pw_handle);
                         continue 'discover;
                     }
                 }
@@ -900,6 +909,8 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
+    shutdown.unwatch_pipewire();
+    drop(pw_handle);
     shutdown.result()
 }
 

@@ -5,7 +5,7 @@ PartOf=graphical-session.target
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/newgrp input -c '/usr/local/bin/rc003-omarchy run --config %h/.config/rc003-omarchy/config.toml'
+ExecStart=/usr/bin/newgrp input -c '%h/.local/bin/rc003-omarchy run --config %h/.config/rc003-omarchy/config.toml'
 Restart=on-failure
 RestartSec=2
 TimeoutStopSec=15

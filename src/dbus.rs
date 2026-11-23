@@ -1,9 +1,9 @@
-//! D-Bus control interface for atvvoice.
+//! D-Bus control interface for rc003-omarchy.
 //!
-//! Exposes `org.atvvoice.Daemon` on the session bus, allowing external programs
-//! to query status and control the microphone.
+//! Exposes `org.rc003omarchy.Daemon` on the session bus, allowing external
+//! programs to query status and control the microphone.
 //!
-//! Requires the `dbus` cargo feature (enabled by default).
+//! Requires the `dbus` cargo feature (disabled by default).
 
 use tokio::sync::{mpsc, watch};
 use zbus::interface;
@@ -11,7 +11,7 @@ use zbus::interface;
 use crate::atvv::{ExternalCommand, State};
 
 /// D-Bus object path for the daemon interface.
-const DBUS_OBJECT_PATH: &str = "/org/atvvoice/Daemon";
+const DBUS_OBJECT_PATH: &str = "/org/rc003omarchy/Daemon";
 
 /// Capacity for the external command channel (D-Bus → session).
 const COMMAND_CHANNEL_CAPACITY: usize = 16;
@@ -54,7 +54,7 @@ impl DaemonInterface {
     }
 }
 
-#[interface(name = "org.atvvoice.Daemon")]
+#[interface(name = "org.rc003omarchy.Daemon")]
 impl DaemonInterface {
     /// Open the microphone (start streaming).
     async fn mic_open(&self) -> zbus::fdo::Result<()> {

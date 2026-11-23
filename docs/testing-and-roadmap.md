@@ -320,3 +320,13 @@ Redmi 验证：157 个单元测试、Clippy 和 release build 通过，真实 St
 - 用“适配器＋设备地址”的 Linux 抽象 Unix socket 防止本程序多实例同时写设备；句柄覆盖握手、录音和重连，进程退出自动释放。
 
 Redmi 验证：158 个单元测试及显式 uinput 集成测试通过，Clippy 和 release build 通过，五项 `doctor` 通过。指定设备的第二实例以状态 1 被拒绝，原服务保持 active；自动发现模式在锁释放 5 秒后找回同一设备并完成协商。
+
+## 29. 第二十二轮：常驻音源、零唤醒事件驱动输入与运维诊断闭环
+
+- PipeWire 虚拟麦克风源提升到 `'discover` 循环之前创建并常驻整个进程生命周期，即使开机遥控器休眠或跨设备重新发现期间也保持源存在，避免 Superwhisper 回退；正常退出前注销故障 watch 并释放源，真实故障仍返回非零退出码。
+- 输入线程改用 `poll()` + `pipe2` 退出管道 + `/dev/input` inotify（`IN_CREATE | IN_ATTRIB | IN_MOVED_TO | IN_DELETE`），正常空载唤醒降至 0 次/秒（`timeout = -1`），udev 授权 `IN_ATTRIB` 即刻触发发现；`probe_keys` 同步改用 `poll()`。
+- `VirtualDevice` 提升为输入线程常驻复用，避免遥控器休眠断连时反复增删输入设备及丢松键风险；按键事件逐个发送 `SYN_REPORT`；`/dev/uinput` 或经 sysfs 识别的 RC003 节点权限/独占失败记录一次性 `warn` 告警，降级期间不独占设备。
+- 配置新增 `[audio]` 的 `frame_timeout_secs`、`keep_alive_secs`、`mic_on_demand` 及 `[mapping.keys]` 非语音键自定义覆盖（向后兼容旧配置），`Config::validate()` 新增蓝牙 MAC 格式与 `audio.node_name` 校验；`doctor` 按实际配置检查自定义源名并新增 Superwhisper hold 快捷键（含 `shortcuts.hold` 与 `system.hold` 是否已 apply）一致性检查。
+- D-Bus 接口与对象路径统一为 `org.rc003omarchy.Daemon` / `/org/rc003omarchy/Daemon`；修正 systemd 示例路径至 `%h/.local/bin/rc003-omarchy`；补充 `THIRD_PARTY_NOTICES.md` 与 `.github/workflows/ci.yml`。
+
+Redmi 实机验证：176 个单元测试通过、显式 `uinput_end_to_end_voice_mapping` 集成测试通过（实测 udev `IN_ATTRIB` 233ms 即刻唤醒接管、同批 down/up 逐事件发出）、Clippy（默认与 `--features dbus`，`-D warnings`）及 release build 通过，六项 `doctor` 检查（`bluetooth`、`uinput`、`input`、`pipewire`、`superwhisper`、`shortcut`）运行正常。

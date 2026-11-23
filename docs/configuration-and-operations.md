@@ -26,6 +26,9 @@ description = "RC003 Remote Microphone"
 gain_db = 0.0
 release_drain_ms = 0
 frame_layout = "raw"
+frame_timeout_secs = 5
+keep_alive_secs = 10
+mic_on_demand = false
 
 [input]
 enabled = true
@@ -35,6 +38,10 @@ release_grab_on_exit = true
 [mapping]
 enabled = true
 profile = "default"
+# 可选：自定义非语音键映射（设为 "None" 可禁用按键）
+# [mapping.keys]
+# power = "None"
+# home = "F13"
 
 [logging]
 level = "info"

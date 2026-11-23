@@ -12,6 +12,9 @@ description = "RC003 Remote Microphone"
 gain_db = 0.0
 release_drain_ms = 0
 frame_layout = "raw"
+frame_timeout_secs = 5
+keep_alive_secs = 10
+mic_on_demand = false
 
 [input]
 enabled = true
@@ -21,6 +24,12 @@ release_grab_on_exit = true
 [mapping]
 enabled = true
 profile = "default"
+# Optional per-key output overrides (use "None" to disable a key):
+# [mapping.keys]
+# power = "Esc"
+# home = "F13"
+# menu = "F14"
+# tv = "F15"
 
 [logging]
 level = "info"
