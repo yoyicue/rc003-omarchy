@@ -1,0 +1,81 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  release-linux-x86_64:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify tag matches Cargo.toml version
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          PKG_VER="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n1)"
+          if [ "$TAG" != "v${PKG_VER}" ]; then
+            echo "Tag ${TAG} does not match Cargo.toml version v${PKG_VER}" >&2
+            exit 1
+          fi
+
+      - name: Install Linux audio and Bluetooth dev libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            clang \
+            libclang-dev \
+            libdbus-1-dev \
+            libpipewire-0.3-dev \
+            libspa-0.2-dev \
+            pkg-config
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run unit tests
+        run: cargo test --locked --all-targets
+
+      - name: Build release binary
+        run: |
+          cargo build --release --locked
+          strip target/release/rc003-omarchy
+          ./target/release/rc003-omarchy --version
+
+      - name: Package release archive
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          PKG_DIR="rc003-omarchy-${TAG}-x86_64-unknown-linux-gnu"
+          mkdir -p "dist/${PKG_DIR}/udev" "dist/${PKG_DIR}/systemd" "dist/${PKG_DIR}/LICENSES"
+          install -m 0755 target/release/rc003-omarchy "dist/${PKG_DIR}/rc003-omarchy"
+          install -m 0644 config.example.toml "dist/${PKG_DIR}/config.example.toml"
+          install -m 0644 udev/70-rc003-omarchy.rules "dist/${PKG_DIR}/udev/70-rc003-omarchy.rules"
+          install -m 0644 systemd/rc003-omarchy.service.example "dist/${PKG_DIR}/systemd/rc003-omarchy.service.example"
+          install -m 0644 README.md "dist/${PKG_DIR}/README.md"
+          install -m 0644 THIRD_PARTY_NOTICES.md "dist/${PKG_DIR}/THIRD_PARTY_NOTICES.md"
+          install -m 0644 LICENSES/ATVVoice-MIT.txt "dist/${PKG_DIR}/LICENSES/ATVVoice-MIT.txt"
+          tar -C dist -czf "dist/${PKG_DIR}.tar.gz" "${PKG_DIR}"
+          (cd dist && sha256sum "${PKG_DIR}.tar.gz" > SHA256SUMS)
+          cat dist/SHA256SUMS
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          ARCHIVE="dist/rc003-omarchy-${TAG}-x86_64-unknown-linux-gnu.tar.gz"
+          gh release create "${TAG}" \
+            "${ARCHIVE}" \
+            dist/SHA256SUMS \
+            --title "rc003-omarchy ${TAG}" \
+            --generate-notes

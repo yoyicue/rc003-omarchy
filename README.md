@@ -23,6 +23,71 @@ RC003 -- evdev ----------> device-specific mapper --> F9 -----+--> Superwhisper
 
 The complete design and validation gates are in [docs/](docs/README.md).
 
+## Install (Prebuilt Binary)
+
+Prebuilt `x86_64` Linux archives are published on [GitHub Releases](https://github.com/yoyicue/rc003-omarchy/releases) (built on Ubuntu 24.04 / glibc 2.39, compatible with Omarchy/Arch and modern Linux distributions with PipeWire and BlueZ).
+
+Runtime dependencies on Omarchy/Arch:
+
+```bash
+sudo pacman -S --needed pipewire bluez
+```
+
+Download, verify, and unpack the release archive:
+
+```bash
+VERSION=v0.1.0
+ARCHIVE="rc003-omarchy-${VERSION}-x86_64-unknown-linux-gnu.tar.gz"
+BASE_URL="https://github.com/yoyicue/rc003-omarchy/releases/download/${VERSION}"
+
+curl -fLO "${BASE_URL}/${ARCHIVE}"
+curl -fLO "${BASE_URL}/SHA256SUMS"
+sha256sum -c SHA256SUMS
+
+tar -xzf "${ARCHIVE}"
+cd "rc003-omarchy-${VERSION}-x86_64-unknown-linux-gnu"
+```
+
+First-time system permissions (udev rule + `input` group):
+
+```bash
+sudo install -m 0644 udev/70-rc003-omarchy.rules /etc/udev/rules.d/
+sudo udevadm control --reload-rules
+sudo udevadm trigger --subsystem-match=input
+sudo udevadm trigger --subsystem-match=misc --sysname-match=uinput
+sudo usermod -a -G input "$USER"
+# Start a new login session after adding your user to the input group.
+```
+
+Optional configuration (skip to use built-in defaults with auto-discovery):
+
+```bash
+mkdir -p ~/.config/rc003-omarchy
+cp config.example.toml ~/.config/rc003-omarchy/config.toml
+```
+
+Install the binary to `~/.local/bin/rc003-omarchy` and enable + start the systemd user service:
+
+```bash
+./rc003-omarchy service install --apply
+# When upgrading an existing service, add --force:
+# ./rc003-omarchy service install --apply --force
+```
+
+Or install the CLI binary only (without systemd):
+
+```bash
+install -Dm755 rc003-omarchy ~/.local/bin/rc003-omarchy
+```
+
+Verify the installation:
+
+```bash
+~/.local/bin/rc003-omarchy --version
+~/.local/bin/rc003-omarchy service status
+~/.local/bin/rc003-omarchy doctor
+```
+
 ## Build
 
 Requirements on Omarchy/Arch:
@@ -114,7 +179,7 @@ The service uses `newgrp input -c` so the daemon starts with the required input 
 ## Validation status
 
 - Previous Redmi baseline: 140 unit tests plus the explicit uinput integration test; Clippy passed with warnings denied and the release build succeeded.
-- Latest lifecycle changes: 158 unit tests pass on Redmi, plus the explicit uinput integration test; Clippy and the release build pass. Default-mode consumer switching, intentional source teardown, and PipeWire restart recovery while Bluetooth is offline have also been verified on hardware. A fresh physical RC003-to-Superwhisper dictation was transcribed and inserted successfully.
+- Latest verification baseline: 206 unit tests pass on Redmi and Linux CI, plus the explicit uinput integration test; Clippy (default and `--features dbus`, warnings denied) and the release build pass. Default-mode consumer switching, intentional source teardown, and PipeWire restart recovery while Bluetooth is offline have also been verified on hardware. A fresh physical RC003-to-Superwhisper dictation was transcribed and inserted successfully.
 - Real BlueZ negotiation passed with ATVV v1.0, 16 kHz, and 120-byte frames.
 - Superwhisper enumerates `RC003 Remote Microphone` as 16 kHz mono S16LE.
 - Virtual RC003 input is verified end to end as RightAlt/F9 down/up through evdev/uinput.

@@ -36,6 +36,7 @@ const DEVICE_LOCK_EXCLUSION: Duration = Duration::from_secs(5);
 #[derive(Parser)]
 #[command(
     name = "rc003-omarchy",
+    version,
     about = "Xiaomi RC003 microphone and input bridge for Omarchy"
 )]
 struct Cli {
