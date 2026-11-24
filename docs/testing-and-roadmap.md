@@ -398,3 +398,10 @@ Redmi 实机验证：`cargo fmt --all -- --check`、200 个单元测试（`200 p
 - 在 ATVV v0.4 下，`AUDIO_STOP` 无原因字节且固定合成为 `MicClose`，因此在 `AUDIO_START` 时显式清空 `pending_close`，确保未应答的旧 `MIC_CLOSE` 不会吞掉下一句真实的 `AUDIO_STOP`。
 
 Redmi 实机验证：`cargo fmt --all -- --check`、202 个单元测试（`202 passed, 0 failed, 1 ignored`）、Clippy（默认与 `--features dbus`，`-D warnings`）及 release 编译全部通过，已重新安装 `~/.local/bin/rc003-omarchy` 并重启服务验证通过。
+
+## 37. 第三十轮：区分 `Opening` 取消与 `Streaming` 关麦的 `PendingClose` 状态
+
+- `pending_close` 升级为 `PendingClose::{Stream, Opening}`，区分“已在流式播放中关麦”与“`Opening` 阶段尚未收到 `AUDIO_START` 即取消开麦”。
+- `Opening` 阶段取消后，若遥控器按序发回迟到的 `AUDIO_START(MicOpen)` 与 `AUDIO_STOP(MicClose)`，则将 `PendingClose::Opening` 绑定到当前 `stream_instance`，使随后的 `AUDIO_STOP(MicClose)` 立即把状态关回 `Connected` 且不重复发送 `MIC_CLOSE`，下一次录音键首次按下即可正常开麦；若中途先收到按钮发起的 `AUDIO_START(HoldToTalk/PressToTalk)`，则保留旧的 `closed_instance` 以继续屏蔽迟到关麦确认；若 `Connected` 状态下收到 `MIC_OPEN_ERROR`，则同步清理悬空的 `PendingClose::Opening`。
+
+Redmi 实机验证：`cargo fmt --all -- --check`、204 个单元测试（`204 passed, 0 failed, 1 ignored`）、Clippy（默认与 `--features dbus`，`-D warnings`）及 release 编译全部通过，已重新安装 `~/.local/bin/rc003-omarchy` 并重启服务验证通过。
