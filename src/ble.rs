@@ -79,15 +79,20 @@ impl NotificationQueue {
                 .iter()
                 .position(|event| matches!(event, SessionNotification::Audio(_)))
             {
-                let _ = events.remove(index);
-                if let Some(SessionNotification::Audio(next_audio)) = events
-                    .iter_mut()
-                    .skip(index)
-                    .find(|e| matches!(e, SessionNotification::Audio(_)))
-                {
-                    next_audio.discontinuity = true;
-                } else if let SessionNotification::Audio(ref mut incoming) = event {
-                    incoming.discontinuity = true;
+                if let Some(SessionNotification::Audio(evicted)) = events.remove(index) {
+                    if let Some(SessionNotification::Audio(next_audio)) = events
+                        .iter_mut()
+                        .skip(index)
+                        .find(|e| matches!(e, SessionNotification::Audio(_)))
+                    {
+                        if next_audio.generation == evicted.generation {
+                            next_audio.discontinuity = true;
+                        }
+                    } else if let SessionNotification::Audio(ref mut incoming) = event {
+                        if incoming.generation == evicted.generation {
+                            incoming.discontinuity = true;
+                        }
+                    }
                 }
             }
         }
@@ -653,6 +658,40 @@ mod tests {
         assert_eq!(packet.data, vec![2]);
         assert_eq!(packet.generation, 2);
         assert!(!packet.discontinuity);
+    }
+
+    #[tokio::test]
+    async fn evicting_old_generation_does_not_mark_next_generation_discontinuous() {
+        let queue = NotificationQueue::default();
+        queue
+            .push(SessionNotification::Audio(AudioPacket::new(vec![1], 1)))
+            .await;
+        queue.push(control_event(vec![0x04], 2)).await;
+        for _ in 0..62 {
+            queue
+                .push(SessionNotification::Audio(AudioPacket::new(vec![2], 2)))
+                .await;
+        }
+        // Queue now holds 64 entries: 1 audio(gen=1) + 1 control(gen=2) + 62 audio(gen=2).
+        // Pushing one more audio(gen=2) evicts the sole audio(gen=1) packet across AUDIO_START.
+        queue
+            .push(SessionNotification::Audio(AudioPacket::new(vec![3], 2)))
+            .await;
+
+        assert!(matches!(
+            queue.next().await,
+            Some(SessionNotification::Control(_))
+        ));
+        for _ in 0..63 {
+            let Some(SessionNotification::Audio(packet)) = queue.next().await else {
+                panic!("expected audio");
+            };
+            assert_eq!(packet.generation, 2);
+            assert!(
+                !packet.discontinuity,
+                "new-generation packet after AUDIO_START must not inherit discontinuity from evicted older generation"
+            );
+        }
     }
 
     #[tokio::test]

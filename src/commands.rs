@@ -18,11 +18,7 @@ pub enum Command {
         command: crate::service::ServiceCommand,
     },
     /// Discover an ATVV-compatible remote without starting the daemon.
-    Scan {
-        /// BlueZ adapter name.
-        #[arg(short, long)]
-        adapter: Option<String>,
-    },
+    Scan,
     /// Run read-only environment checks.
     Doctor {
         /// Emit JSON instead of human-readable output.
@@ -45,17 +41,27 @@ pub async fn run(
     command: Command,
     config_path: Option<&Path>,
     config: &Config,
+    adapter_override: Option<&str>,
     node_name_override: Option<&str>,
     device_override: Option<&str>,
 ) -> Result<()> {
-    let device_filter = device_override
-        .filter(|s| !s.is_empty())
+    let explicit_device = device_override.filter(|s| !s.is_empty());
+    let device_filter = explicit_device
         .or_else(|| (!config.device.address.is_empty()).then_some(config.device.address.as_str()));
     match command {
         Command::Run | Command::TestAudio | Command::TestDictation => Ok(()),
         Command::Service { command } => crate::service::run(command, config_path),
-        Command::Scan { adapter } => scan(adapter).await,
-        Command::Doctor { json } => doctor(json, config, node_name_override, device_filter).await,
+        Command::Scan => scan(adapter_override, explicit_device).await,
+        Command::Doctor { json } => {
+            doctor(
+                json,
+                config,
+                adapter_override,
+                node_name_override,
+                device_filter,
+            )
+            .await
+        }
         Command::TestKeys { seconds } => {
             if seconds == 0 {
                 anyhow::bail!("--seconds must be greater than zero");
@@ -70,19 +76,25 @@ pub async fn run(
     }
 }
 
-async fn adapter(name: Option<String>) -> Result<bluer::Adapter> {
+async fn adapter(name: Option<&str>) -> Result<bluer::Adapter> {
     let session = bluer::Session::new().await?;
     match name {
-        Some(name) => session.adapter(&name).map_err(Into::into),
+        Some(name) => session.adapter(name).map_err(Into::into),
         None => session.default_adapter().await.map_err(Into::into),
     }
 }
 
-async fn scan(adapter_name: Option<String>) -> Result<()> {
+async fn scan(adapter_name: Option<&str>, device_filter: Option<&str>) -> Result<()> {
+    let filter_addr = device_filter
+        .map(|addr| {
+            addr.parse::<bluer::Address>()
+                .context("parse --device address")
+        })
+        .transpose()?;
     let adapter = adapter(adapter_name).await?;
     let device = tokio::time::timeout(
         Duration::from_secs(10),
-        ble::find_atvv_device(&adapter, None, &[]),
+        ble::find_atvv_device(&adapter, filter_addr, &[]),
     )
     .await
     .context("timed out discovering an ATVV remote")??;
@@ -218,8 +230,11 @@ fn parse_superwhisper_hold_shortcut(stdout: &[u8]) -> Option<HoldShortcutInfo> {
     None
 }
 
-async fn check_bluetooth(configured_addr: Option<bluer::Address>) -> Check {
-    match adapter(None).await {
+async fn check_bluetooth(
+    adapter_name: Option<&str>,
+    configured_addr: Option<bluer::Address>,
+) -> Check {
+    match adapter(adapter_name).await {
         Ok(adapter) => {
             let addresses = match adapter.device_addresses().await {
                 Ok(addresses) => addresses,
@@ -425,6 +440,7 @@ fn check_superwhisper_shortcut(config: &Config) -> Check {
 async fn doctor(
     json: bool,
     config: &Config,
+    adapter_override: Option<&str>,
     node_name_override: Option<&str>,
     device_filter: Option<&str>,
 ) -> Result<()> {
@@ -437,7 +453,7 @@ async fn doctor(
         .transpose()?;
 
     let mut checks = Vec::new();
-    checks.push(check_bluetooth(configured_addr).await);
+    checks.push(check_bluetooth(adapter_override, configured_addr).await);
 
     match std::fs::OpenOptions::new()
         .read(true)

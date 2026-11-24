@@ -341,3 +341,11 @@ Redmi 实机验证：176 个单元测试通过、显式 `uinput_end_to_end_voice
 - 按键重复改为按映射后的目标键（`Up/Down/Left/Right/Backspace/VolumeUp/VolumeDown/PageUp/PageDown`）判定而非原始键码；`doctor` 与 `test-keys` 的 evdev 枚举同步按 `--device` / `config.device.address` 过滤；`udev/70-rc003-omarchy.rules` 第一条显式补充 `GROUP="input", MODE="0660"`。
 
 Redmi 实机验证与 CI：GitHub Actions CI（`#45279841839`）与 Redmi 真机同步通过——`cargo fmt --all -- --check`、182 个单元测试（`182 passed, 0 failed, 1 ignored`）、显式 `uinput_end_to_end_voice_mapping` 集成测试（经 udev `IN_ATTRIB` 295ms 唤醒接管）、Clippy（默认与 `--features dbus`，`-D warnings`）及 release 编译全部通过。新二进制已通过 `service install --apply --force` 安装至 `~/.local/bin/rc003-omarchy`，更新后的 `udev/70-rc003-omarchy.rules` 已安装至 `/etc/udev/rules.d/` 并重载触发，systemd 用户服务为 `active/enabled`，在遥控器休眠待连状态下 PipeWire 源与输入线程均已常驻运行，`doctor` 的 `bluetooth`、`uinput`、`pipewire`、`superwhisper`、`shortcut` 五项通过，`input` 因遥控器当前休眠报 `warn`（唤醒后即刻接管）。
+
+## 31. 第二十四轮：三项边角清零（设备移除退回、全局 `--adapter` 对齐与跨代溢出边界）
+
+- `ensure_connected`、首次与重连 `resolve_chars` 以及 `negotiate` 统一识别 BlueZ `DoesNotExist` / `UnknownObject` 或适配器设备列表缺失，运行中执行 `bluetoothctl remove` 时立刻退回外层 `'discover` 重新发现（自动发现模式同步重置 `TargetAddress::None` 与 D-Bus `device_address`），不再对失效对象持续轮询告警。
+- 移除 `Command::Scan` 上与全局 `Cli::adapter` 重名的局部字段，统一将 `--adapter` 透传至 `scan` 与 `doctor`（`scan` 同时支持显式 `--device` 过滤），并补充 `Cli::command().debug_assert()` 与前置/后置参数解析单测。
+- `NotificationQueue` 满 64 包淘汰音频包时仅在下一音频包与被淘汰包属于同一 `generation` 时标记 `discontinuity = true`，避免跨 `AUDIO_START` 边界淘汰旧句音频误伤新句首包（尤其 `headered` 分包模式）。
+
+Redmi 实机验证：`cargo fmt --all -- --check`、185 个单元测试（`185 passed, 0 failed, 1 ignored`）、Clippy（默认与 `--features dbus`，`-D warnings`）及 release 编译全部通过，已重新安装 `~/.local/bin/rc003-omarchy` 并重启服务验证通过。

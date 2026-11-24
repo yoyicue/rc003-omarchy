@@ -303,33 +303,94 @@ fn active_exclusions(
     (addresses, next_expiry)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConnectOutcome {
+    Connected,
+    Removed,
+}
+
+fn is_device_removed_bluer_error(error: &bluer::Error) -> bool {
+    matches!(error.kind, bluer::ErrorKind::DoesNotExist)
+        || error.message.contains("UnknownObject")
+        || error.message.contains("DoesNotExist")
+        || error.to_string().contains("UnknownObject")
+}
+
+fn is_device_removed_error(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<bluer::Error>()
+        .is_some_and(is_device_removed_bluer_error)
+}
+
+async fn device_removed_from_adapter(adapter: &bluer::Adapter, address: bluer::Address) -> bool {
+    adapter
+        .device_addresses()
+        .await
+        .is_ok_and(|addrs| !addrs.contains(&address))
+}
+
 /// Wait for device to be connected, using event stream if possible.
-async fn ensure_connected(device: &bluer::Device, retry_delay: Duration) {
+/// Returns `ConnectOutcome::Removed` if the device is unpaired/removed from BlueZ.
+async fn ensure_connected(
+    adapter: &bluer::Adapter,
+    device: &bluer::Device,
+    retry_delay: Duration,
+) -> ConnectOutcome {
     match device.is_connected().await {
-        Ok(true) => return,
-        Err(e) => tracing::warn!("is_connected() failed, assuming disconnected: {e}"),
-        _ => {}
+        Ok(true) => return ConnectOutcome::Connected,
+        Err(e) => {
+            if is_device_removed_bluer_error(&e)
+                || device_removed_from_adapter(adapter, device.address()).await
+            {
+                return ConnectOutcome::Removed;
+            }
+            tracing::warn!("is_connected() failed, assuming disconnected: {e}");
+        }
+        Ok(false) => {}
     }
     tracing::info!("Waiting for device to connect...");
     if let Ok(mut events) = device.events().await {
-        if matches!(device.is_connected().await, Ok(true)) {
-            return;
+        match device.is_connected().await {
+            Ok(true) => return ConnectOutcome::Connected,
+            Err(e)
+                if is_device_removed_bluer_error(&e)
+                    || device_removed_from_adapter(adapter, device.address()).await =>
+            {
+                return ConnectOutcome::Removed;
+            }
+            _ => {}
         }
         while let Some(event) = futures::StreamExt::next(&mut events).await {
             if let bluer::DeviceEvent::PropertyChanged(bluer::DeviceProperty::Connected(true)) =
                 event
             {
-                return;
+                return ConnectOutcome::Connected;
             }
         }
+        if device_removed_from_adapter(adapter, device.address()).await {
+            return ConnectOutcome::Removed;
+        }
+    } else if device_removed_from_adapter(adapter, device.address()).await {
+        return ConnectOutcome::Removed;
     }
     // Fallback: poll
     loop {
         tokio::time::sleep(retry_delay).await;
         match device.is_connected().await {
-            Ok(true) => return,
-            Err(e) => tracing::warn!("is_connected() poll failed: {e}"),
-            _ => {}
+            Ok(true) => return ConnectOutcome::Connected,
+            Err(e) => {
+                if is_device_removed_bluer_error(&e)
+                    || device_removed_from_adapter(adapter, device.address()).await
+                {
+                    return ConnectOutcome::Removed;
+                }
+                tracing::warn!("is_connected() poll failed: {e}");
+            }
+            Ok(false) => {
+                if device_removed_from_adapter(adapter, device.address()).await {
+                    return ConnectOutcome::Removed;
+                }
+            }
         }
     }
 }
@@ -432,6 +493,7 @@ async fn main() -> anyhow::Result<()> {
                     other,
                     cli.config.as_deref(),
                     &config,
+                    cli.adapter.as_deref(),
                     cli.name.as_deref(),
                     cli.device.as_deref(),
                 )
@@ -615,6 +677,17 @@ async fn main() -> anyhow::Result<()> {
         (None, None)
     };
 
+    let reset_discovered_device = || {
+        if filter_addr.is_none() {
+            if let Some(ref handle) = input_handle {
+                handle.set_target_address(input::TargetAddress::None);
+            }
+            #[cfg(feature = "dbus")]
+            let _ = dbus_addr_tx.send(String::new());
+        }
+        let _ = state_tx.send(atvv::State::Disconnected);
+    };
+
     // Locked devices are skipped briefly, then retried in case the other owner exited.
     let mut excluded_addrs: HashMap<bluer::Address, tokio::time::Instant> = HashMap::new();
 
@@ -686,7 +759,16 @@ async fn main() -> anyhow::Result<()> {
         };
 
         tokio::select! {
-            _ = ensure_connected(&device, retry_delay) => {}
+            outcome = ensure_connected(&adapter, &device, retry_delay) => {
+                if outcome == ConnectOutcome::Removed {
+                    tracing::warn!(
+                        "Device {} was removed from BlueZ; returning to discovery",
+                        ble::redact_address(device.address())
+                    );
+                    reset_discovered_device();
+                    continue 'discover;
+                }
+            }
             _ = shutdown.wait() => {
                 tracing::info!("Shutting down");
                 break 'discover;
@@ -703,6 +785,16 @@ async fn main() -> anyhow::Result<()> {
                             break c;
                         }
                         Err(e) => {
+                            if is_device_removed_error(&e)
+                                || device_removed_from_adapter(&adapter, device.address()).await
+                            {
+                                tracing::warn!(
+                                    "Device {} was removed from BlueZ while resolving characteristics; returning to discovery",
+                                    ble::redact_address(device.address())
+                                );
+                                reset_discovered_device();
+                                continue 'discover;
+                            }
                             tracing::warn!(
                                 "Failed to resolve characteristics ({e}), retrying in 2s..."
                             );
@@ -750,12 +842,7 @@ async fn main() -> anyhow::Result<()> {
                                         "Device {} is locked by another client, looking for another device...",
                                         ble::redact_address(device.address())
                                     );
-                                    if let Some(ref handle) = input_handle {
-                                        handle.set_target_address(input::TargetAddress::None);
-                                    }
-                                    #[cfg(feature = "dbus")]
-                                    let _ = dbus_addr_tx.send(String::new());
-                                    let _ = state_tx.send(atvv::State::Disconnected);
+                                    reset_discovered_device();
                                     excluded_addrs.insert(
                                         device.address(),
                                         tokio::time::Instant::now() + DEVICE_LOCK_EXCLUSION,
@@ -769,6 +856,15 @@ async fn main() -> anyhow::Result<()> {
                                     );
                                 }
                             }
+                        } else if is_device_removed_error(&e)
+                            || device_removed_from_adapter(&adapter, device.address()).await
+                        {
+                            tracing::warn!(
+                                "Device {} was removed from BlueZ during negotiation; returning to discovery",
+                                ble::redact_address(device.address())
+                            );
+                            reset_discovered_device();
+                            continue 'discover;
                         } else {
                             tracing::error!("Negotiation failed: {e}");
                         }
@@ -897,12 +993,7 @@ async fn main() -> anyhow::Result<()> {
                                 "Device {} is locked by another client, looking for another device...",
                                 ble::redact_address(device.address())
                             );
-                            if let Some(ref handle) = input_handle {
-                                handle.set_target_address(input::TargetAddress::None);
-                            }
-                            #[cfg(feature = "dbus")]
-                            let _ = dbus_addr_tx.send(String::new());
-                            let _ = state_tx.send(atvv::State::Disconnected);
+                            reset_discovered_device();
                             excluded_addrs.insert(
                                 device.address(),
                                 tokio::time::Instant::now() + DEVICE_LOCK_EXCLUSION,
@@ -937,7 +1028,15 @@ async fn main() -> anyhow::Result<()> {
 
             // Wait for device to reconnect (C1: interruptible by ctrl+c)
             tokio::select! {
-                _ = ensure_connected(&device, retry_delay) => {
+                outcome = ensure_connected(&adapter, &device, retry_delay) => {
+                    if outcome == ConnectOutcome::Removed {
+                        tracing::warn!(
+                            "Device {} was removed from BlueZ while reconnecting; returning to discovery",
+                            ble::redact_address(device.address())
+                        );
+                        reset_discovered_device();
+                        continue 'discover;
+                    }
                     tracing::info!("Device reconnected");
                 }
                 _ = shutdown.wait() => {
@@ -969,6 +1068,16 @@ async fn main() -> anyhow::Result<()> {
                                 break c;
                             }
                             Err(e) => {
+                                if is_device_removed_error(&e)
+                                    || device_removed_from_adapter(&adapter, device.address()).await
+                                {
+                                    tracing::warn!(
+                                        "Device {} was removed from BlueZ while re-resolving characteristics; returning to discovery",
+                                        ble::redact_address(device.address())
+                                    );
+                                    reset_discovered_device();
+                                    continue 'discover;
+                                }
                                 tracing::warn!(
                                     "Failed to re-resolve characteristics ({e}), retrying in 2s..."
                                 );
@@ -1097,5 +1206,48 @@ mod tests {
             notify_not_permitted_action(false),
             NotifyLockAction::SkipAndRediscover
         );
+    }
+
+    #[test]
+    fn device_removed_errors_are_detected() {
+        let does_not_exist = bluer::Error {
+            kind: bluer::ErrorKind::DoesNotExist,
+            message: "Does Not Exist".to_string(),
+        };
+        assert!(is_device_removed_error(&anyhow::Error::new(does_not_exist)));
+
+        let unknown_object = bluer::Error {
+            kind: bluer::ErrorKind::Failed,
+            message: "org.freedesktop.DBus.Error.UnknownObject: Method failed".to_string(),
+        };
+        assert!(is_device_removed_error(&anyhow::Error::new(unknown_object)));
+
+        let transient = bluer::Error {
+            kind: bluer::ErrorKind::InProgress,
+            message: "Operation already in progress".to_string(),
+        };
+        assert!(!is_device_removed_error(&anyhow::Error::new(transient)));
+    }
+
+    #[test]
+    fn cli_definition_and_global_adapter_subcommands_are_valid() {
+        use clap::CommandFactory;
+        Cli::command().debug_assert();
+
+        let pre = Cli::try_parse_from(["rc003-omarchy", "--adapter", "hci1", "scan"]).unwrap();
+        assert_eq!(pre.adapter.as_deref(), Some("hci1"));
+        assert!(matches!(pre.command, Some(commands::Command::Scan)));
+
+        let post = Cli::try_parse_from(["rc003-omarchy", "scan", "--adapter", "hci1"]).unwrap();
+        assert_eq!(post.adapter.as_deref(), Some("hci1"));
+        assert!(matches!(post.command, Some(commands::Command::Scan)));
+
+        let doc = Cli::try_parse_from(["rc003-omarchy", "doctor", "--adapter", "hci1", "--json"])
+            .unwrap();
+        assert_eq!(doc.adapter.as_deref(), Some("hci1"));
+        assert!(matches!(
+            doc.command,
+            Some(commands::Command::Doctor { json: true })
+        ));
     }
 }
