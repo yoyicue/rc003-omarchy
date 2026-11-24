@@ -17,7 +17,7 @@ mod service;
 use anyhow::Context;
 use clap::Parser;
 use crossbeam_queue::ArrayQueue;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::os::{
     linux::net::SocketAddrExt,
     unix::net::{SocketAddr, UnixDatagram},
@@ -319,10 +319,11 @@ fn is_device_removed_bluer_error(error: &bluer::Error) -> bool {
 }
 
 async fn device_removed_from_adapter(adapter: &bluer::Adapter, address: bluer::Address) -> bool {
-    adapter
-        .device_addresses()
+    tokio::time::timeout(Duration::from_secs(2), adapter.device_addresses())
         .await
-        .is_ok_and(|addrs| !addrs.contains(&address))
+        .ok()
+        .and_then(Result::ok)
+        .is_some_and(|addrs| !addrs.contains(&address))
 }
 
 /// Wait for device to be connected, using event stream if possible.
@@ -408,8 +409,48 @@ const NEGOTIATE_TIMEOUT: Duration = Duration::from_secs(5);
 /// Short timeout for best-effort MIC_CLOSE during shutdown so input cleanup
 /// always completes well within systemd's stop timeout.
 const SHUTDOWN_MIC_CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
-/// Maximum pre-CAPS_RESP notifications preserved for handoff to `run_session`.
-const MAX_DEFERRED_NEGOTIATION_EVENTS: usize = 64;
+/// Maximum pre-CAPS_RESP audio packets preserved for handoff to `run_session`.
+/// Control packets are never dropped when audio reaches this cap.
+const MAX_DEFERRED_NEGOTIATION_AUDIO: usize = 64;
+
+fn push_deferred_audio(
+    deferred: &mut VecDeque<atvv::SessionNotification>,
+    mut packet: atvv::AudioPacket,
+) {
+    let audio_count = deferred
+        .iter()
+        .filter(|e| matches!(e, atvv::SessionNotification::Audio(_)))
+        .count();
+    if audio_count >= MAX_DEFERRED_NEGOTIATION_AUDIO {
+        if let Some(index) = deferred
+            .iter()
+            .position(|e| matches!(e, atvv::SessionNotification::Audio(_)))
+        {
+            let _ = deferred.remove(index);
+            let mut hit_boundary = false;
+            let mut marked = false;
+            for queued in deferred.iter_mut().skip(index) {
+                if matches!(
+                    queued,
+                    atvv::SessionNotification::Control(pkt)
+                        if matches!(pkt.data.first(), Some(0x04 | 0x0A))
+                ) {
+                    hit_boundary = true;
+                    break;
+                }
+                if let atvv::SessionNotification::Audio(next_audio) = queued {
+                    next_audio.discontinuity = true;
+                    marked = true;
+                    break;
+                }
+            }
+            if !marked && !hit_boundary {
+                packet.discontinuity = true;
+            }
+        }
+    }
+    deferred.push_back(atvv::SessionNotification::Audio(packet));
+}
 
 /// Send GET_CAPS and wait for CAPS_RESP to determine protocol version.
 async fn negotiate(
@@ -429,20 +470,37 @@ async fn negotiate(
     let deadline = tokio::time::sleep(NEGOTIATE_TIMEOUT);
     tokio::pin!(deadline);
 
-    let mut deferred = Vec::new();
+    let mut deferred = VecDeque::new();
     let mut saw_audio_start = false;
+    let mut last_audio_stop_at: Option<tokio::time::Instant> = None;
 
     // BleStream<T> is Pin<Box<dyn Stream>>, already Unpin -- no tokio::pin! needed.
     loop {
         tokio::select! {
             event = notifications.next() => {
                 match event {
-                    Some(atvv::SessionNotification::Control(packet)) => {
+                    Some(atvv::SessionNotification::Control(mut packet)) => {
                         if let Some(caps) = protocol::parse_caps_resp(&packet.data) {
                             tracing::info!(
                                 "CAPS_RESP: version={}, codecs={:?}, model={:?}, frame_size={}",
                                 caps.version, caps.codecs, caps.interaction_model, caps.audio_frame_size.0
                             );
+                            // If a pre-CAPS_RESP utterance already finished and its tail drain
+                            // window has already elapsed, drop its stale audio/stream events so
+                            // old audio cannot leak into a newly connected PipeWire client.
+                            if !saw_audio_start
+                                && last_audio_stop_at.is_some_and(|stopped_at| {
+                                    stopped_at.elapsed() >= atvv::AUDIO_TAIL_DRAIN_TIMEOUT
+                                })
+                            {
+                                deferred.retain(|ev| {
+                                    matches!(
+                                        ev,
+                                        atvv::SessionNotification::Control(pkt)
+                                            if !matches!(pkt.data.first(), Some(0x00 | 0x04 | 0x0A))
+                                    )
+                                });
+                            }
                             let notifications: atvv::BleStream<atvv::SessionNotification> =
                                 if deferred.is_empty() {
                                     notifications
@@ -454,22 +512,38 @@ async fn negotiate(
                                 events: device_events,
                             }));
                         }
+                        packet.deferred_during_negotiation = true;
                         match packet.data.first().copied() {
-                            Some(0x04) => saw_audio_start = true,
-                            Some(0x00) => saw_audio_start = false,
+                            Some(0x04) => {
+                                if !saw_audio_start && last_audio_stop_at.is_some() {
+                                    // A new utterance superseded an earlier finished one; discard
+                                    // the completed utterance's buffered audio and stream markers.
+                                    deferred.retain(|ev| {
+                                        matches!(
+                                            ev,
+                                            atvv::SessionNotification::Control(pkt)
+                                                if !matches!(pkt.data.first(), Some(0x00 | 0x04 | 0x0A))
+                                        )
+                                    });
+                                }
+                                saw_audio_start = true;
+                                last_audio_stop_at = None;
+                            }
+                            Some(0x00) => {
+                                saw_audio_start = false;
+                                last_audio_stop_at = Some(packet.received_at);
+                            }
                             _ => {}
                         }
-                        if deferred.len() < MAX_DEFERRED_NEGOTIATION_EVENTS {
-                            tracing::debug!(
-                                "Deferring non-CAPS_RESP CTL during negotiation: {:02x?}",
-                                packet.data
-                            );
-                            deferred.push(atvv::SessionNotification::Control(packet));
-                        }
+                        tracing::debug!(
+                            "Deferring non-CAPS_RESP CTL during negotiation: {:02x?}",
+                            packet.data
+                        );
+                        deferred.push_back(atvv::SessionNotification::Control(packet));
                     }
                     Some(atvv::SessionNotification::Audio(packet)) => {
-                        if saw_audio_start && deferred.len() < MAX_DEFERRED_NEGOTIATION_EVENTS {
-                            deferred.push(atvv::SessionNotification::Audio(packet));
+                        if saw_audio_start {
+                            push_deferred_audio(&mut deferred, packet);
                         }
                     }
                     None => {
@@ -818,7 +892,14 @@ async fn main() -> anyhow::Result<()> {
                                 break c;
                             }
                             Err(e) => {
-                                if device_removed_from_adapter(&adapter, device.address()).await {
+                                let removed = tokio::select! {
+                                    removed = device_removed_from_adapter(&adapter, device.address()) => removed,
+                                    _ = shutdown.wait() => {
+                                        tracing::info!("Shutting down");
+                                        break 'discover;
+                                    }
+                                };
+                                if removed {
                                     tracing::warn!(
                                         "Device {} was removed from BlueZ while resolving characteristics; returning to discovery",
                                         ble::redact_address(device.address())
@@ -885,14 +966,22 @@ async fn main() -> anyhow::Result<()> {
                                     );
                                 }
                             }
-                        } else if device_removed_from_adapter(&adapter, device.address()).await {
-                            tracing::warn!(
-                                "Device {} was removed from BlueZ during negotiation; returning to discovery",
-                                ble::redact_address(device.address())
-                            );
-                            reset_discovered_device();
-                            continue 'discover;
                         } else {
+                            let removed = tokio::select! {
+                                removed = device_removed_from_adapter(&adapter, device.address()) => removed,
+                                _ = shutdown.wait() => {
+                                    tracing::info!("Shutting down");
+                                    break 'discover;
+                                }
+                            };
+                            if removed {
+                                tracing::warn!(
+                                    "Device {} was removed from BlueZ during negotiation; returning to discovery",
+                                    ble::redact_address(device.address())
+                                );
+                                reset_discovered_device();
+                                continue 'discover;
+                            }
                             tracing::error!("Negotiation failed: {e}");
                         }
                         tokio::select! {
@@ -958,10 +1047,10 @@ async fn main() -> anyhow::Result<()> {
                     let mut samples = frame.samples;
                     adpcm::declip(&mut samples);
                     adpcm::lowpass(&mut samples);
-                    let _ = pcm_tx.force_push(pw::PcmFrame {
-                        generation: frame.generation,
-                        samples,
-                    });
+                    for chunk in samples.chunks(pw::MAX_PCM_FRAME_SAMPLES) {
+                        let _ =
+                            pcm_tx.force_push(pw::PcmFrame::from_slice(frame.generation, chunk));
+                    }
                 }
             });
 
@@ -1249,17 +1338,15 @@ mod tests {
 
         // Remote sends AUDIO_START (v1.0, HTT, 16kHz, stream 0) BEFORE CAPS_RESP.
         notif_tx
-            .send(atvv::SessionNotification::Control(atvv::ControlPacket {
-                data: vec![0x04, 0x03, 0x02, 0x00],
-                generation: 1,
-            }))
+            .send(atvv::SessionNotification::Control(
+                atvv::ControlPacket::new(vec![0x04, 0x03, 0x02, 0x00], 1),
+            ))
             .unwrap();
         // Then CAPS_RESP: v1.0, ADPCM_16KHZ, HTT, 120-byte frames.
         notif_tx
-            .send(atvv::SessionNotification::Control(atvv::ControlPacket {
-                data: vec![0x0B, 0x01, 0x00, 0x02, 0x03, 0x00, 0x78],
-                generation: 1,
-            }))
+            .send(atvv::SessionNotification::Control(
+                atvv::ControlPacket::new(vec![0x0B, 0x01, 0x00, 0x02, 0x03, 0x00, 0x78], 1),
+            ))
             .unwrap();
         // Then an audio frame arrives after negotiation.
         notif_tx
@@ -1303,6 +1390,289 @@ mod tests {
             .try_recv()
             .expect("AUDIO_START arriving before CAPS_RESP must not silence the first utterance");
         assert_eq!(frame.samples.len(), 240);
+    }
+
+    #[tokio::test]
+    async fn negotiate_preserves_audio_stop_past_full_audio_buffer_and_expires_old_tail() {
+        use tokio::sync::{mpsc as tokio_mpsc, Mutex};
+        use tokio_stream::wrappers::UnboundedReceiverStream;
+
+        struct RecordingBle {
+            commands: tokio_mpsc::UnboundedSender<Vec<u8>>,
+            notifications: Mutex<Option<tokio_mpsc::UnboundedReceiver<atvv::SessionNotification>>>,
+            events: Mutex<Option<tokio_mpsc::UnboundedReceiver<atvv::DeviceConnectionEvent>>>,
+        }
+
+        impl atvv::BleDevice for RecordingBle {
+            fn write_command(&self, data: &[u8]) -> atvv::BleFut<'_, ()> {
+                let data = data.to_vec();
+                Box::pin(async move {
+                    let _ = self.commands.send(data);
+                    Ok(())
+                })
+            }
+
+            fn notifications(
+                &self,
+            ) -> atvv::BleFut<'_, atvv::BleStream<atvv::SessionNotification>> {
+                Box::pin(async {
+                    let rx = self.notifications.lock().await.take().unwrap();
+                    Ok(Box::pin(UnboundedReceiverStream::new(rx))
+                        as atvv::BleStream<atvv::SessionNotification>)
+                })
+            }
+
+            fn connection_events(
+                &self,
+            ) -> atvv::BleFut<'_, atvv::BleStream<atvv::DeviceConnectionEvent>> {
+                Box::pin(async {
+                    let rx = self.events.lock().await.take().unwrap();
+                    Ok(Box::pin(UnboundedReceiverStream::new(rx))
+                        as atvv::BleStream<atvv::DeviceConnectionEvent>)
+                })
+            }
+        }
+
+        // Case 1: 65 audio packets followed by AUDIO_STOP before CAPS_RESP must NOT drop
+        // AUDIO_STOP, so the next START_SEARCH sends MIC_OPEN (not MIC_CLOSE).
+        let (cmd_tx, mut cmd_rx) = tokio_mpsc::unbounded_channel();
+        let (notif_tx, notif_rx) = tokio_mpsc::unbounded_channel();
+        let (event_tx, event_rx) = tokio_mpsc::unbounded_channel();
+        let ble = RecordingBle {
+            commands: cmd_tx,
+            notifications: Mutex::new(Some(notif_rx)),
+            events: Mutex::new(Some(event_rx)),
+        };
+
+        notif_tx
+            .send(atvv::SessionNotification::Control(
+                atvv::ControlPacket::new(vec![0x04, 0x03, 0x02, 0x00], 1),
+            ))
+            .unwrap();
+        for _ in 0..65 {
+            notif_tx
+                .send(atvv::SessionNotification::Audio(atvv::AudioPacket::new(
+                    vec![0u8; 120],
+                    1,
+                )))
+                .unwrap();
+        }
+        notif_tx
+            .send(atvv::SessionNotification::Control(
+                atvv::ControlPacket::new(vec![0x00, 0x02], 1),
+            ))
+            .unwrap();
+        notif_tx
+            .send(atvv::SessionNotification::Control(
+                atvv::ControlPacket::new(vec![0x0B, 0x01, 0x00, 0x02, 0x03, 0x00, 0x78], 1),
+            ))
+            .unwrap();
+        // Next button press after negotiation must open the mic, not close it.
+        notif_tx
+            .send(atvv::SessionNotification::Control(
+                atvv::ControlPacket::new(vec![0x08], 1),
+            ))
+            .unwrap();
+        drop(notif_tx);
+
+        let (caps, streams) = negotiate(&ble).await.unwrap();
+        let _ = cmd_rx.try_recv(); // GET_CAPS
+        let (mut session_protocol, _) = protocol::create_protocol(&caps).unwrap();
+        let (audio_tx, _audio_rx) = tokio_mpsc::channel(128);
+        let timeouts = atvv::SessionTimeouts {
+            frame_timeout: Duration::ZERO,
+            keepalive: Duration::ZERO,
+        };
+        atvv::run_session(
+            &ble,
+            &mut *session_protocol,
+            streams,
+            atvv::SessionConfig {
+                audio_tx,
+                timeouts: &timeouts,
+                command_rx: None,
+                state_tx: None,
+                consumer_rx: None,
+                generation: None,
+                tail_expiration: None,
+                streaming: None,
+                mic_on_demand: false,
+            },
+        )
+        .await
+        .unwrap();
+        drop(event_tx);
+        assert_eq!(cmd_rx.try_recv().unwrap(), vec![0x0C, 0x00]); // MIC_OPEN
+
+        // Case 2: AUDIO_STOP 1.2s before CAPS_RESP drops stale completed utterance audio.
+        tokio::time::pause();
+        let (cmd_tx, _cmd_rx) = tokio_mpsc::unbounded_channel();
+        let (notif_tx, notif_rx) = tokio_mpsc::unbounded_channel();
+        let (event_tx, event_rx) = tokio_mpsc::unbounded_channel();
+        let ble = RecordingBle {
+            commands: cmd_tx,
+            notifications: Mutex::new(Some(notif_rx)),
+            events: Mutex::new(Some(event_rx)),
+        };
+
+        notif_tx
+            .send(atvv::SessionNotification::Control(
+                atvv::ControlPacket::new(vec![0x04, 0x03, 0x02, 0x00], 1),
+            ))
+            .unwrap();
+        notif_tx
+            .send(atvv::SessionNotification::Audio(atvv::AudioPacket::new(
+                vec![0u8; 120],
+                1,
+            )))
+            .unwrap();
+        notif_tx
+            .send(atvv::SessionNotification::Control(
+                atvv::ControlPacket::new(vec![0x00, 0x02], 1),
+            ))
+            .unwrap();
+        let neg_task = tokio::spawn(async move {
+            let (caps, streams) = negotiate(&ble).await.unwrap();
+            let (mut session_protocol, _) = protocol::create_protocol(&caps).unwrap();
+            let (audio_tx, mut audio_rx) = tokio_mpsc::channel(8);
+            let timeouts = atvv::SessionTimeouts {
+                frame_timeout: Duration::ZERO,
+                keepalive: Duration::ZERO,
+            };
+            atvv::run_session(
+                &ble,
+                &mut *session_protocol,
+                streams,
+                atvv::SessionConfig {
+                    audio_tx,
+                    timeouts: &timeouts,
+                    command_rx: None,
+                    state_tx: None,
+                    consumer_rx: None,
+                    generation: None,
+                    tail_expiration: None,
+                    streaming: None,
+                    mic_on_demand: false,
+                },
+            )
+            .await
+            .unwrap();
+            audio_rx.try_recv().ok()
+        });
+        tokio::time::advance(Duration::from_millis(1200)).await;
+        notif_tx
+            .send(atvv::SessionNotification::Control(
+                atvv::ControlPacket::new(vec![0x0B, 0x01, 0x00, 0x02, 0x03, 0x00, 0x78], 1),
+            ))
+            .unwrap();
+        drop(notif_tx);
+        let stale = neg_task.await.unwrap();
+        drop(event_tx);
+        assert!(
+            stale.is_none(),
+            "utterance stopped >1s before CAPS_RESP must not leak stale samples"
+        );
+    }
+
+    #[tokio::test]
+    async fn pre_caps_start_search_does_not_close_mic_on_demand() {
+        use tokio::sync::{mpsc as tokio_mpsc, watch, Mutex};
+        use tokio_stream::wrappers::UnboundedReceiverStream;
+
+        struct RecordingBle {
+            commands: tokio_mpsc::UnboundedSender<Vec<u8>>,
+            notifications: Mutex<Option<tokio_mpsc::UnboundedReceiver<atvv::SessionNotification>>>,
+            events: Mutex<Option<tokio_mpsc::UnboundedReceiver<atvv::DeviceConnectionEvent>>>,
+        }
+
+        impl atvv::BleDevice for RecordingBle {
+            fn write_command(&self, data: &[u8]) -> atvv::BleFut<'_, ()> {
+                let data = data.to_vec();
+                Box::pin(async move {
+                    let _ = self.commands.send(data);
+                    Ok(())
+                })
+            }
+
+            fn notifications(
+                &self,
+            ) -> atvv::BleFut<'_, atvv::BleStream<atvv::SessionNotification>> {
+                Box::pin(async {
+                    let rx = self.notifications.lock().await.take().unwrap();
+                    Ok(Box::pin(UnboundedReceiverStream::new(rx))
+                        as atvv::BleStream<atvv::SessionNotification>)
+                })
+            }
+
+            fn connection_events(
+                &self,
+            ) -> atvv::BleFut<'_, atvv::BleStream<atvv::DeviceConnectionEvent>> {
+                Box::pin(async {
+                    let rx = self.events.lock().await.take().unwrap();
+                    Ok(Box::pin(UnboundedReceiverStream::new(rx))
+                        as atvv::BleStream<atvv::DeviceConnectionEvent>)
+                })
+            }
+        }
+
+        let (cmd_tx, mut cmd_rx) = tokio_mpsc::unbounded_channel();
+        let (notif_tx, notif_rx) = tokio_mpsc::unbounded_channel();
+        let (event_tx, event_rx) = tokio_mpsc::unbounded_channel();
+        let ble = RecordingBle {
+            commands: cmd_tx,
+            notifications: Mutex::new(Some(notif_rx)),
+            events: Mutex::new(Some(event_rx)),
+        };
+
+        // START_SEARCH arrives before CAPS_RESP while a PipeWire consumer is already attached.
+        notif_tx
+            .send(atvv::SessionNotification::Control(
+                atvv::ControlPacket::new(vec![0x08], 1),
+            ))
+            .unwrap();
+        notif_tx
+            .send(atvv::SessionNotification::Control(
+                atvv::ControlPacket::new(vec![0x0B, 0x01, 0x00, 0x02, 0x03, 0x00, 0x78], 1),
+            ))
+            .unwrap();
+        drop(notif_tx);
+
+        let (caps, streams) = negotiate(&ble).await.unwrap();
+        let _ = cmd_rx.try_recv(); // GET_CAPS
+        let (mut session_protocol, _) = protocol::create_protocol(&caps).unwrap();
+        let (audio_tx, _audio_rx) = tokio_mpsc::channel(8);
+        let (_consumer_tx, mut consumer_rx) = watch::channel(consumer::ConsumerEvent::Changed(1));
+        let (state_tx, state_rx) = watch::channel(atvv::State::Connected);
+        let timeouts = atvv::SessionTimeouts {
+            frame_timeout: Duration::ZERO,
+            keepalive: Duration::ZERO,
+        };
+        atvv::run_session(
+            &ble,
+            &mut *session_protocol,
+            streams,
+            atvv::SessionConfig {
+                audio_tx,
+                timeouts: &timeouts,
+                command_rx: None,
+                state_tx: Some(&state_tx),
+                consumer_rx: Some(&mut consumer_rx),
+                generation: None,
+                tail_expiration: None,
+                streaming: None,
+                mic_on_demand: true,
+            },
+        )
+        .await
+        .unwrap();
+        drop(event_tx);
+
+        let mut sent = Vec::new();
+        while let Ok(cmd) = cmd_rx.try_recv() {
+            sent.push(cmd);
+        }
+        assert_eq!(sent, vec![vec![0x0C, 0x00]]);
+        assert_eq!(*state_rx.borrow(), atvv::State::Opening);
     }
 
     #[test]

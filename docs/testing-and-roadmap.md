@@ -359,4 +359,14 @@ Redmi 实机验证：`cargo fmt --all -- --check`、185 个单元测试（`185 p
 - 16 kHz 采样率一致：`get_caps_cmd()` 仅声明 16 kHz 编码，会话 `AUDIO_START` 校验采样率与协商 codec 一致，不匹配则拒绝进入流式输出并关闭麦克风。
 - 安全与实时性：`test-keys` 直接复用已验证的 `Device` 句柄消除 `eventN` TOCTOU；退出清理 `MIC_CLOSE` 增加 2 秒超时确保在 systemd 15 秒期限前释放按键；PipeWire RT 回调预分配固定容量 `MAX_PENDING` 缓冲并用原子计数移出溢出日志；`doctor` 区分 `system.hold` 字段缺失与显式空列表 `[]`。
 
-Redmi 实机验证：`cargo fmt --all -- --check`、189 个单元测试（`189 passed, 0 failed, 1 ignored`）、Clippy（默认与 `--features dbus`，`-D warnings`）及 release 编译全部通过，已重新安装 `~/.local/bin/rc003-omarchy` 并重启服务。
+Redmi 实机验证：`cargo fmt --all -- --check`、189 个单元测试（`189 passed, 0 failed, 1 ignored`）、Clippy（默认与 `--features dbus`，`-D warnings`）及 release 编译全部通过，已重新安装 `~/.local/bin/rc003-omarchy` 并重启服务。随后完成实体 RC003 语音键真实听写上屏复验，确认仅声明 16 kHz 的 `GET_CAPS` 与热唤醒协商链路工作正常。
+
+## 33. 第二十六轮：协商缓冲边界、采样率防覆盖、停服可中断与零释放 RT 帧
+
+- 协商期缓冲（`negotiate()`）：音频包上限（64 槽）与控制事件分离，满载仅淘汰最旧音频并标记 `discontinuity`，绝不丢弃 `AUDIO_STOP` 等控制事件；`ControlPacket` 记录到达时刻 `received_at`，`AUDIO_STOP` 超过 1 秒尾音期限才收到 `CAPS_RESP` 时直接丢弃过时旧句，未超时则按剩余尾音时间设定 `TailDeadline`（归零则立即推进 `generation`）。
+- 按需模式与预协商按键：`ControlPacket.deferred_during_negotiation` 标记协商期间缓入的 `START_SEARCH`，避免 `mic_on_demand` 启动自动开麦（`Opening`）后被早于 `CAPS_RESP` 的按键误当 toggle-off 关闭。
+- `ProtocolV10::on_audio_sync` 校验同步包采样率与已协商 `selected_codec` 一致，忽略采样率不匹配的 `AUDIO_SYNC` 且绝不覆盖已协商 codec。
+- 停服可中断：`device_removed_from_adapter` 增加 2 秒超时，且 `resolve_chars` 与 `negotiate` 错误分支中的设备存在性查询均与 `shutdown.wait()` 竞争，BlueZ D-Bus 卡死不再阻塞 `SIGTERM`。
+- PipeWire RT 回调彻底零分配、零释放：`PcmFrame` 改为定长内联 `[i16; 512]`（`!std::mem::needs_drop::<PcmFrame>()`），RT 线程消费帧时不再触发 `Vec` 堆释放。
+
+Redmi 实机验证：`cargo fmt --all -- --check`、192 个单元测试（`192 passed, 0 failed, 1 ignored`）、Clippy（默认与 `--features dbus`，`-D warnings`）及 release 编译全部通过，已重新安装 `~/.local/bin/rc003-omarchy` 并重启服务验证通过。

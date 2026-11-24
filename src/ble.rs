@@ -214,10 +214,10 @@ async fn forward_dbus_notifications(
             learn_protocol_version(&data, &mut v10);
             advance_generation_on_audio_start(&data, &generation, v10.unwrap_or(false));
             queue
-                .push(SessionNotification::Control(ControlPacket {
+                .push(SessionNotification::Control(ControlPacket::new(
                     data,
-                    generation: generation.load(Ordering::Relaxed),
-                }))
+                    generation.load(Ordering::Relaxed),
+                )))
                 .await;
         } else if path.as_str() == paths.rx {
             queue
@@ -611,7 +611,7 @@ mod tests {
     use super::*;
 
     fn control_event(data: Vec<u8>, generation: u64) -> SessionNotification {
-        SessionNotification::Control(ControlPacket { data, generation })
+        SessionNotification::Control(ControlPacket::new(data, generation))
     }
 
     async fn drain_audio_before_start<F>(

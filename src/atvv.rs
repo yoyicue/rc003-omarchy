@@ -23,7 +23,7 @@ pub enum State {
     Streaming,
 }
 
-const AUDIO_TAIL_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
+pub(crate) const AUDIO_TAIL_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
 
 impl std::fmt::Display for State {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -92,6 +92,19 @@ impl AudioPacket {
 pub struct ControlPacket {
     pub data: Vec<u8>,
     pub generation: u64,
+    pub received_at: Instant,
+    pub deferred_during_negotiation: bool,
+}
+
+impl ControlPacket {
+    pub fn new(data: Vec<u8>, generation: u64) -> Self {
+        Self {
+            data,
+            generation,
+            received_at: Instant::now(),
+            deferred_during_negotiation: false,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -222,9 +235,33 @@ pub async fn run_session(
     let mut pending_close = None;
     macro_rules! close_mic_reset {
         ($state:ident, $last_seq:ident, $current_stream_id:ident) => {
+            close_mic_reset!(
+                $state,
+                $last_seq,
+                $current_stream_id,
+                AUDIO_TAIL_DRAIN_TIMEOUT
+            );
+        };
+        ($state:ident, $last_seq:ident, $current_stream_id:ident, $tail_duration:expr) => {
             if stopped_generation != Some(stream_generation) {
-                if let Some(tail_expiration) = tail_expiration {
-                    tail_expiration.arm_after(AUDIO_TAIL_DRAIN_TIMEOUT, stream_generation);
+                let tail_duration: Duration = $tail_duration;
+                if tail_duration.is_zero() {
+                    if let Some(tail_expiration) = tail_expiration {
+                        tail_expiration.clear();
+                    }
+                    if let Some(generation) = generation {
+                        let next = crate::audio::generation_number(stream_generation)
+                            .wrapping_add(1)
+                            | (stream_generation & crate::audio::GENERATION_BLOCKED);
+                        let _ = generation.compare_exchange(
+                            stream_generation,
+                            next,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        );
+                    }
+                } else if let Some(tail_expiration) = tail_expiration {
+                    tail_expiration.arm_after(tail_duration, stream_generation);
                 }
                 stopped_generation = Some(stream_generation);
             }
@@ -286,7 +323,9 @@ pub async fn run_session(
                         let should_close = !matches!(reason, AudioStopReason::HttButtonRelease)
                             && state == State::Streaming;
                         let sid = current_stream_id.unwrap_or(StreamId::MIC_OPEN);
-                        close_mic_reset!(state, last_seq, current_stream_id);
+                        let tail_remaining =
+                            AUDIO_TAIL_DRAIN_TIMEOUT.saturating_sub(packet.received_at.elapsed());
+                        close_mic_reset!(state, last_seq, current_stream_id, tail_remaining);
                         if should_close {
                             pending_close = Some(AudioStopReason::MicClose);
                             ble.write_command(&protocol.mic_close_cmd(sid)).await?;
@@ -339,6 +378,13 @@ pub async fn run_session(
                     }
                     CtlEvent::StartSearch => {
                         tracing::info!("START_SEARCH (state={:?})", state);
+
+                        if packet.deferred_during_negotiation && state == State::Opening {
+                            tracing::debug!(
+                                "Ignoring pre-negotiation START_SEARCH while mic is already opening"
+                            );
+                            continue;
+                        }
 
                         if state == State::Streaming || state == State::Opening {
                             // Toggle: second press stops streaming
@@ -580,10 +626,9 @@ mod tests {
         ) -> Result<(), tokio_mpsc::error::SendError<SessionNotification>> {
             let generation = self.generation.load(Ordering::Relaxed);
             self.sender
-                .send(SessionNotification::Control(ControlPacket {
-                    data,
-                    generation,
-                }))
+                .send(SessionNotification::Control(ControlPacket::new(
+                    data, generation,
+                )))
         }
     }
 

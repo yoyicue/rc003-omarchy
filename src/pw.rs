@@ -38,10 +38,37 @@ pub enum SessionControl {
     Shutdown,
 }
 
+/// Inline sample capacity per PCM frame passed across the lock-free queue.
+/// Covers ATVV v1.0 16 kHz frames (240 samples) and v0.4 frames (257 samples)
+/// without any heap allocation or deallocation inside the PipeWire RT callback.
+pub const MAX_PCM_FRAME_SAMPLES: usize = 512;
+
 #[derive(Debug)]
 pub struct PcmFrame {
     pub generation: u64,
-    pub samples: Vec<i16>,
+    len: u16,
+    samples: [i16; MAX_PCM_FRAME_SAMPLES],
+}
+
+impl PcmFrame {
+    pub fn from_slice(generation: u64, slice: &[i16]) -> Self {
+        let len = slice.len().min(MAX_PCM_FRAME_SAMPLES);
+        let mut samples = [0i16; MAX_PCM_FRAME_SAMPLES];
+        samples[..len].copy_from_slice(&slice[..len]);
+        Self {
+            generation,
+            len: len as u16,
+            samples,
+        }
+    }
+
+    pub fn samples(&self) -> &[i16] {
+        &self.samples[..self.len as usize]
+    }
+
+    pub fn samples_mut(&mut self) -> &mut [i16] {
+        &mut self.samples[..self.len as usize]
+    }
 }
 
 /// Return true when a frame belongs to a newer utterance.
@@ -365,8 +392,8 @@ pub fn run_pw_source(
                     sync_generation(&mut buf, &mut previous_generation, frame.generation);
                     let current = generation.load(Ordering::Acquire);
                     if frame_is_output_current(frame.generation, previous_generation, current) {
-                        crate::adpcm::apply_gain_linear(&mut frame.samples, gain_linear);
-                        let dropped = push_samples_bounded(&mut buf, &frame.samples, MAX_PENDING);
+                        crate::adpcm::apply_gain_linear(frame.samples_mut(), gain_linear);
+                        let dropped = push_samples_bounded(&mut buf, frame.samples(), MAX_PENDING);
                         if dropped > 0 {
                             dropped_samples.fetch_add(dropped as u64, Ordering::Relaxed);
                         }
@@ -789,15 +816,20 @@ mod tests {
 
     #[test]
     fn array_queue_drops_oldest_frame_when_full() {
+        assert!(
+            !std::mem::needs_drop::<PcmFrame>(),
+            "PcmFrame must be trivially droppable to avoid heap deallocation in PipeWire RT callback"
+        );
         let queue = ArrayQueue::new(2);
         for generation in 1..=3 {
-            let _ = queue.force_push(PcmFrame {
-                generation,
-                samples: vec![generation as i16],
-            });
+            let _ = queue.force_push(PcmFrame::from_slice(generation, &[generation as i16]));
         }
-        assert_eq!(queue.pop().unwrap().generation, 2);
-        assert_eq!(queue.pop().unwrap().generation, 3);
+        let first = queue.pop().unwrap();
+        assert_eq!(first.generation, 2);
+        assert_eq!(first.samples(), &[2]);
+        let second = queue.pop().unwrap();
+        assert_eq!(second.generation, 3);
+        assert_eq!(second.samples(), &[3]);
     }
 
     #[test]

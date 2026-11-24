@@ -240,8 +240,6 @@ impl Protocol for ProtocolV10 {
     }
 
     fn on_audio_sync(&mut self, sync: &AudioSyncData) {
-        self.audio_buffer.clear();
-        self.awaiting_sync = false;
         match sync {
             AudioSyncData::Full {
                 codec,
@@ -249,11 +247,28 @@ impl Protocol for ProtocolV10 {
                 predictor,
                 step_index,
             } => {
+                if let Some(expected) = self.selected_codec {
+                    if codec.sample_rate() != expected.sample_rate() {
+                        tracing::warn!(
+                            actual = ?codec,
+                            actual_hz = codec.sample_rate(),
+                            expected = ?expected,
+                            expected_hz = expected.sample_rate(),
+                            "Ignoring v1.0 AUDIO_SYNC with mismatched sample rate"
+                        );
+                        return;
+                    }
+                } else {
+                    self.selected_codec = Some(*codec);
+                }
+                self.audio_buffer.clear();
+                self.awaiting_sync = false;
                 self.decoder.reset(*predictor, *step_index);
                 self.frame_seq = *seq;
-                self.selected_codec = Some(*codec);
             }
             AudioSyncData::FrameNum { seq } => {
+                self.audio_buffer.clear();
+                self.awaiting_sync = false;
                 // Unexpected in v1.0 (v1.0 uses Full sync with decoder state),
                 // but handle gracefully by updating frame sequence only.
                 tracing::trace!(
@@ -718,5 +733,28 @@ mod tests {
         let frames = hdr.decode_audio(&[0u8; 126]);
         assert_eq!(frames.len(), 1);
         assert_eq!(frames[0].seq, 5);
+    }
+
+    #[test]
+    fn test_audio_sync_with_mismatched_sample_rate_is_ignored() {
+        let mut p = ProtocolV10::new();
+        let caps = Capabilities {
+            version: ProtocolVersion::V1_0,
+            codecs: Codecs::ADPCM_8KHZ | Codecs::ADPCM_16KHZ,
+            interaction_model: InteractionModel::HoldToTalk,
+            audio_frame_size: AudioFrameSize(120),
+        };
+        assert_eq!(p.on_caps_resp(&caps).unwrap(), Codec::Adpcm16kHz);
+        p.frame_seq = 7;
+
+        p.on_audio_sync(&AudioSyncData::Full {
+            codec: Codec::Adpcm8kHz,
+            seq: 99,
+            predictor: 1234,
+            step_index: 20,
+        });
+
+        assert_eq!(p.negotiated_codec(), Some(Codec::Adpcm16kHz));
+        assert_eq!(p.frame_seq, 7);
     }
 }
