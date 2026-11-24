@@ -1115,8 +1115,8 @@ fn sysfs_is_rc003(path: &Path) -> Option<bool> {
     Some(vendor == RC003_VENDOR_ID && product == RC003_PRODUCT_ID)
 }
 
-pub fn check_rc003_access(address: Option<&str>) -> Result<Vec<String>> {
-    let mut paths = Vec::new();
+fn open_rc003_devices(address: Option<&str>) -> Result<Vec<(PathBuf, Device)>> {
+    let mut devices = Vec::new();
     for entry in std::fs::read_dir("/dev/input")? {
         let path = entry?.path();
         if !path
@@ -1136,18 +1136,24 @@ pub fn check_rc003_access(address: Option<&str>) -> Result<Vec<String>> {
                     continue;
                 }
             }
-            paths.push(path.display().to_string());
+            devices.push((path, device));
         }
     }
-    Ok(paths)
+    Ok(devices)
+}
+
+pub fn check_rc003_access(address: Option<&str>) -> Result<Vec<String>> {
+    Ok(open_rc003_devices(address)?
+        .into_iter()
+        .map(|(path, _)| path.display().to_string())
+        .collect())
 }
 
 pub fn probe_keys(duration: Duration, address: Option<&str>) -> Result<()> {
-    let path = check_rc003_access(address)?
+    let (_path, mut device) = open_rc003_devices(address)?
         .into_iter()
         .next()
         .context("no accessible RC003 event node")?;
-    let mut device = Device::open(&path)?;
     device.set_nonblocking(true)?;
     device.grab()?;
     println!(

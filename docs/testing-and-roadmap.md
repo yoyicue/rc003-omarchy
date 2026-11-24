@@ -349,3 +349,14 @@ Redmi 实机验证与 CI：GitHub Actions CI（`#45279841839`）与 Redmi 真机
 - `NotificationQueue` 满 64 包淘汰音频包时仅在下一音频包与被淘汰包属于同一 `generation` 时标记 `discontinuity = true`，避免跨 `AUDIO_START` 边界淘汰旧句音频误伤新句首包（尤其 `headered` 分包模式）。
 
 Redmi 实机验证：`cargo fmt --all -- --check`、185 个单元测试（`185 passed, 0 failed, 1 ignored`）、Clippy（默认与 `--features dbus`，`-D warnings`）及 release 编译全部通过，已重新安装 `~/.local/bin/rc003-omarchy` 并重启服务验证通过。
+
+## 32. 第二十五轮：Codex 深度复审 11 项最小改动收口
+
+- GATT 重连与特征刷新：统一内层循环为每次重连/协商失败后重新确认连接并重解析 `chars` 与厂商握手；`map_notify_error` 补齐 `UnknownObject`/`DoesNotExist` → `bluer::ErrorKind::NotFound`，`is_device_removed_bluer_error` 补齐 `NotFound`，并按适配器设备列表区分“设备已移除”与“特征对象重建”。
+- 发现与配对过滤：守护进程认领设备前统一检查 `is_paired()`（`doctor` 同步检查），实时扫描切至 `discover_devices_with_changes()`，避免认领未配对邻近遥控器或漏掉延迟填充 UUID 的设备。
+- 队列溢出与 `headered` 对齐：`NotificationQueue` 改为按队列中是否跨过 `AUDIO_START` / `AUDIO_SYNC` 控制事件判断断层边界（消除消费者切换改 `generation` 导致的漏标回归）；`ProtocolV10::on_audio_discontinuity` 在 `headered` 模式下无条件等待下一次 `AUDIO_SYNC`。
+- 唤醒首句保活：`negotiate()` 等待 `CAPS_RESP` 期间保留先到的控制事件及 `AUDIO_START` 后的音频包并拼接到会话流头部，防止唤醒后的第一句听写静音。
+- 16 kHz 采样率一致：`get_caps_cmd()` 仅声明 16 kHz 编码，会话 `AUDIO_START` 校验采样率与协商 codec 一致，不匹配则拒绝进入流式输出并关闭麦克风。
+- 安全与实时性：`test-keys` 直接复用已验证的 `Device` 句柄消除 `eventN` TOCTOU；退出清理 `MIC_CLOSE` 增加 2 秒超时确保在 systemd 15 秒期限前释放按键；PipeWire RT 回调预分配固定容量 `MAX_PENDING` 缓冲并用原子计数移出溢出日志；`doctor` 区分 `system.hold` 字段缺失与显式空列表 `[]`。
+
+Redmi 实机验证：`cargo fmt --all -- --check`、189 个单元测试（`189 passed, 0 failed, 1 ignored`）、Clippy（默认与 `--features dbus`，`-D warnings`）及 release 编译全部通过，已重新安装 `~/.local/bin/rc003-omarchy` 并重启服务。

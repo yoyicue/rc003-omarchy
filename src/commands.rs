@@ -94,7 +94,7 @@ async fn scan(adapter_name: Option<&str>, device_filter: Option<&str>) -> Result
     let adapter = adapter(adapter_name).await?;
     let device = tokio::time::timeout(
         Duration::from_secs(10),
-        ble::find_atvv_device(&adapter, filter_addr, &[]),
+        ble::find_atvv_device(&adapter, filter_addr, &[], false),
     )
     .await
     .context("timed out discovering an ATVV remote")??;
@@ -123,7 +123,7 @@ impl Check {
 #[derive(Debug, PartialEq, Eq)]
 struct HoldShortcutInfo {
     configured: String,
-    system: Vec<String>,
+    system: Option<Vec<String>>,
 }
 
 fn pactl_has_source(output: &str, node_name: &str) -> bool {
@@ -174,7 +174,7 @@ fn extract_hold_from_json(value: &serde_json::Value) -> Option<String> {
     None
 }
 
-fn extract_system_holds_from_json(value: &serde_json::Value) -> Vec<String> {
+fn extract_system_holds_from_json(value: &serde_json::Value) -> Option<Vec<String>> {
     value
         .get("system")
         .and_then(|system| system.get("hold"))
@@ -188,7 +188,6 @@ fn extract_system_holds_from_json(value: &serde_json::Value) -> Vec<String> {
                 .map(ToString::to_string)
                 .collect()
         })
-        .unwrap_or_default()
 }
 
 fn parse_superwhisper_hold_shortcut(stdout: &[u8]) -> Option<HoldShortcutInfo> {
@@ -222,7 +221,7 @@ fn parse_superwhisper_hold_shortcut(stdout: &[u8]) -> Option<HoldShortcutInfo> {
             if !cleaned.is_empty() {
                 return Some(HoldShortcutInfo {
                     configured: cleaned.to_string(),
-                    system: Vec::new(),
+                    system: None,
                 });
             }
         }
@@ -246,6 +245,9 @@ async fn check_bluetooth(
                 let Ok(device) = adapter.device(address) else {
                     continue;
                 };
+                if !device.is_paired().await.unwrap_or(false) {
+                    continue;
+                }
                 if let Ok(Some(uuids)) = device.uuids().await {
                     if uuids.contains(&ble::ATVV_SERVICE) {
                         let name = device.name().await.ok().flatten().unwrap_or_default();
@@ -366,28 +368,26 @@ fn check_superwhisper_audio(node_name: &str) -> Check {
 fn evaluate_superwhisper_shortcut(parsed: Option<HoldShortcutInfo>, expected: &str) -> Check {
     match parsed {
         Some(info) if shortcut_matches_voice_key(&info.configured, expected) => {
-            if !info.system.is_empty()
-                && !info
-                    .system
+            if let Some(system) = info.system.as_deref() {
+                if !system
                     .iter()
                     .any(|key| shortcut_matches_voice_key(key, expected))
-            {
-                Check::new(
-                    "shortcut",
-                    "warn",
-                    format!(
-                        "Superwhisper hold shortcut is {expected}, but system bindings are {:?} \
-                         (run: superwhisper shortcuts apply)",
-                        info.system
-                    ),
-                )
-            } else {
-                Check::new(
-                    "shortcut",
-                    "pass",
-                    format!("Superwhisper hold shortcut matches config ({expected})"),
-                )
+                {
+                    return Check::new(
+                        "shortcut",
+                        "warn",
+                        format!(
+                            "Superwhisper hold shortcut is {expected}, but system bindings are {system:?} \
+                             (run: superwhisper shortcuts apply)"
+                        ),
+                    );
+                }
             }
+            Check::new(
+                "shortcut",
+                "pass",
+                format!("Superwhisper hold shortcut matches config ({expected})"),
+            )
         }
         Some(info) => Check::new(
             "shortcut",
@@ -514,11 +514,21 @@ mod tests {
         }"#;
         let info = parse_superwhisper_hold_shortcut(live_json).unwrap();
         assert_eq!(info.configured, "RightAlt");
-        assert_eq!(info.system, vec!["RightAlt"]);
+        assert_eq!(info.system, Some(vec!["RightAlt".to_string()]));
         assert_eq!(
             evaluate_superwhisper_shortcut(Some(info), "RightAlt").status,
             "pass"
         );
+
+        let unapplied_empty = br#"{
+            "shortcuts": { "hold": "RightAlt" },
+            "system": { "hold": [] }
+        }"#;
+        let info = parse_superwhisper_hold_shortcut(unapplied_empty).unwrap();
+        assert_eq!(info.system, Some(Vec::new()));
+        let check = evaluate_superwhisper_shortcut(Some(info), "RightAlt");
+        assert_eq!(check.status, "warn");
+        assert!(check.detail.contains("superwhisper shortcuts apply"));
 
         let unapplied = br#"{
             "shortcuts": { "hold": "F9" },

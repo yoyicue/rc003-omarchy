@@ -166,6 +166,10 @@ impl Protocol for ProtocolV10 {
         Ok(codec)
     }
 
+    fn negotiated_codec(&self) -> Option<Codec> {
+        self.selected_codec
+    }
+
     fn decode_audio(&mut self, data: &[u8]) -> Vec<AudioFrame> {
         let Some(codec) = self.selected_codec else {
             return Vec::new();
@@ -218,14 +222,13 @@ impl Protocol for ProtocolV10 {
         !self.audio_buffer.is_empty()
     }
 
-    fn on_audio_discontinuity(&mut self, next_packet_len: usize) {
+    fn on_audio_discontinuity(&mut self) {
         self.audio_buffer.clear();
-        let plain_size = self.audio_frame_size.0 as usize;
-        if self.header_mode && plain_size > 0 {
-            let wire_size = plain_size + 6;
-            if next_packet_len == 0 || !next_packet_len.is_multiple_of(wire_size) {
-                self.awaiting_sync = true;
-            }
+        if self.header_mode {
+            // In headered mode, packet length alone cannot prove alignment after a
+            // drop (e.g., losing a 6-byte header leaves 120 old payload + 6 new
+            // header = 126 bytes). Wait for an explicit AUDIO_SYNC or AUDIO_START.
+            self.awaiting_sync = true;
         }
     }
 
@@ -684,27 +687,28 @@ mod tests {
     }
 
     #[test]
-    fn test_discontinuity_clears_partial_raw_and_waits_for_sync_on_fragmented_headered() {
+    fn test_discontinuity_clears_partial_raw_and_waits_for_sync_in_headered_mode() {
         // Raw mode: clears orphan half-frame and resumes decoding cleanly.
         let mut raw = ProtocolV10::new();
         raw.selected_codec = Some(Codec::Adpcm16kHz);
         raw.audio_frame_size = AudioFrameSize(120);
         assert!(raw.decode_audio(&[0xAAu8; 60]).is_empty());
         assert!(raw.has_partial_audio());
-        raw.on_audio_discontinuity(120);
+        raw.on_audio_discontinuity();
         assert!(!raw.has_partial_audio());
         assert_eq!(raw.decode_audio(&[0u8; 120]).len(), 1);
 
-        // Headered mode with fragmented packet after drop: waits for AUDIO_SYNC.
+        // Headered mode: always waits for AUDIO_SYNC after drop, even when the next
+        // packet happens to be 126 bytes (could be 120 old payload + 6 new header).
         let mut hdr = ProtocolV10::new();
         hdr.selected_codec = Some(Codec::Adpcm16kHz);
         hdr.audio_frame_size = AudioFrameSize(120);
         hdr.set_frame_layout(AudioFrameLayout::Headered);
         assert!(hdr.decode_audio(&[0u8; 60]).is_empty());
-        hdr.on_audio_discontinuity(66);
+        hdr.on_audio_discontinuity();
         assert!(!hdr.has_partial_audio());
-        assert!(hdr.decode_audio(&[0u8; 66]).is_empty());
         assert!(hdr.decode_audio(&[0u8; 126]).is_empty());
+        assert!(hdr.decode_audio(&[0u8; 66]).is_empty());
         hdr.on_audio_sync(&AudioSyncData::Full {
             codec: Codec::Adpcm16kHz,
             seq: 5,
@@ -714,9 +718,5 @@ mod tests {
         let frames = hdr.decode_audio(&[0u8; 126]);
         assert_eq!(frames.len(), 1);
         assert_eq!(frames[0].seq, 5);
-
-        // Headered mode with full aligned frame after drop: keeps decoding immediately.
-        hdr.on_audio_discontinuity(126);
-        assert_eq!(hdr.decode_audio(&[0u8; 126]).len(), 1);
     }
 }

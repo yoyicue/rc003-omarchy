@@ -310,16 +310,12 @@ enum ConnectOutcome {
 }
 
 fn is_device_removed_bluer_error(error: &bluer::Error) -> bool {
-    matches!(error.kind, bluer::ErrorKind::DoesNotExist)
-        || error.message.contains("UnknownObject")
+    matches!(
+        error.kind,
+        bluer::ErrorKind::DoesNotExist | bluer::ErrorKind::NotFound
+    ) || error.message.contains("UnknownObject")
         || error.message.contains("DoesNotExist")
         || error.to_string().contains("UnknownObject")
-}
-
-fn is_device_removed_error(error: &anyhow::Error) -> bool {
-    error
-        .downcast_ref::<bluer::Error>()
-        .is_some_and(is_device_removed_bluer_error)
 }
 
 async fn device_removed_from_adapter(adapter: &bluer::Adapter, address: bluer::Address) -> bool {
@@ -409,6 +405,11 @@ fn acquire_device_lock(adapter: &str, address: bluer::Address) -> std::io::Resul
 
 /// Timeout waiting for CAPS_RESP during negotiation.
 const NEGOTIATE_TIMEOUT: Duration = Duration::from_secs(5);
+/// Short timeout for best-effort MIC_CLOSE during shutdown so input cleanup
+/// always completes well within systemd's stop timeout.
+const SHUTDOWN_MIC_CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
+/// Maximum pre-CAPS_RESP notifications preserved for handoff to `run_session`.
+const MAX_DEFERRED_NEGOTIATION_EVENTS: usize = 64;
 
 /// Send GET_CAPS and wait for CAPS_RESP to determine protocol version.
 async fn negotiate(
@@ -428,6 +429,9 @@ async fn negotiate(
     let deadline = tokio::time::sleep(NEGOTIATE_TIMEOUT);
     tokio::pin!(deadline);
 
+    let mut deferred = Vec::new();
+    let mut saw_audio_start = false;
+
     // BleStream<T> is Pin<Box<dyn Stream>>, already Unpin -- no tokio::pin! needed.
     loop {
         tokio::select! {
@@ -439,15 +443,35 @@ async fn negotiate(
                                 "CAPS_RESP: version={}, codecs={:?}, model={:?}, frame_size={}",
                                 caps.version, caps.codecs, caps.interaction_model, caps.audio_frame_size.0
                             );
+                            let notifications: atvv::BleStream<atvv::SessionNotification> =
+                                if deferred.is_empty() {
+                                    notifications
+                                } else {
+                                    Box::pin(futures::stream::iter(deferred).chain(notifications))
+                                };
                             return Ok((caps, atvv::BleStreams {
                                 notifications,
                                 events: device_events,
                             }));
                         }
-                        // Not a CAPS_RESP (e.g., stale START_SEARCH) -- keep waiting
-                        tracing::debug!("Ignoring non-CAPS_RESP CTL during negotiation: {:02x?}", packet.data);
+                        match packet.data.first().copied() {
+                            Some(0x04) => saw_audio_start = true,
+                            Some(0x00) => saw_audio_start = false,
+                            _ => {}
+                        }
+                        if deferred.len() < MAX_DEFERRED_NEGOTIATION_EVENTS {
+                            tracing::debug!(
+                                "Deferring non-CAPS_RESP CTL during negotiation: {:02x?}",
+                                packet.data
+                            );
+                            deferred.push(atvv::SessionNotification::Control(packet));
+                        }
                     }
-                    Some(atvv::SessionNotification::Audio(_)) => {}
+                    Some(atvv::SessionNotification::Audio(packet)) => {
+                        if saw_audio_start && deferred.len() < MAX_DEFERRED_NEGOTIATION_EVENTS {
+                            deferred.push(atvv::SessionNotification::Audio(packet));
+                        }
+                    }
                     None => {
                         anyhow::bail!("device disconnected during negotiation");
                     }
@@ -698,7 +722,8 @@ async fn main() -> anyhow::Result<()> {
         let device = loop {
             tokio::select! {
                 result = async {
-                    let discovery = ble::find_atvv_device(&adapter, filter_addr, &excluded_vec);
+                    let discovery =
+                        ble::find_atvv_device(&adapter, filter_addr, &excluded_vec, true);
                     if let Some(deadline) = exclusion_deadline {
                         match tokio::time::timeout_at(deadline, discovery).await {
                             Ok(result) => result,
@@ -758,76 +783,80 @@ async fn main() -> anyhow::Result<()> {
             None
         };
 
-        tokio::select! {
-            outcome = ensure_connected(&adapter, &device, retry_delay) => {
-                if outcome == ConnectOutcome::Removed {
-                    tracing::warn!(
-                        "Device {} was removed from BlueZ; returning to discovery",
-                        ble::redact_address(device.address())
-                    );
-                    reset_discovered_device();
-                    continue 'discover;
-                }
-            }
-            _ = shutdown.wait() => {
-                tracing::info!("Shutting down");
-                break 'discover;
-            }
-        }
+        let mut has_connected_once = false;
 
-        // Resolve GATT characteristics (retries on failure, interruptible)
-        let mut chars = loop {
+        // Inner loop: connect/resolve → negotiate → session → reconnect (same device).
+        loop {
             tokio::select! {
-                result = ble::resolve_chars(&device) => {
-                    match result {
-                        Ok(c) => {
-                            tracing::info!("ATVV characteristics resolved");
-                            break c;
-                        }
-                        Err(e) => {
-                            if is_device_removed_error(&e)
-                                || device_removed_from_adapter(&adapter, device.address()).await
-                            {
-                                tracing::warn!(
-                                    "Device {} was removed from BlueZ while resolving characteristics; returning to discovery",
-                                    ble::redact_address(device.address())
-                                );
-                                reset_discovered_device();
-                                continue 'discover;
-                            }
-                            tracing::warn!(
-                                "Failed to resolve characteristics ({e}), retrying in 2s..."
-                            );
-                            tokio::select! {
-                                _ = tokio::time::sleep(retry_delay) => {}
-                                _ = shutdown.wait() => break 'discover,
-                            }
-                        }
+                outcome = ensure_connected(&adapter, &device, retry_delay) => {
+                    if outcome == ConnectOutcome::Removed {
+                        tracing::warn!(
+                            "Device {} was removed from BlueZ; returning to discovery",
+                            ble::redact_address(device.address())
+                        );
+                        reset_discovered_device();
+                        continue 'discover;
                     }
+                    if has_connected_once {
+                        tracing::info!("Device reconnected");
+                    }
+                    has_connected_once = true;
                 }
                 _ = shutdown.wait() => {
                     tracing::info!("Shutting down");
                     break 'discover;
                 }
             }
-        };
 
-        // Perform vendor handshake if the device requires one (e.g. Philips TV Voice remotes).
-        // Keep the returned stream alive: dropping it calls StopNotify on ff02,
-        // which resets the remote's ATVV-ready state before GET_CAPS can succeed.
-        let mut _vendor_ff02_stream = tokio::select! {
-            result = ble::vendor_handshake(&device) => match result {
-                Ok(stream) => stream,
-                Err(e) => {
-                    tracing::warn!("Vendor handshake failed: {e}");
-                    None
+            // Resolve GATT characteristics (handles may change after reconnect or GATT rebuild)
+            let chars = loop {
+                tokio::select! {
+                    result = ble::resolve_chars(&device) => {
+                        match result {
+                            Ok(c) => {
+                                tracing::info!("ATVV characteristics resolved");
+                                break c;
+                            }
+                            Err(e) => {
+                                if device_removed_from_adapter(&adapter, device.address()).await {
+                                    tracing::warn!(
+                                        "Device {} was removed from BlueZ while resolving characteristics; returning to discovery",
+                                        ble::redact_address(device.address())
+                                    );
+                                    reset_discovered_device();
+                                    continue 'discover;
+                                }
+                                tracing::warn!(
+                                    "Failed to resolve characteristics ({e}), retrying in {retry_delay:?}..."
+                                );
+                                tokio::select! {
+                                    _ = tokio::time::sleep(retry_delay) => {}
+                                    _ = shutdown.wait() => break 'discover,
+                                }
+                            }
+                        }
+                    }
+                    _ = shutdown.wait() => {
+                        tracing::info!("Shutting down");
+                        break 'discover;
+                    }
                 }
-            },
-            _ = shutdown.wait() => break 'discover,
-        };
+            };
 
-        // Inner loop: session → reconnect (same device).
-        loop {
+            // Perform vendor handshake if the device requires one (e.g. Philips TV Voice remotes).
+            // Keep the returned stream alive: dropping it calls StopNotify on ff02,
+            // which resets the remote's ATVV-ready state before GET_CAPS can succeed.
+            let _vendor_ff02_stream = tokio::select! {
+                result = ble::vendor_handshake(&device) => match result {
+                    Ok(stream) => stream,
+                    Err(e) => {
+                        tracing::warn!("Vendor handshake failed: {e}");
+                        None
+                    }
+                },
+                _ = shutdown.wait() => break 'discover,
+            };
+
             let ble_device = ble::BluerDevice::new(&device, &chars, pw_handle.generation.clone());
 
             // Negotiate protocol version
@@ -856,9 +885,7 @@ async fn main() -> anyhow::Result<()> {
                                     );
                                 }
                             }
-                        } else if is_device_removed_error(&e)
-                            || device_removed_from_adapter(&adapter, device.address()).await
-                        {
+                        } else if device_removed_from_adapter(&adapter, device.address()).await {
                             tracing::warn!(
                                 "Device {} was removed from BlueZ during negotiation; returning to discovery",
                                 ble::redact_address(device.address())
@@ -969,8 +996,19 @@ async fn main() -> anyhow::Result<()> {
                     let mic_close = session_protocol.mic_close_cmd(
                         protocol::types::StreamId::ANY,
                     );
-                    let _ = atvv::BleDevice::write_command(&ble_device, &mic_close).await;
-                    tracing::info!("Sent MIC_CLOSE, shutting down");
+                    match tokio::time::timeout(
+                        SHUTDOWN_MIC_CLOSE_TIMEOUT,
+                        atvv::BleDevice::write_command(&ble_device, &mic_close),
+                    )
+                    .await
+                    {
+                        Ok(Ok(())) => tracing::info!("Sent MIC_CLOSE, shutting down"),
+                        Ok(Err(e)) => tracing::warn!("MIC_CLOSE failed during shutdown: {e}"),
+                        Err(_) => tracing::warn!(
+                            "MIC_CLOSE timed out after {:?} during shutdown; continuing cleanup",
+                            SHUTDOWN_MIC_CLOSE_TIMEOUT
+                        ),
+                    }
                     break 'discover;
                 }
             };
@@ -1023,77 +1061,8 @@ async fn main() -> anyhow::Result<()> {
             }
             reconnect_delay = std::cmp::min(reconnect_delay * 2, reconnect_max_delay);
 
-            // Update D-Bus state
+            // Update D-Bus state before re-connecting and re-resolving handles.
             let _ = state_tx.send(atvv::State::Disconnected);
-
-            // Wait for device to reconnect (C1: interruptible by ctrl+c)
-            tokio::select! {
-                outcome = ensure_connected(&adapter, &device, retry_delay) => {
-                    if outcome == ConnectOutcome::Removed {
-                        tracing::warn!(
-                            "Device {} was removed from BlueZ while reconnecting; returning to discovery",
-                            ble::redact_address(device.address())
-                        );
-                        reset_discovered_device();
-                        continue 'discover;
-                    }
-                    tracing::info!("Device reconnected");
-                }
-                _ = shutdown.wait() => {
-                    tracing::info!("Interrupted during reconnection, shutting down");
-                    break 'discover;
-                }
-            }
-
-            // Re-resolve characteristics (handles may change after reconnect)
-            // Also re-run vendor handshake since some devices (e.g. Philips) reset their
-            // ATVV-ready state on reconnect.
-            chars = loop {
-                tokio::select! {
-                    result = ble::resolve_chars(&device) => {
-                        match result {
-                            Ok(c) => {
-                                tracing::info!("ATVV characteristics re-resolved");
-                                // Re-run vendor handshake (e.g. Philips remotes reset state on reconnect)
-                                _vendor_ff02_stream = tokio::select! {
-                                    result = ble::vendor_handshake(&device) => match result {
-                                        Ok(stream) => stream,
-                                        Err(e) => {
-                                            tracing::warn!("Vendor handshake failed after reconnect: {e}");
-                                            None
-                                        }
-                                    },
-                                    _ = shutdown.wait() => break 'discover,
-                                };
-                                break c;
-                            }
-                            Err(e) => {
-                                if is_device_removed_error(&e)
-                                    || device_removed_from_adapter(&adapter, device.address()).await
-                                {
-                                    tracing::warn!(
-                                        "Device {} was removed from BlueZ while re-resolving characteristics; returning to discovery",
-                                        ble::redact_address(device.address())
-                                    );
-                                    reset_discovered_device();
-                                    continue 'discover;
-                                }
-                                tracing::warn!(
-                                    "Failed to re-resolve characteristics ({e}), retrying in 2s..."
-                                );
-                                tokio::select! {
-                                    _ = tokio::time::sleep(retry_delay) => {}
-                                    _ = shutdown.wait() => break 'discover,
-                                }
-                            }
-                        }
-                    }
-                    _ = shutdown.wait() => {
-                        tracing::info!("Interrupted during characteristic resolution, shutting down");
-                        break 'discover;
-                    }
-                }
-            };
         }
     }
 
@@ -1214,19 +1183,126 @@ mod tests {
             kind: bluer::ErrorKind::DoesNotExist,
             message: "Does Not Exist".to_string(),
         };
-        assert!(is_device_removed_error(&anyhow::Error::new(does_not_exist)));
+        assert!(is_device_removed_bluer_error(&does_not_exist));
+
+        let not_found = bluer::Error {
+            kind: bluer::ErrorKind::NotFound,
+            message: String::new(),
+        };
+        assert!(is_device_removed_bluer_error(&not_found));
 
         let unknown_object = bluer::Error {
             kind: bluer::ErrorKind::Failed,
             message: "org.freedesktop.DBus.Error.UnknownObject: Method failed".to_string(),
         };
-        assert!(is_device_removed_error(&anyhow::Error::new(unknown_object)));
+        assert!(is_device_removed_bluer_error(&unknown_object));
 
         let transient = bluer::Error {
             kind: bluer::ErrorKind::InProgress,
             message: "Operation already in progress".to_string(),
         };
-        assert!(!is_device_removed_error(&anyhow::Error::new(transient)));
+        assert!(!is_device_removed_bluer_error(&transient));
+    }
+
+    #[tokio::test]
+    async fn negotiate_preserves_audio_start_received_before_caps_resp() {
+        use tokio::sync::{mpsc as tokio_mpsc, Mutex};
+        use tokio_stream::wrappers::UnboundedReceiverStream;
+
+        struct FakeNegotiateBle {
+            notifications: Mutex<Option<tokio_mpsc::UnboundedReceiver<atvv::SessionNotification>>>,
+            events: Mutex<Option<tokio_mpsc::UnboundedReceiver<atvv::DeviceConnectionEvent>>>,
+        }
+
+        impl atvv::BleDevice for FakeNegotiateBle {
+            fn write_command(&self, _data: &[u8]) -> atvv::BleFut<'_, ()> {
+                Box::pin(async { Ok(()) })
+            }
+
+            fn notifications(
+                &self,
+            ) -> atvv::BleFut<'_, atvv::BleStream<atvv::SessionNotification>> {
+                Box::pin(async {
+                    let rx = self.notifications.lock().await.take().unwrap();
+                    Ok(Box::pin(UnboundedReceiverStream::new(rx))
+                        as atvv::BleStream<atvv::SessionNotification>)
+                })
+            }
+
+            fn connection_events(
+                &self,
+            ) -> atvv::BleFut<'_, atvv::BleStream<atvv::DeviceConnectionEvent>> {
+                Box::pin(async {
+                    let rx = self.events.lock().await.take().unwrap();
+                    Ok(Box::pin(UnboundedReceiverStream::new(rx))
+                        as atvv::BleStream<atvv::DeviceConnectionEvent>)
+                })
+            }
+        }
+
+        let (notif_tx, notif_rx) = tokio_mpsc::unbounded_channel();
+        let (event_tx, event_rx) = tokio_mpsc::unbounded_channel();
+        let ble = FakeNegotiateBle {
+            notifications: Mutex::new(Some(notif_rx)),
+            events: Mutex::new(Some(event_rx)),
+        };
+
+        // Remote sends AUDIO_START (v1.0, HTT, 16kHz, stream 0) BEFORE CAPS_RESP.
+        notif_tx
+            .send(atvv::SessionNotification::Control(atvv::ControlPacket {
+                data: vec![0x04, 0x03, 0x02, 0x00],
+                generation: 1,
+            }))
+            .unwrap();
+        // Then CAPS_RESP: v1.0, ADPCM_16KHZ, HTT, 120-byte frames.
+        notif_tx
+            .send(atvv::SessionNotification::Control(atvv::ControlPacket {
+                data: vec![0x0B, 0x01, 0x00, 0x02, 0x03, 0x00, 0x78],
+                generation: 1,
+            }))
+            .unwrap();
+        // Then an audio frame arrives after negotiation.
+        notif_tx
+            .send(atvv::SessionNotification::Audio(atvv::AudioPacket::new(
+                vec![0u8; 120],
+                1,
+            )))
+            .unwrap();
+        drop(notif_tx);
+
+        let (caps, streams) = negotiate(&ble).await.unwrap();
+        let (mut session_protocol, codec) = protocol::create_protocol(&caps).unwrap();
+        assert_eq!(codec, protocol::types::Codec::Adpcm16kHz);
+
+        let (audio_tx, mut audio_rx) = tokio_mpsc::channel(8);
+        let timeouts = atvv::SessionTimeouts {
+            frame_timeout: Duration::ZERO,
+            keepalive: Duration::ZERO,
+        };
+        atvv::run_session(
+            &ble,
+            &mut *session_protocol,
+            streams,
+            atvv::SessionConfig {
+                audio_tx,
+                timeouts: &timeouts,
+                command_rx: None,
+                state_tx: None,
+                consumer_rx: None,
+                generation: None,
+                tail_expiration: None,
+                streaming: None,
+                mic_on_demand: false,
+            },
+        )
+        .await
+        .unwrap();
+        drop(event_tx);
+
+        let frame = audio_rx
+            .try_recv()
+            .expect("AUDIO_START arriving before CAPS_RESP must not silence the first utterance");
+        assert_eq!(frame.samples.len(), 240);
     }
 
     #[test]

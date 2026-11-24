@@ -70,6 +70,13 @@ struct NotificationQueue {
     notify: tokio::sync::Notify,
 }
 
+fn resets_audio_framing(event: &SessionNotification) -> bool {
+    matches!(
+        event,
+        SessionNotification::Control(pkt) if matches!(pkt.data.first(), Some(0x04 | 0x0A))
+    )
+}
+
 impl NotificationQueue {
     async fn push(&self, mut event: SessionNotification) {
         let is_audio = matches!(event, SessionNotification::Audio(_));
@@ -79,19 +86,23 @@ impl NotificationQueue {
                 .iter()
                 .position(|event| matches!(event, SessionNotification::Audio(_)))
             {
-                if let Some(SessionNotification::Audio(evicted)) = events.remove(index) {
-                    if let Some(SessionNotification::Audio(next_audio)) = events
-                        .iter_mut()
-                        .skip(index)
-                        .find(|e| matches!(e, SessionNotification::Audio(_)))
-                    {
-                        if next_audio.generation == evicted.generation {
-                            next_audio.discontinuity = true;
-                        }
-                    } else if let SessionNotification::Audio(ref mut incoming) = event {
-                        if incoming.generation == evicted.generation {
-                            incoming.discontinuity = true;
-                        }
+                let _ = events.remove(index);
+                let mut hit_boundary = false;
+                let mut marked = false;
+                for queued in events.iter_mut().skip(index) {
+                    if resets_audio_framing(queued) {
+                        hit_boundary = true;
+                        break;
+                    }
+                    if let SessionNotification::Audio(next_audio) = queued {
+                        next_audio.discontinuity = true;
+                        marked = true;
+                        break;
+                    }
+                }
+                if !marked && !hit_boundary {
+                    if let SessionNotification::Audio(ref mut incoming) = event {
+                        incoming.discontinuity = true;
                     }
                 }
             }
@@ -227,6 +238,16 @@ fn map_notify_error(error: zbus::Error) -> anyhow::Error {
             bluer::Error {
                 kind: bluer::ErrorKind::NotPermitted,
                 message: "StartNotify not permitted".to_string(),
+            }
+            .into()
+        }
+        zbus::Error::MethodError(name, msg, _)
+            if name == "org.freedesktop.DBus.Error.UnknownObject"
+                || name == "org.bluez.Error.DoesNotExist" =>
+        {
+            bluer::Error {
+                kind: bluer::ErrorKind::NotFound,
+                message: msg.unwrap_or_else(|| name.to_string()),
             }
             .into()
         }
@@ -418,13 +439,22 @@ fn should_skip(addr: Address, filter_addr: Option<Address>, excluded: &[Address]
     false
 }
 
-/// Find a bonded device that advertises the ATVV service.
+async fn matches_atvv_device(device: &Device, require_paired: bool) -> bool {
+    if require_paired && !device.is_paired().await.unwrap_or(false) {
+        return false;
+    }
+    matches!(device.uuids().await, Ok(Some(uuids)) if uuids.contains(&ATVV_SERVICE))
+}
+
+/// Find a device that advertises the ATVV service.
 /// If `filter_addr` is Some, only match that specific address.
 /// Addresses in `exclude` are skipped (e.g. devices locked by another instance).
+/// When `require_paired` is true, unpaired nearby remotes are ignored.
 pub async fn find_atvv_device(
     adapter: &Adapter,
     filter_addr: Option<Address>,
     exclude: &[Address],
+    require_paired: bool,
 ) -> Result<Device> {
     // First check already-known devices
     for addr in adapter.device_addresses().await? {
@@ -432,21 +462,20 @@ pub async fn find_atvv_device(
             continue;
         }
         let device = adapter.device(addr)?;
-        if let Ok(Some(uuids)) = device.uuids().await {
-            if uuids.contains(&ATVV_SERVICE) {
-                tracing::info!(
-                    "Found ATVV device: {} ({})",
-                    device.name().await.ok().flatten().unwrap_or_default(),
-                    redact_address(addr)
-                );
-                return Ok(device);
-            }
+        if matches_atvv_device(&device, require_paired).await {
+            tracing::info!(
+                "Found ATVV device: {} ({})",
+                device.name().await.ok().flatten().unwrap_or_default(),
+                redact_address(addr)
+            );
+            return Ok(device);
         }
     }
 
-    // Fall back to discovery stream
+    // Fall back to discovery stream with property changes so devices whose
+    // UUIDs or Paired flags arrive after DeviceAdded are not missed.
     tracing::info!("Scanning for ATVV devices...");
-    let discover = adapter.discover_devices().await?;
+    let discover = adapter.discover_devices_with_changes().await?;
     tokio::pin!(discover);
     while let Some(evt) = discover.next().await {
         if let AdapterEvent::DeviceAdded(addr) = evt {
@@ -454,11 +483,9 @@ pub async fn find_atvv_device(
                 continue;
             }
             let device = adapter.device(addr)?;
-            if let Ok(Some(uuids)) = device.uuids().await {
-                if uuids.contains(&ATVV_SERVICE) {
-                    tracing::info!("Discovered ATVV device: {}", redact_address(addr));
-                    return Ok(device);
-                }
+            if matches_atvv_device(&device, require_paired).await {
+                tracing::info!("Discovered ATVV device: {}", redact_address(addr));
+                return Ok(device);
             }
         }
     }
@@ -692,6 +719,33 @@ mod tests {
                 "new-generation packet after AUDIO_START must not inherit discontinuity from evicted older generation"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn evicting_audio_across_consumer_generation_change_still_marks_discontinuity() {
+        let queue = NotificationQueue::default();
+        // First half-frame tagged gen=1, then consumer switch advances generation to 2
+        // without any AUDIO_START control event in between.
+        queue
+            .push(SessionNotification::Audio(AudioPacket::new(vec![1], 1)))
+            .await;
+        for _ in 0..63 {
+            queue
+                .push(SessionNotification::Audio(AudioPacket::new(vec![2], 2)))
+                .await;
+        }
+        queue
+            .push(SessionNotification::Audio(AudioPacket::new(vec![3], 2)))
+            .await;
+
+        let Some(SessionNotification::Audio(first)) = queue.next().await else {
+            panic!("expected audio");
+        };
+        assert_eq!(first.generation, 2);
+        assert!(
+            first.discontinuity,
+            "evicting audio without an intervening AUDIO_START must mark discontinuity even when consumer switch changed generation"
+        );
     }
 
     #[tokio::test]

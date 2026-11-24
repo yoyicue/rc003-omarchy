@@ -295,6 +295,21 @@ pub async fn run_session(
                     }
                     CtlEvent::AudioStart { reason, codec, stream_id } => {
                         tracing::info!("AUDIO_START (reason={:?}, codec={:?}, stream_id={:?})", reason, codec, stream_id);
+                        if let Some(expected) = protocol.negotiated_codec() {
+                            if codec.sample_rate() != expected.sample_rate() {
+                                tracing::warn!(
+                                    actual = ?codec,
+                                    actual_hz = codec.sample_rate(),
+                                    expected = ?expected,
+                                    expected_hz = expected.sample_rate(),
+                                    "Rejecting AUDIO_START with mismatched sample rate"
+                                );
+                                close_mic_reset!(state, last_seq, current_stream_id);
+                                pending_close = Some(AudioStopReason::MicClose);
+                                let _ = ble.write_command(&protocol.mic_close_cmd(stream_id)).await;
+                                continue;
+                            }
+                        }
                         if let Some(tail_expiration) = tail_expiration {
                             tail_expiration.clear();
                         }
@@ -378,7 +393,7 @@ pub async fn run_session(
                             "BLE audio notification queue overflowed; resyncing partial frame buffer"
                         );
                         drop_next_frame = false;
-                        protocol.on_audio_discontinuity(packet.data.len());
+                        protocol.on_audio_discontinuity();
                     }
                     for mut frame in protocol.decode_audio(&packet.data) {
                         // Reset frame timer on every audio frame
@@ -2022,6 +2037,83 @@ mod tests {
             frame.samples.iter().all(|&s| s == 0),
             "decoded frame should come solely from the post-discontinuity zero packet"
         );
+
+        ctrl.event_tx
+            .send(DeviceConnectionEvent::Disconnected)
+            .unwrap();
+        let result = session.await.unwrap();
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_mismatched_audio_start_codec_is_rejected() {
+        use crate::protocol::v10::ProtocolV10;
+
+        tokio::time::pause();
+
+        let (device, mut ctrl) = mock_device();
+        let (audio_tx, mut audio_rx) = tokio_mpsc::channel(64);
+        let (state_tx, mut state_rx) = tokio::sync::watch::channel(State::Connected);
+
+        let timeouts = SessionTimeouts {
+            frame_timeout: Duration::ZERO,
+            keepalive: Duration::ZERO,
+        };
+
+        let caps = Capabilities {
+            version: ProtocolVersion::V1_0,
+            codecs: Codecs::ADPCM_8KHZ | Codecs::ADPCM_16KHZ,
+            interaction_model: InteractionModel::HoldToTalk,
+            audio_frame_size: AudioFrameSize(120),
+        };
+        let mut protocol = ProtocolV10::new();
+        assert_eq!(
+            protocol.on_caps_resp(&caps).unwrap(),
+            crate::protocol::types::Codec::Adpcm16kHz
+        );
+
+        let notifications = device.notifications().await.unwrap();
+        let events = device.connection_events().await.unwrap();
+        let streams = BleStreams {
+            notifications,
+            events,
+        };
+
+        let session = tokio::spawn(async move {
+            run_session(
+                &device,
+                &mut protocol,
+                streams,
+                SessionConfig {
+                    audio_tx,
+                    timeouts: &timeouts,
+                    command_rx: None,
+                    state_tx: Some(&state_tx),
+                    consumer_rx: None,
+                    generation: None,
+                    tail_expiration: None,
+                    streaming: None,
+                    mic_on_demand: false,
+                },
+            )
+            .await
+        });
+
+        // Remote sends AUDIO_START claiming 8 kHz (0x01) despite 16 kHz negotiation.
+        ctrl.ctl_tx
+            .send(vec![CTL_AUDIO_START, 0x03, 0x01, 0x05])
+            .unwrap();
+        tokio::time::advance(Duration::from_millis(1)).await;
+        assert!(wait_for_state(&mut state_rx, State::Connected, Duration::from_millis(10)).await);
+        assert_eq!(
+            try_recv_all_commands(&mut ctrl.commands_rx).await,
+            vec![vec![0x0D, 0x05]]
+        );
+
+        // Subsequent 8 kHz audio packets must NOT enter the 16 kHz output channel.
+        ctrl.rx_tx.send(audio_packet(vec![0x00; 120], 0)).unwrap();
+        tokio::time::advance(Duration::from_millis(1)).await;
+        assert!(audio_rx.try_recv().is_err());
 
         ctrl.event_tx
             .send(DeviceConnectionEvent::Disconnected)

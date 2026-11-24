@@ -29,6 +29,11 @@ pub trait Protocol: Send {
     /// Process received capabilities. Returns the negotiated codec.
     fn on_caps_resp(&mut self, caps: &Capabilities) -> Result<Codec>;
 
+    /// Negotiated codec from `on_caps_resp`, if available.
+    fn negotiated_codec(&self) -> Option<Codec> {
+        None
+    }
+
     /// Decode a notification into zero or more complete PCM frames.
     fn decode_audio(&mut self, data: &[u8]) -> Vec<AudioFrame>;
 
@@ -37,7 +42,7 @@ pub trait Protocol: Send {
     }
 
     /// Recover framing state after upstream BLE audio notifications were dropped.
-    fn on_audio_discontinuity(&mut self, _next_packet_len: usize) {}
+    fn on_audio_discontinuity(&mut self) {}
 
     /// Select the v1.0 wire frame layout. v0.4 always includes its header.
     fn set_frame_layout(&mut self, _layout: AudioFrameLayout) {}
@@ -70,11 +75,12 @@ pub(crate) fn negotiate_codec(remote_codecs: types::Codecs) -> Result<types::Cod
 /// PTT | HTT support bitmask for GET_CAPS (OnRequest always implied).
 const SUPPORTED_INTERACTION_MODELS: u8 = 0x03;
 
-/// Build a GET_CAPS command advertising our maximum supported version (v1.0).
+/// Build a GET_CAPS command advertising our maximum supported version (v1.0)
+/// and only the 16 kHz codec supported by our PipeWire pipeline.
 #[must_use]
 pub fn get_caps_cmd() -> Vec<u8> {
     let ver = types::ProtocolVersion::V1_0.wire_value().to_be_bytes();
-    let codecs = (types::Codecs::ADPCM_8KHZ | types::Codecs::ADPCM_16KHZ).bits();
+    let codecs = types::Codecs::ADPCM_16KHZ.bits();
     vec![
         u8::from(types::TxOpcode::GetCaps),
         ver[0],
@@ -130,8 +136,8 @@ mod tests {
         assert_eq!(cmd[2], 0x00);
         // Reserved
         assert_eq!(cmd[3], 0x00);
-        // Codecs: ADPCM_8KHZ | ADPCM_16KHZ = 0x03
-        assert_eq!(cmd[4], 0x03);
+        // Codecs: ADPCM_16KHZ = 0x02 (matches fixed 16 kHz PipeWire source)
+        assert_eq!(cmd[4], 0x02);
         // Interaction models: PTT | HTT = 0x03
         assert_eq!(cmd[5], 0x03);
         assert_eq!(cmd.len(), 6);

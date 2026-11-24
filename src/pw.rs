@@ -140,6 +140,33 @@ fn stream_failure(old: &StreamState, new: &StreamState, shutting_down: bool) -> 
     }
 }
 
+/// Maximum pending samples before overflow truncation (~500ms at 16kHz).
+const MAX_PENDING: usize = 8000;
+
+/// Append decoded PCM samples into a pre-allocated buffer without ever growing
+/// past `max_pending`, returning the number of dropped samples.
+fn push_samples_bounded(buf: &mut Vec<i16>, samples: &[i16], max_pending: usize) -> usize {
+    if samples.len() >= max_pending {
+        let dropped = buf.len() + (samples.len() - max_pending);
+        buf.clear();
+        buf.extend_from_slice(&samples[samples.len() - max_pending..]);
+        return dropped;
+    }
+    let overflow = (buf.len() + samples.len()).saturating_sub(max_pending);
+    if overflow > 0 {
+        buf.drain(..overflow);
+    }
+    buf.extend_from_slice(samples);
+    overflow
+}
+
+fn log_dropped_samples(counter: &AtomicU64) {
+    let dropped = counter.swap(0, Ordering::Relaxed);
+    if dropped > 0 {
+        tracing::warn!("audio buffer overflow: dropped {dropped} samples");
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct PendingLink {
     output_node: u32,
@@ -270,9 +297,7 @@ pub fn run_pw_source(
     // Precompute linear gain multiplier outside the RT callback to avoid
     // recomputing powf() on every frame.
     let gain_linear = 10f32.powf(gain_db / 20.0);
-
-    /// Maximum pending samples before overflow truncation (~500ms at 16kHz).
-    const MAX_PENDING: usize = 8000;
+    let dropped_samples = Arc::new(AtomicU64::new(0));
 
     // Track our PipeWire node ID once the stream reaches Paused/Streaming.
     let our_node_id: std::rc::Rc<std::cell::Cell<u32>> =
@@ -290,8 +315,10 @@ pub fn run_pw_source(
             let on_node_id_ready = on_node_id_ready.clone();
             let stream_for_id = stream.clone();
             let mainloop = mainloop.clone();
+            let dropped_samples = dropped_samples.clone();
             move |_, _, old, new| {
                 tracing::debug!("PipeWire stream state: {old:?} -> {new:?}");
+                log_dropped_samples(&dropped_samples);
                 if matches!(&new, StreamState::Paused | StreamState::Streaming) {
                     let id = stream_for_id.node_id();
                     if id != u32::MAX && our_node_id.get() == u32::MAX {
@@ -319,10 +346,13 @@ pub fn run_pw_source(
             }
         })
         .process({
-            // The RT callback exclusively owns its PCM buffer. Other threads only
-            // publish the current utterance through an atomic generation counter.
-            let mut buf = Vec::new();
+            // The RT callback exclusively owns its pre-allocated PCM buffer.
+            // Other threads only publish the current utterance through an atomic
+            // generation counter; overflow drops are recorded atomically to avoid
+            // allocations or synchronous logging inside the real-time thread.
+            let mut buf = Vec::with_capacity(MAX_PENDING);
             let mut previous_generation = 0;
+            let dropped_samples = dropped_samples.clone();
             move |stream: &Stream, _| {
                 expire_tail_generation(&tail_expiration, &generation);
                 sync_output_buffer(
@@ -336,15 +366,11 @@ pub fn run_pw_source(
                     let current = generation.load(Ordering::Acquire);
                     if frame_is_output_current(frame.generation, previous_generation, current) {
                         crate::adpcm::apply_gain_linear(&mut frame.samples, gain_linear);
-                        buf.extend_from_slice(&frame.samples);
+                        let dropped = push_samples_bounded(&mut buf, &frame.samples, MAX_PENDING);
+                        if dropped > 0 {
+                            dropped_samples.fetch_add(dropped as u64, Ordering::Relaxed);
+                        }
                     }
-                }
-
-                // Bound pending buffer to prevent unbounded growth under backpressure.
-                if buf.len() > MAX_PENDING {
-                    let dropped = buf.len() - MAX_PENDING;
-                    buf.drain(..dropped);
-                    tracing::warn!("audio buffer overflow: dropped {dropped} samples");
                 }
 
                 let Some(mut pw_buf) = stream.dequeue_buffer() else {
@@ -744,6 +770,7 @@ pub fn run_pw_source(
 
     // Block until quit.
     mainloop.run();
+    log_dropped_samples(&dropped_samples);
 
     // Follow cpal's exact drop pattern: explicitly drop listener and context
     // first, let stream, _receiver, and mainloop drop at function scope end.
@@ -949,5 +976,18 @@ mod tests {
         );
         assert_eq!(unrelated, vec![12]);
         assert!(pending.entries.is_empty());
+    }
+
+    #[test]
+    fn push_samples_bounded_never_reallocates_and_counts_drops() {
+        let mut buf = Vec::with_capacity(4);
+        let initial_cap = buf.capacity();
+        assert_eq!(push_samples_bounded(&mut buf, &[1, 2, 3], 4), 0);
+        assert_eq!(buf, vec![1, 2, 3]);
+        assert_eq!(push_samples_bounded(&mut buf, &[4, 5, 6], 4), 2);
+        assert_eq!(buf, vec![3, 4, 5, 6]);
+        assert_eq!(push_samples_bounded(&mut buf, &[10, 11, 12, 13, 14], 4), 5);
+        assert_eq!(buf, vec![11, 12, 13, 14]);
+        assert_eq!(buf.capacity(), initial_cap);
     }
 }

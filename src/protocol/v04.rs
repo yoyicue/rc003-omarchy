@@ -149,6 +149,10 @@ impl Protocol for ProtocolV04 {
         Ok(codec)
     }
 
+    fn negotiated_codec(&self) -> Option<Codec> {
+        self.selected_codec
+    }
+
     fn decode_audio(&mut self, data: &[u8]) -> Vec<AudioFrame> {
         let expected = self.audio_frame_size.0 as usize;
         if data.len() != expected {
