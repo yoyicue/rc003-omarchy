@@ -70,11 +70,18 @@ struct NotificationQueue {
     notify: tokio::sync::Notify,
 }
 
-fn resets_audio_framing(event: &SessionNotification) -> bool {
-    matches!(
-        event,
-        SessionNotification::Control(pkt) if matches!(pkt.data.first(), Some(0x04 | 0x0A))
-    )
+pub(crate) fn resets_audio_framing(event: &SessionNotification) -> bool {
+    let SessionNotification::Control(pkt) = event else {
+        return false;
+    };
+    match pkt.data.first().copied() {
+        Some(0x04) => true,
+        // v1.0 AUDIO_SYNC: [0x0A, codec, frame_num(2), predictor(2), step_index(1)].
+        // Only treat a valid 16 kHz sync as a framing reset boundary so a rejected
+        // 8 kHz sync cannot suppress discontinuity tracking in headered mode.
+        Some(0x0A) => pkt.data.len() >= 7 && pkt.data[1] == 0x02,
+        _ => false,
+    }
 }
 
 impl NotificationQueue {
@@ -745,6 +752,47 @@ mod tests {
         assert!(
             first.discontinuity,
             "evicting audio without an intervening AUDIO_START must mark discontinuity even when consumer switch changed generation"
+        );
+    }
+
+    #[tokio::test]
+    async fn mismatched_8khz_audio_sync_does_not_suppress_discontinuity() {
+        let queue = NotificationQueue::default();
+        queue
+            .push(SessionNotification::Audio(AudioPacket::new(vec![1; 6], 1)))
+            .await;
+        // Invalid 8 kHz v1.0 AUDIO_SYNC (codec = 0x01) will be rejected by ProtocolV10.
+        queue
+            .push(control_event(
+                vec![0x0A, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00],
+                1,
+            ))
+            .await;
+        for _ in 0..62 {
+            queue
+                .push(SessionNotification::Audio(AudioPacket::new(
+                    vec![2; 126],
+                    1,
+                )))
+                .await;
+        }
+        queue
+            .push(SessionNotification::Audio(AudioPacket::new(
+                vec![3; 126],
+                1,
+            )))
+            .await;
+
+        assert!(matches!(
+            queue.next().await,
+            Some(SessionNotification::Control(_))
+        ));
+        let Some(SessionNotification::Audio(first)) = queue.next().await else {
+            panic!("expected audio");
+        };
+        assert!(
+            first.discontinuity,
+            "rejected 8 kHz AUDIO_SYNC must not suppress discontinuity marking"
         );
     }
 

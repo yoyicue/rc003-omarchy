@@ -430,11 +430,7 @@ fn push_deferred_audio(
             let mut hit_boundary = false;
             let mut marked = false;
             for queued in deferred.iter_mut().skip(index) {
-                if matches!(
-                    queued,
-                    atvv::SessionNotification::Control(pkt)
-                        if matches!(pkt.data.first(), Some(0x04 | 0x0A))
-                ) {
+                if ble::resets_audio_framing(queued) {
                     hit_boundary = true;
                     break;
                 }
@@ -472,7 +468,7 @@ async fn negotiate(
 
     let mut deferred = VecDeque::new();
     let mut saw_audio_start = false;
-    let mut last_audio_stop_at: Option<tokio::time::Instant> = None;
+    let mut completed_utterance_end: Option<(usize, tokio::time::Instant)> = None;
 
     // BleStream<T> is Pin<Box<dyn Stream>>, already Unpin -- no tokio::pin! needed.
     loop {
@@ -486,20 +482,15 @@ async fn negotiate(
                                 caps.version, caps.codecs, caps.interaction_model, caps.audio_frame_size.0
                             );
                             // If a pre-CAPS_RESP utterance already finished and its tail drain
-                            // window has already elapsed, drop its stale audio/stream events so
-                            // old audio cannot leak into a newly connected PipeWire client.
-                            if !saw_audio_start
-                                && last_audio_stop_at.is_some_and(|stopped_at| {
-                                    stopped_at.elapsed() >= atvv::AUDIO_TAIL_DRAIN_TIMEOUT
-                                })
-                            {
-                                deferred.retain(|ev| {
-                                    matches!(
-                                        ev,
-                                        atvv::SessionNotification::Control(pkt)
-                                            if !matches!(pkt.data.first(), Some(0x00 | 0x04 | 0x0A))
-                                    )
-                                });
+                            // window has already elapsed, drop everything up through its
+                            // AUDIO_STOP (including the START_SEARCH that initiated it) so old
+                            // audio cannot leak and an expired utterance cannot re-open the mic.
+                            if !saw_audio_start {
+                                if let Some((end, stopped_at)) = completed_utterance_end {
+                                    if stopped_at.elapsed() >= atvv::AUDIO_TAIL_DRAIN_TIMEOUT {
+                                        deferred.drain(..end);
+                                    }
+                                }
                             }
                             let notifications: atvv::BleStream<atvv::SessionNotification> =
                                 if deferred.is_empty() {
@@ -515,31 +506,38 @@ async fn negotiate(
                         packet.deferred_during_negotiation = true;
                         match packet.data.first().copied() {
                             Some(0x04) => {
-                                if !saw_audio_start && last_audio_stop_at.is_some() {
-                                    // A new utterance superseded an earlier finished one; discard
-                                    // the completed utterance's buffered audio and stream markers.
-                                    deferred.retain(|ev| {
-                                        matches!(
-                                            ev,
-                                            atvv::SessionNotification::Control(pkt)
-                                                if !matches!(pkt.data.first(), Some(0x00 | 0x04 | 0x0A))
-                                        )
-                                    });
+                                if !saw_audio_start {
+                                    if let Some((end, _)) = completed_utterance_end.take() {
+                                        // A new utterance superseded an earlier finished one.
+                                        deferred.drain(..end);
+                                    }
                                 }
                                 saw_audio_start = true;
-                                last_audio_stop_at = None;
+                                completed_utterance_end = None;
+                                tracing::debug!(
+                                    "Deferring non-CAPS_RESP CTL during negotiation: {:02x?}",
+                                    packet.data
+                                );
+                                deferred.push_back(atvv::SessionNotification::Control(packet));
                             }
                             Some(0x00) => {
+                                let received_at = packet.received_at;
                                 saw_audio_start = false;
-                                last_audio_stop_at = Some(packet.received_at);
+                                tracing::debug!(
+                                    "Deferring non-CAPS_RESP CTL during negotiation: {:02x?}",
+                                    packet.data
+                                );
+                                deferred.push_back(atvv::SessionNotification::Control(packet));
+                                completed_utterance_end = Some((deferred.len(), received_at));
                             }
-                            _ => {}
+                            _ => {
+                                tracing::debug!(
+                                    "Deferring non-CAPS_RESP CTL during negotiation: {:02x?}",
+                                    packet.data
+                                );
+                                deferred.push_back(atvv::SessionNotification::Control(packet));
+                            }
                         }
-                        tracing::debug!(
-                            "Deferring non-CAPS_RESP CTL during negotiation: {:02x?}",
-                            packet.data
-                        );
-                        deferred.push_back(atvv::SessionNotification::Control(packet));
                     }
                     Some(atvv::SessionNotification::Audio(packet)) => {
                         if saw_audio_start {
@@ -1504,9 +1502,10 @@ mod tests {
         drop(event_tx);
         assert_eq!(cmd_rx.try_recv().unwrap(), vec![0x0C, 0x00]); // MIC_OPEN
 
-        // Case 2: AUDIO_STOP 1.2s before CAPS_RESP drops stale completed utterance audio.
+        // Case 2: START_SEARCH + AUDIO_START + Audio + AUDIO_STOP 1.2s before CAPS_RESP
+        // drops stale completed utterance audio AND its initiating START_SEARCH (no MIC_OPEN).
         tokio::time::pause();
-        let (cmd_tx, _cmd_rx) = tokio_mpsc::unbounded_channel();
+        let (cmd_tx, mut cmd_rx) = tokio_mpsc::unbounded_channel();
         let (notif_tx, notif_rx) = tokio_mpsc::unbounded_channel();
         let (event_tx, event_rx) = tokio_mpsc::unbounded_channel();
         let ble = RecordingBle {
@@ -1515,6 +1514,11 @@ mod tests {
             events: Mutex::new(Some(event_rx)),
         };
 
+        notif_tx
+            .send(atvv::SessionNotification::Control(
+                atvv::ControlPacket::new(vec![0x08], 1),
+            ))
+            .unwrap();
         notif_tx
             .send(atvv::SessionNotification::Control(
                 atvv::ControlPacket::new(vec![0x04, 0x03, 0x02, 0x00], 1),
@@ -1572,6 +1576,114 @@ mod tests {
             stale.is_none(),
             "utterance stopped >1s before CAPS_RESP must not leak stale samples"
         );
+        let _ = cmd_rx.try_recv(); // GET_CAPS
+        assert!(
+            cmd_rx.try_recv().is_err(),
+            "expired pre-CAPS_RESP utterance must not replay its START_SEARCH as a new MIC_OPEN"
+        );
+    }
+
+    #[tokio::test]
+    async fn default_mode_double_pre_caps_start_search_opens_then_closes() {
+        use tokio::sync::{mpsc as tokio_mpsc, Mutex};
+        use tokio_stream::wrappers::UnboundedReceiverStream;
+
+        struct RecordingBle {
+            commands: tokio_mpsc::UnboundedSender<Vec<u8>>,
+            notifications: Mutex<Option<tokio_mpsc::UnboundedReceiver<atvv::SessionNotification>>>,
+            events: Mutex<Option<tokio_mpsc::UnboundedReceiver<atvv::DeviceConnectionEvent>>>,
+        }
+
+        impl atvv::BleDevice for RecordingBle {
+            fn write_command(&self, data: &[u8]) -> atvv::BleFut<'_, ()> {
+                let data = data.to_vec();
+                Box::pin(async move {
+                    let _ = self.commands.send(data);
+                    Ok(())
+                })
+            }
+
+            fn notifications(
+                &self,
+            ) -> atvv::BleFut<'_, atvv::BleStream<atvv::SessionNotification>> {
+                Box::pin(async {
+                    let rx = self.notifications.lock().await.take().unwrap();
+                    Ok(Box::pin(UnboundedReceiverStream::new(rx))
+                        as atvv::BleStream<atvv::SessionNotification>)
+                })
+            }
+
+            fn connection_events(
+                &self,
+            ) -> atvv::BleFut<'_, atvv::BleStream<atvv::DeviceConnectionEvent>> {
+                Box::pin(async {
+                    let rx = self.events.lock().await.take().unwrap();
+                    Ok(Box::pin(UnboundedReceiverStream::new(rx))
+                        as atvv::BleStream<atvv::DeviceConnectionEvent>)
+                })
+            }
+        }
+
+        let (cmd_tx, mut cmd_rx) = tokio_mpsc::unbounded_channel();
+        let (notif_tx, notif_rx) = tokio_mpsc::unbounded_channel();
+        let (event_tx, event_rx) = tokio_mpsc::unbounded_channel();
+        let ble = RecordingBle {
+            commands: cmd_tx,
+            notifications: Mutex::new(Some(notif_rx)),
+            events: Mutex::new(Some(event_rx)),
+        };
+
+        // Two START_SEARCH presses before CAPS_RESP in default (non-on-demand) mode.
+        notif_tx
+            .send(atvv::SessionNotification::Control(
+                atvv::ControlPacket::new(vec![0x08], 1),
+            ))
+            .unwrap();
+        notif_tx
+            .send(atvv::SessionNotification::Control(
+                atvv::ControlPacket::new(vec![0x08], 1),
+            ))
+            .unwrap();
+        notif_tx
+            .send(atvv::SessionNotification::Control(
+                atvv::ControlPacket::new(vec![0x0B, 0x01, 0x00, 0x02, 0x03, 0x00, 0x78], 1),
+            ))
+            .unwrap();
+        drop(notif_tx);
+
+        let (caps, streams) = negotiate(&ble).await.unwrap();
+        let _ = cmd_rx.try_recv(); // GET_CAPS
+        let (mut session_protocol, _) = protocol::create_protocol(&caps).unwrap();
+        let (audio_tx, _audio_rx) = tokio_mpsc::channel(8);
+        let timeouts = atvv::SessionTimeouts {
+            frame_timeout: Duration::ZERO,
+            keepalive: Duration::ZERO,
+        };
+        atvv::run_session(
+            &ble,
+            &mut *session_protocol,
+            streams,
+            atvv::SessionConfig {
+                audio_tx,
+                timeouts: &timeouts,
+                command_rx: None,
+                state_tx: None,
+                consumer_rx: None,
+                generation: None,
+                tail_expiration: None,
+                streaming: None,
+                mic_on_demand: false,
+            },
+        )
+        .await
+        .unwrap();
+        drop(event_tx);
+
+        let mut sent = Vec::new();
+        while let Ok(cmd) = cmd_rx.try_recv() {
+            sent.push(cmd);
+        }
+        assert_eq!(sent, vec![vec![0x0C, 0x00], vec![0x0D, 0x00]]);
     }
 
     #[tokio::test]

@@ -370,3 +370,13 @@ Redmi 实机验证：`cargo fmt --all -- --check`、189 个单元测试（`189 p
 - PipeWire RT 回调彻底零分配、零释放：`PcmFrame` 改为定长内联 `[i16; 512]`（`!std::mem::needs_drop::<PcmFrame>()`），RT 线程消费帧时不再触发 `Vec` 堆释放。
 
 Redmi 实机验证：`cargo fmt --all -- --check`、192 个单元测试（`192 passed, 0 failed, 1 ignored`）、Clippy（默认与 `--features dbus`，`-D warnings`）及 release 编译全部通过，已重新安装 `~/.local/bin/rc003-omarchy` 并重启服务验证通过。
+
+## 34. 第二十七轮：保活写入超时与五项协商/同步联动边角收口
+
+- 保活写入防阻塞：best-effort 的 `keepalive` 写入增加 500ms 超时，防止 BlueZ 写入卡住挡住已入队的 `AUDIO_STOP` 导致尾音超期泄漏。
+- 过期预协商旧句彻底清理：`negotiate()` 记录已完成旧句在 `deferred` 中的终止索引，超期或被新句覆盖时通过 `drain(..end)` 连同发起该句的 `START_SEARCH` 一并清除，不再意外重发 `MIC_OPEN`。
+- 精准限制预协商 `START_SEARCH` 抑制范围：仅在 `mic_on_demand` 启动自动开麦（`auto_opened_on_entry`）时跳过一次预协商 `START_SEARCH`，默认模式下协商前连按两次正常开麦再关麦。
+- `AUDIO_SYNC` 拒收不误清残帧保护：`run_session` 仅在 `protocol.on_audio_sync` 确实清空残帧（`!protocol.has_partial_audio()`）后才清 `drop_next_frame`，被拒的 8 kHz 同步包不再让跨代半帧漏给新客户端。
+- 队列断层边界校验同步包采样率：`ble::resets_audio_framing`（供 `NotificationQueue` 与协商缓冲共用）仅将 `AUDIO_START`（`0x04`）或合法 16 kHz `AUDIO_SYNC`（`0x0A` 且 codec=`0x02`）视为断层重置边界，被拒的 8 kHz 同步包不再在 `headered` 模式下抑制 `discontinuity` 标记。
+
+Redmi 实机验证：`cargo fmt --all -- --check`、196 个单元测试（`196 passed, 0 failed, 1 ignored`）、Clippy（默认与 `--features dbus`，`-D warnings`）及 release 编译全部通过，已重新安装 `~/.local/bin/rc003-omarchy` 并重启服务。

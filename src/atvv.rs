@@ -24,6 +24,9 @@ pub enum State {
 }
 
 pub(crate) const AUDIO_TAIL_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
+/// Short bound for best-effort keepalive writes so a stalled BlueZ call cannot
+/// delay processing AUDIO_STOP past the tail-drain window.
+const KEEPALIVE_WRITE_TIMEOUT: Duration = Duration::from_millis(500);
 
 impl std::fmt::Display for State {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -219,12 +222,14 @@ pub async fn run_session(
     // Helper: reset session state after mic close. Used in multiple `tokio::select!`
     // match arms where the pattern (set state → Connected, clear seq/stream_id) repeats.
     // Inlines `set_state` logic to avoid borrow conflicts.
+    let mut auto_opened_on_entry = false;
     if mic_on_demand {
         if let Some(rx) = consumer_rx.as_mut() {
             let initial_count = current_consumer_count(rx);
             if initial_count > 0 && state == State::Connected {
                 ble.write_command(&protocol.mic_open_cmd()).await?;
                 set_state(State::Opening, &mut state);
+                auto_opened_on_entry = true;
             }
         }
     }
@@ -268,6 +273,7 @@ pub async fn run_session(
             if let Some(streaming) = streaming {
                 streaming.store(false, Ordering::Relaxed);
             }
+            auto_opened_on_entry = false;
             set_state(State::Connected, &mut $state);
             $last_seq = None;
             $current_stream_id = None;
@@ -360,6 +366,7 @@ pub async fn run_session(
                         // Remote resets its sequence counter on every AUDIO_START
                         last_seq = None;
                         current_stream_id = Some(stream_id);
+                        auto_opened_on_entry = false;
                         set_state(State::Streaming, &mut state);
                         if let Some(streaming) = streaming {
                             streaming.store(true, Ordering::Relaxed);
@@ -379,9 +386,13 @@ pub async fn run_session(
                     CtlEvent::StartSearch => {
                         tracing::info!("START_SEARCH (state={:?})", state);
 
-                        if packet.deferred_during_negotiation && state == State::Opening {
+                        if auto_opened_on_entry
+                            && packet.deferred_during_negotiation
+                            && state == State::Opening
+                        {
+                            auto_opened_on_entry = false;
                             tracing::debug!(
-                                "Ignoring pre-negotiation START_SEARCH while mic is already opening"
+                                "Ignoring pre-negotiation START_SEARCH while mic is already opening on demand"
                             );
                             continue;
                         }
@@ -404,8 +415,10 @@ pub async fn run_session(
                     }
                     CtlEvent::AudioSync(ref sync) => {
                         tracing::debug!("AUDIO_SYNC: {:?}", sync);
-                        drop_next_frame = false;
                         protocol.on_audio_sync(sync);
+                        if !protocol.has_partial_audio() {
+                            drop_next_frame = false;
+                        }
                     }
                     CtlEvent::CapsResp(caps) => {
                         tracing::debug!("Ignoring unsolicited CAPS_RESP: {:?}", caps.version);
@@ -413,6 +426,7 @@ pub async fn run_session(
                     CtlEvent::MicOpenError(code) => {
                         tracing::warn!("MIC_OPEN_ERROR: {:?}", code);
                         if state == State::Opening {
+                            auto_opened_on_entry = false;
                             set_state(State::Connected, &mut state);
                             current_stream_id = None;
                         }
@@ -562,7 +576,17 @@ pub async fn run_session(
             () = &mut keepalive_timer, if keepalive_enabled && state == State::Streaming => {
                 let sid = current_stream_id.unwrap_or(StreamId::MIC_OPEN);
                 tracing::debug!("Sending keepalive");
-                let _ = ble.write_command(&protocol.keepalive_cmd(sid)).await;
+                if time::timeout(
+                    KEEPALIVE_WRITE_TIMEOUT,
+                    ble.write_command(&protocol.keepalive_cmd(sid)),
+                )
+                .await
+                .is_err()
+                {
+                    tracing::warn!(
+                        "Keepalive write timed out after {KEEPALIVE_WRITE_TIMEOUT:?}"
+                    );
+                }
                 keepalive_timer.as_mut().reset(Instant::now() + keepalive_interval);
             }
             () = &mut frame_timer, if frame_timeout_enabled && (state == State::Streaming || state == State::Opening) => {
@@ -2165,5 +2189,210 @@ mod tests {
             .unwrap();
         let result = session.await.unwrap();
         assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_rejected_8khz_audio_sync_preserves_drop_next_frame() {
+        use crate::protocol::v10::ProtocolV10;
+
+        tokio::time::pause();
+
+        let (device, ctrl) = mock_device();
+        let (audio_tx, mut audio_rx) = tokio_mpsc::channel(64);
+        let (state_tx, mut state_rx) = tokio::sync::watch::channel(State::Connected);
+        let timeouts = SessionTimeouts {
+            frame_timeout: Duration::ZERO,
+            keepalive: Duration::ZERO,
+        };
+        let caps = Capabilities {
+            version: ProtocolVersion::V1_0,
+            codecs: Codecs::ADPCM_8KHZ | Codecs::ADPCM_16KHZ,
+            interaction_model: InteractionModel::HoldToTalk,
+            audio_frame_size: AudioFrameSize(120),
+        };
+        let mut protocol = ProtocolV10::new();
+        protocol.on_caps_resp(&caps).unwrap();
+
+        let notifications = device.notifications().await.unwrap();
+        let events = device.connection_events().await.unwrap();
+        let streams = BleStreams {
+            notifications,
+            events,
+        };
+        let session = tokio::spawn(async move {
+            run_session(
+                &device,
+                &mut protocol,
+                streams,
+                SessionConfig {
+                    audio_tx,
+                    timeouts: &timeouts,
+                    command_rx: None,
+                    state_tx: Some(&state_tx),
+                    consumer_rx: None,
+                    generation: None,
+                    tail_expiration: None,
+                    streaming: None,
+                    mic_on_demand: false,
+                },
+            )
+            .await
+        });
+
+        ctrl.ctl_tx
+            .send(vec![CTL_AUDIO_START, 0x03, 0x02, 0x00])
+            .unwrap();
+        tokio::time::advance(Duration::from_millis(1)).await;
+        assert!(wait_for_state(&mut state_rx, State::Streaming, Duration::from_millis(10)).await);
+
+        // Buffer a 60-byte half-frame under gen=0, then a 30-byte fragment under gen=1
+        // so `drop_next_frame` is armed while `audio_buffer` holds 90 mixed bytes.
+        ctrl.rx_tx.send(audio_packet(vec![0x11; 60], 0)).unwrap();
+        ctrl.rx_tx.send(audio_packet(vec![0x22; 30], 1)).unwrap();
+        tokio::time::advance(Duration::from_millis(1)).await;
+        assert!(audio_rx.try_recv().is_err());
+
+        // Inject a rejected 8 kHz AUDIO_SYNC (codec=0x01) before completing the mixed frame;
+        // `drop_next_frame` must remain armed because the partial buffer was NOT cleared.
+        ctrl.ctl_tx
+            .send(vec![0x0A, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00])
+            .unwrap();
+        ctrl.rx_tx.send(audio_packet(vec![0x33; 30], 1)).unwrap();
+        tokio::time::advance(Duration::from_millis(1)).await;
+        assert!(
+            audio_rx.try_recv().is_err(),
+            "mixed cross-generation half-frame must remain dropped after rejected 8 kHz AUDIO_SYNC"
+        );
+
+        ctrl.rx_tx.send(audio_packet(vec![0x00; 120], 1)).unwrap();
+        tokio::time::advance(Duration::from_millis(1)).await;
+        assert_eq!(audio_rx.try_recv().unwrap().generation, 1);
+
+        ctrl.event_tx
+            .send(DeviceConnectionEvent::Disconnected)
+            .unwrap();
+        assert!(session.await.unwrap().is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_stalled_keepalive_write_does_not_delay_audio_stop_past_tail_window() {
+        use crate::protocol::v10::ProtocolV10;
+
+        struct StallingKeepaliveBle {
+            keepalive_started: Arc<tokio::sync::Notify>,
+            notifications: Mutex<Option<tokio_mpsc::UnboundedReceiver<SessionNotification>>>,
+            events: Mutex<Option<tokio_mpsc::UnboundedReceiver<DeviceConnectionEvent>>>,
+        }
+
+        impl BleDevice for StallingKeepaliveBle {
+            fn write_command(&self, _data: &[u8]) -> BleFut<'_, ()> {
+                let started = self.keepalive_started.clone();
+                Box::pin(async move {
+                    started.notify_one();
+                    time::sleep(Duration::from_secs(30)).await;
+                    Ok(())
+                })
+            }
+
+            fn notifications(&self) -> BleFut<'_, BleStream<SessionNotification>> {
+                Box::pin(async {
+                    let rx = self.notifications.lock().await.take().unwrap();
+                    Ok(Box::pin(UnboundedReceiverStream::new(rx))
+                        as BleStream<SessionNotification>)
+                })
+            }
+
+            fn connection_events(&self) -> BleFut<'_, BleStream<DeviceConnectionEvent>> {
+                Box::pin(async {
+                    let rx = self.events.lock().await.take().unwrap();
+                    Ok(Box::pin(UnboundedReceiverStream::new(rx))
+                        as BleStream<DeviceConnectionEvent>)
+                })
+            }
+        }
+
+        tokio::time::pause();
+
+        let keepalive_started = Arc::new(tokio::sync::Notify::new());
+        let (notif_tx, notif_rx) = tokio_mpsc::unbounded_channel();
+        let (event_tx, event_rx) = tokio_mpsc::unbounded_channel();
+        let device = StallingKeepaliveBle {
+            keepalive_started: keepalive_started.clone(),
+            notifications: Mutex::new(Some(notif_rx)),
+            events: Mutex::new(Some(event_rx)),
+        };
+        let (audio_tx, _audio_rx) = tokio_mpsc::channel(64);
+        let (state_tx, mut state_rx) = tokio::sync::watch::channel(State::Connected);
+        let tail_expiration = TailDeadline::new();
+        let tail_for_session = tail_expiration.clone();
+        let timeouts = SessionTimeouts {
+            frame_timeout: Duration::ZERO,
+            keepalive: Duration::from_secs(2),
+        };
+        let caps = Capabilities {
+            version: ProtocolVersion::V1_0,
+            codecs: Codecs::ADPCM_16KHZ,
+            interaction_model: InteractionModel::HoldToTalk,
+            audio_frame_size: AudioFrameSize(120),
+        };
+        let mut protocol = ProtocolV10::new();
+        protocol.on_caps_resp(&caps).unwrap();
+
+        let notifications = device.notifications().await.unwrap();
+        let events = device.connection_events().await.unwrap();
+        let streams = BleStreams {
+            notifications,
+            events,
+        };
+        let session = tokio::spawn(async move {
+            run_session(
+                &device,
+                &mut protocol,
+                streams,
+                SessionConfig {
+                    audio_tx,
+                    timeouts: &timeouts,
+                    command_rx: None,
+                    state_tx: Some(&state_tx),
+                    consumer_rx: None,
+                    generation: None,
+                    tail_expiration: Some(&tail_for_session),
+                    streaming: None,
+                    mic_on_demand: false,
+                },
+            )
+            .await
+        });
+
+        notif_tx
+            .send(SessionNotification::Control(ControlPacket::new(
+                vec![CTL_AUDIO_START, 0x03, 0x02, 0x00],
+                1,
+            )))
+            .unwrap();
+        tokio::time::advance(Duration::from_millis(1)).await;
+        assert!(wait_for_state(&mut state_rx, State::Streaming, Duration::from_millis(10)).await);
+
+        // Wait until the keepalive timer fires and enters the stalled write_command().
+        let started_fut = keepalive_started.notified();
+        tokio::pin!(started_fut);
+        tokio::time::advance(Duration::from_secs(2)).await;
+        started_fut.await;
+
+        // Queue AUDIO_STOP while keepalive is stuck in write_command().
+        notif_tx
+            .send(SessionNotification::Control(ControlPacket::new(
+                vec![CTL_AUDIO_STOP, 0x02],
+                1,
+            )))
+            .unwrap();
+
+        // Keepalive must time out at 500ms so AUDIO_STOP is processed well before the 1s tail window.
+        tokio::time::advance(Duration::from_millis(550)).await;
+        assert!(wait_for_state(&mut state_rx, State::Connected, Duration::from_millis(10)).await);
+        assert!(tail_expiration.is_armed());
+
+        event_tx.send(DeviceConnectionEvent::Disconnected).unwrap();
+        assert!(session.await.unwrap().is_ok());
     }
 }
