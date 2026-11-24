@@ -75,7 +75,10 @@ pub(crate) fn resets_audio_framing(event: &SessionNotification) -> bool {
         return false;
     };
     match pkt.data.first().copied() {
-        Some(0x04) => true,
+        // v1.0 AUDIO_START: [0x04, reason, codec, stream_id]. Require a full
+        // 16 kHz header so a malformed 1-byte [0x04] (ignored by ProtocolV10)
+        // cannot suppress discontinuity tracking in headered mode.
+        Some(0x04) => pkt.data.len() >= 4 && pkt.data[2] == 0x02,
         // v1.0 AUDIO_SYNC: [0x0A, codec, frame_num(2), predictor(2), step_index(1)].
         // Only treat a valid 16 kHz sync as a framing reset boundary so a rejected
         // 8 kHz sync cannot suppress discontinuity tracking in headered mode.
@@ -700,7 +703,9 @@ mod tests {
         queue
             .push(SessionNotification::Audio(AudioPacket::new(vec![1], 1)))
             .await;
-        queue.push(control_event(vec![0x04], 2)).await;
+        queue
+            .push(control_event(vec![0x04, 0x03, 0x02, 0x00], 2))
+            .await;
         for _ in 0..62 {
             queue
                 .push(SessionNotification::Audio(AudioPacket::new(vec![2], 2)))
@@ -793,6 +798,43 @@ mod tests {
         assert!(
             first.discontinuity,
             "rejected 8 kHz AUDIO_SYNC must not suppress discontinuity marking"
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_short_audio_start_does_not_suppress_discontinuity() {
+        let queue = NotificationQueue::default();
+        queue
+            .push(SessionNotification::Audio(AudioPacket::new(vec![1; 6], 1)))
+            .await;
+        // Malformed 1-byte [0x04] is rejected by ProtocolV10::parse_ctl and must
+        // not suppress discontinuity tracking.
+        queue.push(control_event(vec![0x04], 1)).await;
+        for _ in 0..62 {
+            queue
+                .push(SessionNotification::Audio(AudioPacket::new(
+                    vec![2; 126],
+                    1,
+                )))
+                .await;
+        }
+        queue
+            .push(SessionNotification::Audio(AudioPacket::new(
+                vec![3; 126],
+                1,
+            )))
+            .await;
+
+        assert!(matches!(
+            queue.next().await,
+            Some(SessionNotification::Control(_))
+        ));
+        let Some(SessionNotification::Audio(first)) = queue.next().await else {
+            panic!("expected audio");
+        };
+        assert!(
+            first.discontinuity,
+            "malformed 1-byte AUDIO_START must not suppress discontinuity marking"
         );
     }
 

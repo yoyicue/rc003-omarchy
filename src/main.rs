@@ -521,14 +521,15 @@ async fn negotiate(
                                 deferred.push_back(atvv::SessionNotification::Control(packet));
                             }
                             Some(0x00) => {
-                                let received_at = packet.received_at;
+                                let stopped_at = completed_utterance_end
+                                    .map_or(packet.received_at, |(_, first)| first);
                                 saw_audio_start = false;
                                 tracing::debug!(
                                     "Deferring non-CAPS_RESP CTL during negotiation: {:02x?}",
                                     packet.data
                                 );
                                 deferred.push_back(atvv::SessionNotification::Control(packet));
-                                completed_utterance_end = Some((deferred.len(), received_at));
+                                completed_utterance_end = Some((deferred.len(), stopped_at));
                             }
                             _ => {
                                 tracing::debug!(
@@ -1564,6 +1565,12 @@ mod tests {
             audio_rx.try_recv().ok()
         });
         tokio::time::advance(Duration::from_millis(1200)).await;
+        // A duplicate AUDIO_STOP arriving 1.2s later must not refresh the original stop timestamp.
+        notif_tx
+            .send(atvv::SessionNotification::Control(
+                atvv::ControlPacket::new(vec![0x00, 0x02], 1),
+            ))
+            .unwrap();
         notif_tx
             .send(atvv::SessionNotification::Control(
                 atvv::ControlPacket::new(vec![0x0B, 0x01, 0x00, 0x02, 0x03, 0x00, 0x78], 1),

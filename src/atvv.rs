@@ -174,7 +174,7 @@ impl Drop for InvalidateGenerationOnExit<'_> {
 /// # Errors
 ///
 fn current_consumer_count(rx: &mut tokio::sync::watch::Receiver<consumer::ConsumerEvent>) -> u32 {
-    match *rx.borrow() {
+    match *rx.borrow_and_update() {
         consumer::ConsumerEvent::Changed(count) => count,
     }
 }
@@ -219,15 +219,70 @@ pub async fn run_session(
         }
     };
 
+    // Destructure pre-subscribed BLE streams before any command writes so
+    // disconnect events can immediately interrupt stalled GATT writes.
+    let notifications = streams.notifications;
+    let device_events = streams.events;
+    tokio::pin!(notifications);
+    tokio::pin!(device_events);
+
+    macro_rules! write_cmd_or_disconnect {
+        ($cmd:expr) => {{
+            let cmd = $cmd;
+            tokio::select! {
+                res = ble.write_command(&cmd) => res?,
+                event = device_events.next() => {
+                    match event {
+                        Some(DeviceConnectionEvent::Disconnected) => {
+                            tracing::info!("Device disconnected during BLE command write");
+                            return Ok(());
+                        }
+                        None => {
+                            tracing::info!("device event stream ended during BLE command write");
+                            return Ok(());
+                        }
+                    }
+                }
+            }
+        }};
+    }
+
+    macro_rules! write_best_effort_or_disconnect {
+        ($cmd:expr, $timeout:expr) => {{
+            let cmd = $cmd;
+            tokio::select! {
+                res = time::timeout($timeout, ble.write_command(&cmd)) => {
+                    if res.is_err() {
+                        tracing::warn!("BLE command write timed out after {:?}", $timeout);
+                    }
+                }
+                event = device_events.next() => {
+                    match event {
+                        Some(DeviceConnectionEvent::Disconnected) => {
+                            tracing::info!("Device disconnected during BLE command write");
+                            return Ok(());
+                        }
+                        None => {
+                            tracing::info!("device event stream ended during BLE command write");
+                            return Ok(());
+                        }
+                    }
+                }
+            }
+        }};
+    }
+
     // Helper: reset session state after mic close. Used in multiple `tokio::select!`
     // match arms where the pattern (set state → Connected, clear seq/stream_id) repeats.
     // Inlines `set_state` logic to avoid borrow conflicts.
+    let mut last_consumer_count = 0u32;
     let mut auto_opened_on_entry = false;
     if mic_on_demand {
         if let Some(rx) = consumer_rx.as_mut() {
             let initial_count = current_consumer_count(rx);
+            last_consumer_count = initial_count;
             if initial_count > 0 && state == State::Connected {
-                ble.write_command(&protocol.mic_open_cmd()).await?;
+                write_cmd_or_disconnect!(protocol.mic_open_cmd());
                 set_state(State::Opening, &mut state);
                 auto_opened_on_entry = true;
             }
@@ -237,7 +292,7 @@ pub async fn run_session(
     let mut stream_generation = 0;
     let mut stopped_generation = None;
     let mut drop_next_frame = false;
-    let mut pending_close = None;
+    let mut pending_close: Option<(AudioStopReason, Option<StreamId>)> = None;
     macro_rules! close_mic_reset {
         ($state:ident, $last_seq:ident, $current_stream_id:ident) => {
             close_mic_reset!(
@@ -280,12 +335,6 @@ pub async fn run_session(
         };
     }
 
-    // Destructure pre-subscribed BLE streams
-    let notifications = streams.notifications;
-    let device_events = streams.events;
-    tokio::pin!(notifications);
-    tokio::pin!(device_events);
-
     let mut last_seq: Option<u16> = None;
 
     // Track the current stream ID (set on AudioStart, used for MIC_CLOSE/keepalive).
@@ -319,10 +368,23 @@ pub async fn run_session(
                         match protocol.parse_ctl(&packet.data) {
                     CtlEvent::AudioStop { reason } => {
                         tracing::info!("AUDIO_STOP (reason={:?})", reason);
-                        if pending_close == Some(reason) {
-                            pending_close = None;
-                            if state == State::Opening {
-                                continue;
+                        if let Some((expected_reason, closed_sid)) = pending_close {
+                            if expected_reason == reason {
+                                pending_close = None;
+                                if state == State::Opening
+                                    || (state == State::Streaming
+                                        && closed_sid.is_some_and(|old_sid| {
+                                            current_stream_id != Some(old_sid)
+                                        }))
+                                {
+                                    tracing::debug!(
+                                        ?reason,
+                                        ?closed_sid,
+                                        ?current_stream_id,
+                                        "Ignoring late AUDIO_STOP ack for previously closed stream"
+                                    );
+                                    continue;
+                                }
                             }
                         }
                         // For HTT button release, remote already stopped — don't send `MIC_CLOSE`
@@ -333,8 +395,8 @@ pub async fn run_session(
                             AUDIO_TAIL_DRAIN_TIMEOUT.saturating_sub(packet.received_at.elapsed());
                         close_mic_reset!(state, last_seq, current_stream_id, tail_remaining);
                         if should_close {
-                            pending_close = Some(AudioStopReason::MicClose);
-                            ble.write_command(&protocol.mic_close_cmd(sid)).await?;
+                            pending_close = Some((AudioStopReason::MicClose, Some(sid)));
+                            write_cmd_or_disconnect!(protocol.mic_close_cmd(sid));
                             tracing::info!("Sent MIC_CLOSE");
                         }
                     }
@@ -350,8 +412,11 @@ pub async fn run_session(
                                     "Rejecting AUDIO_START with mismatched sample rate"
                                 );
                                 close_mic_reset!(state, last_seq, current_stream_id);
-                                pending_close = Some(AudioStopReason::MicClose);
-                                let _ = ble.write_command(&protocol.mic_close_cmd(stream_id)).await;
+                                pending_close = Some((AudioStopReason::MicClose, Some(stream_id)));
+                                write_best_effort_or_disconnect!(
+                                    protocol.mic_close_cmd(stream_id),
+                                    KEEPALIVE_WRITE_TIMEOUT
+                                );
                                 continue;
                             }
                         }
@@ -360,7 +425,12 @@ pub async fn run_session(
                         }
                         stream_generation = packet.generation;
                         stopped_generation = None;
-                        pending_close = None;
+                        // Preserve a pending MIC_CLOSE ack only if it belongs to a different
+                        // (earlier) stream so a late ack cannot close this brand-new stream.
+                        if !matches!(pending_close, Some((_, Some(old_sid))) if old_sid != stream_id)
+                        {
+                            pending_close = None;
+                        }
                         drop_next_frame = false;
                         protocol.on_audio_start();
                         // Remote resets its sequence counter on every AUDIO_START
@@ -401,11 +471,11 @@ pub async fn run_session(
                             // Toggle: second press stops streaming
                             let sid = current_stream_id.unwrap_or(StreamId::MIC_OPEN);
                             close_mic_reset!(state, last_seq, current_stream_id);
-                            pending_close = Some(AudioStopReason::MicClose);
-                            ble.write_command(&protocol.mic_close_cmd(sid)).await?;
+                            pending_close = Some((AudioStopReason::MicClose, Some(sid)));
+                            write_cmd_or_disconnect!(protocol.mic_close_cmd(sid));
                             tracing::info!("Sent MIC_CLOSE (toggle off)");
                         } else {
-                            ble.write_command(&protocol.mic_open_cmd()).await?;
+                            write_cmd_or_disconnect!(protocol.mic_open_cmd());
                             tracing::info!("Sent MIC_OPEN");
                             set_state(State::Opening, &mut state);
                             if frame_timeout_enabled {
@@ -500,7 +570,7 @@ pub async fn run_session(
                 match cmd {
                     ExternalCommand::MicOpen => {
                         if state == State::Connected {
-                            ble.write_command(&protocol.mic_open_cmd()).await?;
+                            write_cmd_or_disconnect!(protocol.mic_open_cmd());
                             tracing::info!("Sent MIC_OPEN (external)");
                             set_state(State::Opening, &mut state);
                             if frame_timeout_enabled {
@@ -511,19 +581,19 @@ pub async fn run_session(
                     ExternalCommand::MicClose => {
                         if state == State::Streaming || state == State::Opening {
                             close_mic_reset!(state, last_seq, current_stream_id);
-                            pending_close = Some(AudioStopReason::MicClose);
-                            ble.write_command(&protocol.mic_close_cmd(sid)).await?;
+                            pending_close = Some((AudioStopReason::MicClose, Some(sid)));
+                            write_cmd_or_disconnect!(protocol.mic_close_cmd(sid));
                             tracing::info!("Sent MIC_CLOSE (external)");
                         }
                     }
                     ExternalCommand::MicToggle => {
                         if state == State::Streaming || state == State::Opening {
                             close_mic_reset!(state, last_seq, current_stream_id);
-                            pending_close = Some(AudioStopReason::MicClose);
-                            ble.write_command(&protocol.mic_close_cmd(sid)).await?;
+                            pending_close = Some((AudioStopReason::MicClose, Some(sid)));
+                            write_cmd_or_disconnect!(protocol.mic_close_cmd(sid));
                             tracing::info!("Sent MIC_CLOSE (external toggle)");
                         } else if state == State::Connected {
-                            ble.write_command(&protocol.mic_open_cmd()).await?;
+                            write_cmd_or_disconnect!(protocol.mic_open_cmd());
                             tracing::info!("Sent MIC_OPEN (external toggle)");
                             set_state(State::Opening, &mut state);
                             if frame_timeout_enabled {
@@ -544,8 +614,10 @@ pub async fn run_session(
                 if mic_on_demand && event.is_ok() {
                     if let Some(rx) = consumer_rx.as_mut() {
                         let count = current_consumer_count(rx);
-                        if count > 0 && state == State::Connected {
-                            ble.write_command(&protocol.mic_open_cmd()).await?;
+                        let consumer_added = count > last_consumer_count;
+                        last_consumer_count = count;
+                        if consumer_added && state == State::Connected {
+                            write_cmd_or_disconnect!(protocol.mic_open_cmd());
                             tracing::info!("Sent MIC_OPEN (consumer connected, on-demand)");
                             set_state(State::Opening, &mut state);
                             if frame_timeout_enabled {
@@ -559,8 +631,11 @@ pub async fn run_session(
                                 tracing::info!("All consumers disconnected, closing mic");
                                 let sid = current_stream_id.unwrap_or(StreamId::MIC_OPEN);
                                 close_mic_reset!(state, last_seq, current_stream_id);
-                                pending_close = Some(AudioStopReason::MicClose);
-                                let _ = ble.write_command(&protocol.mic_close_cmd(sid)).await;
+                                pending_close = Some((AudioStopReason::MicClose, Some(sid)));
+                                write_best_effort_or_disconnect!(
+                                    protocol.mic_close_cmd(sid),
+                                    KEEPALIVE_WRITE_TIMEOUT
+                                );
                             }
                             if invalidate_tail {
                                 if let Some(tail_expiration) = tail_expiration {
@@ -576,25 +651,21 @@ pub async fn run_session(
             () = &mut keepalive_timer, if keepalive_enabled && state == State::Streaming => {
                 let sid = current_stream_id.unwrap_or(StreamId::MIC_OPEN);
                 tracing::debug!("Sending keepalive");
-                if time::timeout(
-                    KEEPALIVE_WRITE_TIMEOUT,
-                    ble.write_command(&protocol.keepalive_cmd(sid)),
-                )
-                .await
-                .is_err()
-                {
-                    tracing::warn!(
-                        "Keepalive write timed out after {KEEPALIVE_WRITE_TIMEOUT:?}"
-                    );
-                }
+                write_best_effort_or_disconnect!(
+                    protocol.keepalive_cmd(sid),
+                    KEEPALIVE_WRITE_TIMEOUT
+                );
                 keepalive_timer.as_mut().reset(Instant::now() + keepalive_interval);
             }
             () = &mut frame_timer, if frame_timeout_enabled && (state == State::Streaming || state == State::Opening) => {
                 tracing::info!("Frame timeout ({:?}) - device likely asleep, closing mic", timeouts.frame_timeout);
                 let sid = current_stream_id.unwrap_or(StreamId::MIC_OPEN);
                 close_mic_reset!(state, last_seq, current_stream_id);
-                pending_close = Some(AudioStopReason::MicClose);
-                let _ = ble.write_command(&protocol.mic_close_cmd(sid)).await;
+                pending_close = Some((AudioStopReason::MicClose, Some(sid)));
+                write_best_effort_or_disconnect!(
+                    protocol.mic_close_cmd(sid),
+                    KEEPALIVE_WRITE_TIMEOUT
+                );
             }
             event = device_events.next() => {
                 let Some(event) = event else {
@@ -2394,5 +2465,292 @@ mod tests {
 
         event_tx.send(DeviceConnectionEvent::Disconnected).unwrap();
         assert!(session.await.unwrap().is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_late_mic_close_ack_for_old_stream_does_not_close_new_stream() {
+        use crate::protocol::v10::ProtocolV10;
+
+        tokio::time::pause();
+
+        let (device, mut ctrl) = mock_device();
+        let (audio_tx, mut audio_rx) = tokio_mpsc::channel(64);
+        let (state_tx, mut state_rx) = tokio::sync::watch::channel(State::Connected);
+        let timeouts = SessionTimeouts {
+            frame_timeout: Duration::ZERO,
+            keepalive: Duration::ZERO,
+        };
+        let caps = Capabilities {
+            version: ProtocolVersion::V1_0,
+            codecs: Codecs::ADPCM_16KHZ,
+            interaction_model: InteractionModel::HoldToTalk,
+            audio_frame_size: AudioFrameSize(120),
+        };
+        let mut protocol = ProtocolV10::new();
+        protocol.on_caps_resp(&caps).unwrap();
+
+        let notifications = device.notifications().await.unwrap();
+        let events = device.connection_events().await.unwrap();
+        let streams = BleStreams {
+            notifications,
+            events,
+        };
+        let session = tokio::spawn(async move {
+            run_session(
+                &device,
+                &mut protocol,
+                streams,
+                SessionConfig {
+                    audio_tx,
+                    timeouts: &timeouts,
+                    command_rx: None,
+                    state_tx: Some(&state_tx),
+                    consumer_rx: None,
+                    generation: None,
+                    tail_expiration: None,
+                    streaming: None,
+                    mic_on_demand: false,
+                },
+            )
+            .await
+        });
+
+        // Start stream 7, then close it via START_SEARCH toggle (sends MIC_CLOSE(7)).
+        ctrl.ctl_tx
+            .send(vec![CTL_AUDIO_START, 0x03, 0x02, 0x07])
+            .unwrap();
+        tokio::time::advance(Duration::from_millis(1)).await;
+        assert!(wait_for_state(&mut state_rx, State::Streaming, Duration::from_millis(10)).await);
+        ctrl.ctl_tx.send(vec![CTL_START_SEARCH]).unwrap();
+        tokio::time::advance(Duration::from_millis(1)).await;
+        assert!(wait_for_state(&mut state_rx, State::Connected, Duration::from_millis(10)).await);
+        assert_eq!(
+            try_recv_all_commands(&mut ctrl.commands_rx).await,
+            vec![vec![0x0D, 0x07]]
+        );
+
+        // Immediately start new stream 0 before stream 7's AUDIO_STOP(MicClose) ack arrives.
+        ctrl.ctl_tx
+            .send(vec![CTL_AUDIO_START, 0x03, 0x02, 0x00])
+            .unwrap();
+        tokio::time::advance(Duration::from_millis(1)).await;
+        assert!(wait_for_state(&mut state_rx, State::Streaming, Duration::from_millis(10)).await);
+
+        // Late AUDIO_STOP(MicClose) from stream 7 arrives now: must NOT close stream 0.
+        ctrl.ctl_tx.send(vec![CTL_AUDIO_STOP, 0x00]).unwrap();
+        ctrl.rx_tx.send(audio_packet(vec![0x00; 120], 1)).unwrap();
+        tokio::time::advance(Duration::from_millis(1)).await;
+
+        assert_eq!(*state_rx.borrow(), State::Streaming);
+        assert!(
+            try_recv_all_commands(&mut ctrl.commands_rx)
+                .await
+                .is_empty(),
+            "late MIC_CLOSE ack from stream 7 must not send MIC_CLOSE(0)"
+        );
+        assert_eq!(
+            audio_rx
+                .try_recv()
+                .expect("stream 0 first frame must be preserved")
+                .samples
+                .len(),
+            240
+        );
+
+        ctrl.event_tx
+            .send(DeviceConnectionEvent::Disconnected)
+            .unwrap();
+        assert!(session.await.unwrap().is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_mic_on_demand_consumer_decrease_and_initial_seen_do_not_reopen() {
+        use crate::protocol::v10::ProtocolV10;
+
+        tokio::time::pause();
+
+        let (device, mut ctrl) = mock_device();
+        let (audio_tx, _audio_rx) = tokio_mpsc::channel(64);
+        let (state_tx, mut state_rx) = tokio::sync::watch::channel(State::Connected);
+        let (consumer_tx, mut consumer_rx) =
+            tokio::sync::watch::channel(consumer::ConsumerEvent::Changed(0));
+        // Simulate an already-present consumer update sent before run_session starts (reconnect).
+        consumer_tx
+            .send(consumer::ConsumerEvent::Changed(2))
+            .unwrap();
+
+        let timeouts = SessionTimeouts {
+            frame_timeout: Duration::ZERO,
+            keepalive: Duration::ZERO,
+        };
+        let caps = Capabilities {
+            version: ProtocolVersion::V1_0,
+            codecs: Codecs::ADPCM_16KHZ,
+            interaction_model: InteractionModel::OnRequest,
+            audio_frame_size: AudioFrameSize(120),
+        };
+        let mut protocol = ProtocolV10::new();
+        protocol.on_caps_resp(&caps).unwrap();
+
+        let notifications = device.notifications().await.unwrap();
+        let events = device.connection_events().await.unwrap();
+        let streams = BleStreams {
+            notifications,
+            events,
+        };
+        let session = tokio::spawn(async move {
+            run_session(
+                &device,
+                &mut protocol,
+                streams,
+                SessionConfig {
+                    audio_tx,
+                    timeouts: &timeouts,
+                    command_rx: None,
+                    state_tx: Some(&state_tx),
+                    consumer_rx: Some(&mut consumer_rx),
+                    generation: None,
+                    tail_expiration: None,
+                    streaming: None,
+                    mic_on_demand: true,
+                },
+            )
+            .await
+        });
+
+        tokio::time::advance(Duration::from_millis(1)).await;
+        assert!(wait_for_state(&mut state_rx, State::Opening, Duration::from_millis(10)).await);
+        assert_eq!(
+            try_recv_all_commands(&mut ctrl.commands_rx).await,
+            vec![vec![0x0C, 0x00]]
+        );
+
+        // User manually closes the mic via button press.
+        ctrl.ctl_tx.send(vec![CTL_START_SEARCH]).unwrap();
+        tokio::time::advance(Duration::from_millis(1)).await;
+        assert!(wait_for_state(&mut state_rx, State::Connected, Duration::from_millis(10)).await);
+        assert_eq!(
+            try_recv_all_commands(&mut ctrl.commands_rx).await,
+            vec![vec![0x0D, 0x00]]
+        );
+
+        // One of the two consumers disconnects (2 -> 1): must NOT re-open the mic.
+        consumer_tx
+            .send(consumer::ConsumerEvent::Changed(1))
+            .unwrap();
+        tokio::time::advance(Duration::from_millis(1)).await;
+        assert_eq!(*state_rx.borrow(), State::Connected);
+        assert!(try_recv_all_commands(&mut ctrl.commands_rx)
+            .await
+            .is_empty());
+
+        ctrl.event_tx
+            .send(DeviceConnectionEvent::Disconnected)
+            .unwrap();
+        assert!(session.await.unwrap().is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_stalled_mic_open_write_exits_immediately_on_disconnect() {
+        use crate::protocol::v10::ProtocolV10;
+
+        struct HangingOpenBle {
+            write_started: Arc<tokio::sync::Notify>,
+            notifications: Mutex<Option<tokio_mpsc::UnboundedReceiver<SessionNotification>>>,
+            events: Mutex<Option<tokio_mpsc::UnboundedReceiver<DeviceConnectionEvent>>>,
+        }
+
+        impl BleDevice for HangingOpenBle {
+            fn write_command(&self, _data: &[u8]) -> BleFut<'_, ()> {
+                let started = self.write_started.clone();
+                Box::pin(async move {
+                    started.notify_one();
+                    std::future::pending::<()>().await;
+                    Ok(())
+                })
+            }
+
+            fn notifications(&self) -> BleFut<'_, BleStream<SessionNotification>> {
+                Box::pin(async {
+                    let rx = self.notifications.lock().await.take().unwrap();
+                    Ok(Box::pin(UnboundedReceiverStream::new(rx))
+                        as BleStream<SessionNotification>)
+                })
+            }
+
+            fn connection_events(&self) -> BleFut<'_, BleStream<DeviceConnectionEvent>> {
+                Box::pin(async {
+                    let rx = self.events.lock().await.take().unwrap();
+                    Ok(Box::pin(UnboundedReceiverStream::new(rx))
+                        as BleStream<DeviceConnectionEvent>)
+                })
+            }
+        }
+
+        let write_started = Arc::new(tokio::sync::Notify::new());
+        let (notif_tx, notif_rx) = tokio_mpsc::unbounded_channel();
+        let (event_tx, event_rx) = tokio_mpsc::unbounded_channel();
+        let device = HangingOpenBle {
+            write_started: write_started.clone(),
+            notifications: Mutex::new(Some(notif_rx)),
+            events: Mutex::new(Some(event_rx)),
+        };
+        let (audio_tx, _audio_rx) = tokio_mpsc::channel(8);
+        let timeouts = SessionTimeouts {
+            frame_timeout: Duration::ZERO,
+            keepalive: Duration::ZERO,
+        };
+        let caps = Capabilities {
+            version: ProtocolVersion::V1_0,
+            codecs: Codecs::ADPCM_16KHZ,
+            interaction_model: InteractionModel::OnRequest,
+            audio_frame_size: AudioFrameSize(120),
+        };
+        let mut protocol = ProtocolV10::new();
+        protocol.on_caps_resp(&caps).unwrap();
+
+        let notifications = device.notifications().await.unwrap();
+        let events = device.connection_events().await.unwrap();
+        let streams = BleStreams {
+            notifications,
+            events,
+        };
+        let session = tokio::spawn(async move {
+            run_session(
+                &device,
+                &mut protocol,
+                streams,
+                SessionConfig {
+                    audio_tx,
+                    timeouts: &timeouts,
+                    command_rx: None,
+                    state_tx: None,
+                    consumer_rx: None,
+                    generation: None,
+                    tail_expiration: None,
+                    streaming: None,
+                    mic_on_demand: false,
+                },
+            )
+            .await
+        });
+
+        let started_fut = write_started.notified();
+        tokio::pin!(started_fut);
+        notif_tx
+            .send(SessionNotification::Control(ControlPacket::new(
+                vec![CTL_START_SEARCH],
+                1,
+            )))
+            .unwrap();
+        started_fut.await;
+
+        // Device disconnects while MIC_OPEN write is hung forever: session must exit promptly.
+        event_tx.send(DeviceConnectionEvent::Disconnected).unwrap();
+        let result = time::timeout(Duration::from_secs(1), session)
+            .await
+            .expect("session must not hang on stalled MIC_OPEN write after disconnect")
+            .unwrap();
+        assert!(result.is_ok());
     }
 }

@@ -380,3 +380,13 @@ Redmi 实机验证：`cargo fmt --all -- --check`、192 个单元测试（`192 p
 - 队列断层边界校验同步包采样率：`ble::resets_audio_framing`（供 `NotificationQueue` 与协商缓冲共用）仅将 `AUDIO_START`（`0x04`）或合法 16 kHz `AUDIO_SYNC`（`0x0A` 且 codec=`0x02`）视为断层重置边界，被拒的 8 kHz 同步包不再在 `headered` 模式下抑制 `discontinuity` 标记。
 
 Redmi 实机验证：`cargo fmt --all -- --check`、196 个单元测试（`196 passed, 0 failed, 1 ignored`）、Clippy（默认与 `--features dbus`，`-D warnings`）及 release 编译全部通过，已重新安装 `~/.local/bin/rc003-omarchy` 并重启服务。
+
+## 35. 第二十八轮：跨流迟到关麦应答、重复停止包、消费者计数去重、短包边界与断连抢占写入
+
+- 跨流迟到 `MIC_CLOSE` 应答隔离：`pending_close` 改为记录 `(AudioStopReason, Option<StreamId>)`；新流 `AUDIO_START` 到达时若流 ID 不同则保留旧流的待确认关麦记录，后续到达的同因迟到 `AUDIO_STOP`（`current_stream_id != Some(old_sid)`）只消费一次并忽略，避免误关新开的流。
+- 协商期重复 `AUDIO_STOP` 不刷新过期时钟：`negotiate()` 连续收到 `AUDIO_STOP` 时沿用首次 `stopped_at` 时间戳并仅推进 `completed_utterance_end` 索引，防止迟到的重复停止包重置 1 秒尾音过期判定并回放过时的 `START_SEARCH`。
+- `mic_on_demand` 消费者 watch 去重与计数递减保护：入口通过 `borrow_and_update()` 标记当前消费者快照为已读，并记录 `last_consumer_count`，仅在消费者数量递增（`count > last_consumer_count`）时自动开麦，避免重连重复触发以及 `2→1` 递减在手动关麦后误重开。
+- 畸形短 `AUDIO_START` 校验：`ble::resets_audio_framing` 收紧 `0x04` 匹配为完整 16 kHz `AUDIO_START`（`len >= 4 && data[2] == 0x02`），防止被 `ProtocolV10::parse_ctl` 忽略的 1 字节 `[0x04]` 在 `headered` 模式下误抑制 `discontinuity` 标记。
+- 所有 BLE 命令写入与断连事件竞争：`run_session` 将 `device_events` 监听前置至初始按需开麦之前，并让每次 `MIC_OPEN` / `MIC_CLOSE` / `keepalive` 写入均与 `DeviceEvent::Disconnected` 竞争，BlueZ 写入在断连期间挂起时可立即退出会话进入重连。
+
+Redmi 实机验证：`cargo fmt --all -- --check`、200 个单元测试（`200 passed, 0 failed, 1 ignored`）、Clippy（默认与 `--features dbus`，`-D warnings`）及 release 编译全部通过，已重新安装 `~/.local/bin/rc003-omarchy` 并重启服务验证通过。
