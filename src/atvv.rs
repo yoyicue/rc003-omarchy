@@ -12,7 +12,7 @@ use tokio::time::{self, Instant};
 
 use crate::audio::TailDeadline;
 use crate::consumer;
-use crate::protocol::types::{AudioFrame, AudioStopReason, CtlEvent, StreamId};
+use crate::protocol::types::{AudioFrame, AudioStopReason, CtlEvent, ProtocolVersion, StreamId};
 use crate::protocol::Protocol;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -292,7 +292,8 @@ pub async fn run_session(
     let mut stream_generation = 0;
     let mut stopped_generation = None;
     let mut drop_next_frame = false;
-    let mut pending_close: Option<(AudioStopReason, Option<StreamId>)> = None;
+    let mut stream_instance: u64 = 0;
+    let mut pending_close: Option<(AudioStopReason, u64)> = None;
     macro_rules! close_mic_reset {
         ($state:ident, $last_seq:ident, $current_stream_id:ident) => {
             close_mic_reset!(
@@ -368,19 +369,17 @@ pub async fn run_session(
                         match protocol.parse_ctl(&packet.data) {
                     CtlEvent::AudioStop { reason } => {
                         tracing::info!("AUDIO_STOP (reason={:?})", reason);
-                        if let Some((expected_reason, closed_sid)) = pending_close {
+                        if let Some((expected_reason, closed_instance)) = pending_close {
                             if expected_reason == reason {
                                 pending_close = None;
                                 if state == State::Opening
                                     || (state == State::Streaming
-                                        && closed_sid.is_some_and(|old_sid| {
-                                            current_stream_id != Some(old_sid)
-                                        }))
+                                        && closed_instance != stream_instance)
                                 {
                                     tracing::debug!(
                                         ?reason,
-                                        ?closed_sid,
-                                        ?current_stream_id,
+                                        closed_instance,
+                                        stream_instance,
                                         "Ignoring late AUDIO_STOP ack for previously closed stream"
                                     );
                                     continue;
@@ -388,16 +387,19 @@ pub async fn run_session(
                             }
                         }
                         // For HTT button release, remote already stopped — don't send `MIC_CLOSE`
+                        let was_streaming = state == State::Streaming;
                         let should_close = !matches!(reason, AudioStopReason::HttButtonRelease)
-                            && state == State::Streaming;
+                            && was_streaming;
                         let sid = current_stream_id.unwrap_or(StreamId::MIC_OPEN);
                         let tail_remaining =
                             AUDIO_TAIL_DRAIN_TIMEOUT.saturating_sub(packet.received_at.elapsed());
                         close_mic_reset!(state, last_seq, current_stream_id, tail_remaining);
                         if should_close {
-                            pending_close = Some((AudioStopReason::MicClose, Some(sid)));
+                            pending_close = Some((AudioStopReason::MicClose, stream_instance));
                             write_cmd_or_disconnect!(protocol.mic_close_cmd(sid));
                             tracing::info!("Sent MIC_CLOSE");
+                        } else if was_streaming {
+                            pending_close = None;
                         }
                     }
                     CtlEvent::AudioStart { reason, codec, stream_id } => {
@@ -412,7 +414,7 @@ pub async fn run_session(
                                     "Rejecting AUDIO_START with mismatched sample rate"
                                 );
                                 close_mic_reset!(state, last_seq, current_stream_id);
-                                pending_close = Some((AudioStopReason::MicClose, Some(stream_id)));
+                                pending_close = Some((AudioStopReason::MicClose, stream_instance));
                                 write_best_effort_or_disconnect!(
                                     protocol.mic_close_cmd(stream_id),
                                     KEEPALIVE_WRITE_TIMEOUT
@@ -425,10 +427,14 @@ pub async fn run_session(
                         }
                         stream_generation = packet.generation;
                         stopped_generation = None;
-                        // Preserve a pending MIC_CLOSE ack only if it belongs to a different
-                        // (earlier) stream so a late ack cannot close this brand-new stream.
-                        if !matches!(pending_close, Some((_, Some(old_sid))) if old_sid != stream_id)
-                        {
+                        stream_instance = stream_instance.wrapping_add(1);
+                        // In v0.4, AUDIO_STOP carries no reason byte and always synthesizes
+                        // AudioStopReason::MicClose, so clear pending_close on AUDIO_START
+                        // lest an unacked earlier close swallow the new stream's real stop.
+                        // In v1.0+, AudioStopReason::MicClose is only a host-close ack, so
+                        // preserve pending_close keyed by stream_instance even when the new
+                        // stream reuses StreamId::MIC_OPEN (0x00).
+                        if protocol.version() == ProtocolVersion::V0_4 {
                             pending_close = None;
                         }
                         drop_next_frame = false;
@@ -471,7 +477,7 @@ pub async fn run_session(
                             // Toggle: second press stops streaming
                             let sid = current_stream_id.unwrap_or(StreamId::MIC_OPEN);
                             close_mic_reset!(state, last_seq, current_stream_id);
-                            pending_close = Some((AudioStopReason::MicClose, Some(sid)));
+                            pending_close = Some((AudioStopReason::MicClose, stream_instance));
                             write_cmd_or_disconnect!(protocol.mic_close_cmd(sid));
                             tracing::info!("Sent MIC_CLOSE (toggle off)");
                         } else {
@@ -581,7 +587,7 @@ pub async fn run_session(
                     ExternalCommand::MicClose => {
                         if state == State::Streaming || state == State::Opening {
                             close_mic_reset!(state, last_seq, current_stream_id);
-                            pending_close = Some((AudioStopReason::MicClose, Some(sid)));
+                            pending_close = Some((AudioStopReason::MicClose, stream_instance));
                             write_cmd_or_disconnect!(protocol.mic_close_cmd(sid));
                             tracing::info!("Sent MIC_CLOSE (external)");
                         }
@@ -589,7 +595,7 @@ pub async fn run_session(
                     ExternalCommand::MicToggle => {
                         if state == State::Streaming || state == State::Opening {
                             close_mic_reset!(state, last_seq, current_stream_id);
-                            pending_close = Some((AudioStopReason::MicClose, Some(sid)));
+                            pending_close = Some((AudioStopReason::MicClose, stream_instance));
                             write_cmd_or_disconnect!(protocol.mic_close_cmd(sid));
                             tracing::info!("Sent MIC_CLOSE (external toggle)");
                         } else if state == State::Connected {
@@ -631,7 +637,7 @@ pub async fn run_session(
                                 tracing::info!("All consumers disconnected, closing mic");
                                 let sid = current_stream_id.unwrap_or(StreamId::MIC_OPEN);
                                 close_mic_reset!(state, last_seq, current_stream_id);
-                                pending_close = Some((AudioStopReason::MicClose, Some(sid)));
+                                pending_close = Some((AudioStopReason::MicClose, stream_instance));
                                 write_best_effort_or_disconnect!(
                                     protocol.mic_close_cmd(sid),
                                     KEEPALIVE_WRITE_TIMEOUT
@@ -661,7 +667,7 @@ pub async fn run_session(
                 tracing::info!("Frame timeout ({:?}) - device likely asleep, closing mic", timeouts.frame_timeout);
                 let sid = current_stream_id.unwrap_or(StreamId::MIC_OPEN);
                 close_mic_reset!(state, last_seq, current_stream_id);
-                pending_close = Some((AudioStopReason::MicClose, Some(sid)));
+                pending_close = Some((AudioStopReason::MicClose, stream_instance));
                 write_best_effort_or_disconnect!(
                     protocol.mic_close_cmd(sid),
                     KEEPALIVE_WRITE_TIMEOUT
@@ -2555,6 +2561,201 @@ mod tests {
                 .samples
                 .len(),
             240
+        );
+
+        ctrl.event_tx
+            .send(DeviceConnectionEvent::Disconnected)
+            .unwrap();
+        assert!(session.await.unwrap().is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_late_mic_close_ack_reusing_stream_id_zero_does_not_close_new_stream() {
+        use crate::protocol::v10::ProtocolV10;
+
+        tokio::time::pause();
+
+        let (device, mut ctrl) = mock_device();
+        let (audio_tx, mut audio_rx) = tokio_mpsc::channel(64);
+        let (state_tx, mut state_rx) = tokio::sync::watch::channel(State::Connected);
+        let timeouts = SessionTimeouts {
+            frame_timeout: Duration::ZERO,
+            keepalive: Duration::ZERO,
+        };
+        let caps = Capabilities {
+            version: ProtocolVersion::V1_0,
+            codecs: Codecs::ADPCM_16KHZ,
+            interaction_model: InteractionModel::OnRequest,
+            audio_frame_size: AudioFrameSize(120),
+        };
+        let mut protocol = ProtocolV10::new();
+        protocol.on_caps_resp(&caps).unwrap();
+
+        let notifications = device.notifications().await.unwrap();
+        let events = device.connection_events().await.unwrap();
+        let streams = BleStreams {
+            notifications,
+            events,
+        };
+        let session = tokio::spawn(async move {
+            run_session(
+                &device,
+                &mut protocol,
+                streams,
+                SessionConfig {
+                    audio_tx,
+                    timeouts: &timeouts,
+                    command_rx: None,
+                    state_tx: Some(&state_tx),
+                    consumer_rx: None,
+                    generation: None,
+                    tail_expiration: None,
+                    streaming: None,
+                    mic_on_demand: false,
+                },
+            )
+            .await
+        });
+
+        // Utterance 1: host-initiated MIC_OPEN -> AUDIO_START with StreamId::MIC_OPEN (0).
+        ctrl.ctl_tx.send(vec![CTL_START_SEARCH]).unwrap();
+        tokio::time::advance(Duration::from_millis(1)).await;
+        assert!(wait_for_state(&mut state_rx, State::Opening, Duration::from_millis(10)).await);
+        assert_eq!(
+            try_recv_all_commands(&mut ctrl.commands_rx).await,
+            vec![vec![0x0C, 0x00]]
+        );
+        ctrl.ctl_tx
+            .send(vec![CTL_AUDIO_START, 0x00, 0x02, 0x00])
+            .unwrap();
+        tokio::time::advance(Duration::from_millis(1)).await;
+        assert!(wait_for_state(&mut state_rx, State::Streaming, Duration::from_millis(10)).await);
+
+        // Close utterance 1 (sends MIC_CLOSE(0)), then immediately reopen utterance 2 (MIC_OPEN).
+        ctrl.ctl_tx.send(vec![CTL_START_SEARCH]).unwrap();
+        tokio::time::advance(Duration::from_millis(1)).await;
+        assert!(wait_for_state(&mut state_rx, State::Connected, Duration::from_millis(10)).await);
+        ctrl.ctl_tx.send(vec![CTL_START_SEARCH]).unwrap();
+        tokio::time::advance(Duration::from_millis(1)).await;
+        assert!(wait_for_state(&mut state_rx, State::Opening, Duration::from_millis(10)).await);
+        assert_eq!(
+            try_recv_all_commands(&mut ctrl.commands_rx).await,
+            vec![vec![0x0D, 0x00], vec![0x0C, 0x00]]
+        );
+
+        // Utterance 2 starts reusing StreamId(0) BEFORE utterance 1's AUDIO_STOP(MicClose) arrives.
+        ctrl.ctl_tx
+            .send(vec![CTL_AUDIO_START, 0x00, 0x02, 0x00])
+            .unwrap();
+        tokio::time::advance(Duration::from_millis(1)).await;
+        assert!(wait_for_state(&mut state_rx, State::Streaming, Duration::from_millis(10)).await);
+
+        // Late AUDIO_STOP(MicClose) from utterance 1 arrives now, followed by 32 frames of utterance 2.
+        ctrl.ctl_tx.send(vec![CTL_AUDIO_STOP, 0x00]).unwrap();
+        for _ in 0..32 {
+            ctrl.rx_tx.send(audio_packet(vec![0x00; 120], 2)).unwrap();
+        }
+        tokio::time::advance(Duration::from_millis(1)).await;
+
+        assert_eq!(*state_rx.borrow(), State::Streaming);
+        assert!(
+            try_recv_all_commands(&mut ctrl.commands_rx)
+                .await
+                .is_empty(),
+            "late MIC_CLOSE ack from utterance 1 must not send MIC_CLOSE(0) for utterance 2"
+        );
+        let mut received = 0;
+        while let Ok(frame) = audio_rx.try_recv() {
+            assert_eq!(frame.samples.len(), 240);
+            received += 1;
+        }
+        assert_eq!(
+            received, 32,
+            "all 32 frames of utterance 2 must be preserved"
+        );
+
+        // Once the single late ack is consumed, a subsequent AUDIO_STOP closes utterance 2 normally.
+        ctrl.ctl_tx.send(vec![CTL_AUDIO_STOP, 0x00]).unwrap();
+        tokio::time::advance(Duration::from_millis(1)).await;
+        assert!(wait_for_state(&mut state_rx, State::Connected, Duration::from_millis(10)).await);
+        assert_eq!(
+            try_recv_all_commands(&mut ctrl.commands_rx).await,
+            vec![vec![0x0D, 0x00]]
+        );
+
+        ctrl.event_tx
+            .send(DeviceConnectionEvent::Disconnected)
+            .unwrap();
+        assert!(session.await.unwrap().is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_v04_unacked_mic_close_does_not_swallow_next_stream_stop() {
+        tokio::time::pause();
+
+        let (device, mut ctrl) = mock_device();
+        let (audio_tx, _audio_rx) = tokio_mpsc::channel(64);
+        let (state_tx, mut state_rx) = tokio::sync::watch::channel(State::Connected);
+        let timeouts = SessionTimeouts {
+            frame_timeout: Duration::ZERO,
+            keepalive: Duration::ZERO,
+        };
+        let caps = Capabilities {
+            version: ProtocolVersion::V0_4,
+            codecs: Codecs::ADPCM_8KHZ,
+            interaction_model: InteractionModel::OnRequest,
+            audio_frame_size: AudioFrameSize(134),
+        };
+        let mut protocol = ProtocolV04::new();
+        protocol.on_caps_resp(&caps).unwrap();
+
+        let notifications = device.notifications().await.unwrap();
+        let events = device.connection_events().await.unwrap();
+        let streams = BleStreams {
+            notifications,
+            events,
+        };
+        let session = tokio::spawn(async move {
+            run_session(
+                &device,
+                &mut protocol,
+                streams,
+                SessionConfig {
+                    audio_tx,
+                    timeouts: &timeouts,
+                    command_rx: None,
+                    state_tx: Some(&state_tx),
+                    consumer_rx: None,
+                    generation: None,
+                    tail_expiration: None,
+                    streaming: None,
+                    mic_on_demand: false,
+                },
+            )
+            .await
+        });
+
+        // Start and close utterance 1 without receiving an AUDIO_STOP ack.
+        ctrl.ctl_tx.send(vec![CTL_AUDIO_START]).unwrap();
+        tokio::time::advance(Duration::from_millis(1)).await;
+        assert!(wait_for_state(&mut state_rx, State::Streaming, Duration::from_millis(10)).await);
+        ctrl.ctl_tx.send(vec![CTL_START_SEARCH]).unwrap();
+        tokio::time::advance(Duration::from_millis(1)).await;
+        assert!(wait_for_state(&mut state_rx, State::Connected, Duration::from_millis(10)).await);
+        assert_eq!(
+            try_recv_all_commands(&mut ctrl.commands_rx).await,
+            vec![V04_MIC_CLOSE.to_vec()]
+        );
+
+        // Start utterance 2 and end it with a genuine v0.4 AUDIO_STOP (synthesized as MicClose).
+        ctrl.ctl_tx.send(vec![CTL_AUDIO_START]).unwrap();
+        tokio::time::advance(Duration::from_millis(1)).await;
+        assert!(wait_for_state(&mut state_rx, State::Streaming, Duration::from_millis(10)).await);
+        ctrl.ctl_tx.send(vec![CTL_AUDIO_STOP]).unwrap();
+        tokio::time::advance(Duration::from_millis(1)).await;
+        assert!(
+            wait_for_state(&mut state_rx, State::Connected, Duration::from_millis(10)).await,
+            "v0.4 AUDIO_STOP for utterance 2 must not be swallowed by an unacked close from utterance 1"
         );
 
         ctrl.event_tx

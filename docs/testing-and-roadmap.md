@@ -390,3 +390,11 @@ Redmi 实机验证：`cargo fmt --all -- --check`、196 个单元测试（`196 p
 - 所有 BLE 命令写入与断连事件竞争：`run_session` 将 `device_events` 监听前置至初始按需开麦之前，并让每次 `MIC_OPEN` / `MIC_CLOSE` / `keepalive` 写入均与 `DeviceEvent::Disconnected` 竞争，BlueZ 写入在断连期间挂起时可立即退出会话进入重连。
 
 Redmi 实机验证：`cargo fmt --all -- --check`、200 个单元测试（`200 passed, 0 failed, 1 ignored`）、Clippy（默认与 `--features dbus`，`-D warnings`）及 release 编译全部通过，已重新安装 `~/.local/bin/rc003-omarchy` 并重启服务验证通过。
+
+## 36. 第二十九轮：同 `StreamId(0)` 复用场景下的迟到关麦确认隔离
+
+- `run_session` 引入主机侧单调递增的录音序号 `stream_instance: u64`（每次合法 `AUDIO_START` 递增），`pending_close` 改为记录 `(AudioStopReason, u64)`，不再依赖远程流 ID 差异区分新旧录音。
+- 在 ATVV v1.0+ 下，即便连续两次主机主动开麦都复用 `StreamId::MIC_OPEN (0x00)`，上一句迟到的 `AUDIO_STOP(MicClose)` 因 `closed_instance != stream_instance` 只被消费并忽略一次，不再误关新流或重发 `MIC_CLOSE(0)`；正常流式结束（如 `HttButtonRelease`）同步清理陈旧 `pending_close`。
+- 在 ATVV v0.4 下，`AUDIO_STOP` 无原因字节且固定合成为 `MicClose`，因此在 `AUDIO_START` 时显式清空 `pending_close`，确保未应答的旧 `MIC_CLOSE` 不会吞掉下一句真实的 `AUDIO_STOP`。
+
+Redmi 实机验证：`cargo fmt --all -- --check`、202 个单元测试（`202 passed, 0 failed, 1 ignored`）、Clippy（默认与 `--features dbus`，`-D warnings`）及 release 编译全部通过，已重新安装 `~/.local/bin/rc003-omarchy` 并重启服务验证通过。
